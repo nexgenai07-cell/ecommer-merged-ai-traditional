@@ -1,16 +1,14 @@
-# PATH: ecommerce/apps/ai/models.py
+# PATH: apps/ai/models.py
 
 from django.db import models
 from django.conf import settings
 
 
 class ChatSession(models.Model):
-    """
-    Tracks a conversation session between a user and the AI assistant.
-    Anonymous users get a session_key (stored in cookie/localStorage).
-    Registered users are linked via ForeignKey.
-    On login, anonymous session is merged with the user's account.
-    """
+    CHANNEL_CHOICES = [
+        ('customer', 'Customer'),
+        ('admin', 'Admin'),
+    ]
 
     user        = models.ForeignKey(
                     settings.AUTH_USER_MODEL,
@@ -25,9 +23,12 @@ class ChatSession(models.Model):
                     related_name='chat_sessions',
                   )
     session_key = models.CharField(max_length=100, unique=True)
+    channel     = models.CharField(max_length=10, choices=CHANNEL_CHOICES, default='customer')
     started_at  = models.DateTimeField(auto_now_add=True)
     updated_at  = models.DateTimeField(auto_now=True)
-
+    is_deleted  = models.BooleanField(default=False)
+    deleted_at  = models.DateTimeField(null=True, blank=True)
+    
     class Meta:
         db_table = 'chat_sessions'
         ordering = ['-started_at']
@@ -39,12 +40,6 @@ class ChatSession(models.Model):
 
 
 class ChatMessage(models.Model):
-    """
-    Stores individual messages within a chat session.
-    metadata field stores structured data like product lists,
-    order info, cart state returned by AI tools.
-    """
-
     SENDER_CHOICES = [
         ('user', 'User'),
         ('ai',   'AI'),
@@ -68,21 +63,11 @@ class ChatMessage(models.Model):
         db_table = 'chat_messages'
         ordering = ['created_at']
 
-    # PATH: ecommerce/apps/ai/models.py  (add below ChatMessage)
-# OR create a separate: ecommerce/apps/stores/models.py (append)
-# Recommended: keep in ecommerce/apps/ai/models.py alongside ChatSession
-
-from django.db import models
-from django.conf import settings
+    def __str__(self):
+        return f'[{self.sender}] {self.message[:50]}'
 
 
 class AuditLog(models.Model):
-    """
-    Records every admin action taken through the WhatsApp bot or admin panel.
-    Required for compliance and accountability in a real client project.
-    old_data and new_data store JSON snapshots of the record before and after change.
-    """
-
     store      = models.ForeignKey(
                    'stores.Store',
                    on_delete=models.CASCADE,
@@ -109,27 +94,10 @@ class AuditLog(models.Model):
                    blank=True,
                    help_text='ID of the affected record'
                  )
-    old_data   = models.JSONField(
-                   null=True,
-                   blank=True,
-                   help_text='Snapshot of record BEFORE the change'
-                 )
-    new_data   = models.JSONField(
-                   null=True,
-                   blank=True,
-                   help_text='Snapshot of record AFTER the change'
-                 )
-    ip_address = models.CharField(
-                   max_length=50,
-                   null=True,
-                   blank=True,
-                   help_text='IP address of the request — null for WhatsApp actions'
-                 )
-    source     = models.CharField(
-                   max_length=20,
-                   default='web',
-                   help_text='Where the action came from: web, whatsapp'
-                 )
+    old_data   = models.JSONField(null=True, blank=True, help_text='Snapshot BEFORE change')
+    new_data   = models.JSONField(null=True, blank=True, help_text='Snapshot AFTER change')
+    ip_address = models.CharField(max_length=50, null=True, blank=True)
+    source     = models.CharField(max_length=20, default='web')
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -145,4 +113,36 @@ class AuditLog(models.Model):
         return f'{actor} → {self.action} on {self.entity}:{self.entity_id}'
 
 
-    
+# NEW — dynamic FAQ/knowledge base documents. Admin uploads PDFs here
+# through the Django admin panel (no hardcoded file paths). Each document
+# can be independently indexed/removed from the Qdrant search index,
+# so this stays fully database-driven instead of static.
+class KnowledgeDocument(models.Model):
+    title       = models.CharField(max_length=255, help_text='e.g. "Store FAQ", "Return Policy Details"')
+    file        = models.FileField(upload_to='knowledge_base/')
+    is_active   = models.BooleanField(
+                    default=True,
+                    help_text='Only active documents are searchable by the Support Agent.'
+                  )
+    is_indexed  = models.BooleanField(
+                    default=False,
+                    editable=False,
+                    help_text='Whether this document is currently embedded in Qdrant.'
+                  )
+    chunk_count = models.IntegerField(default=0, editable=False)
+    uploaded_by = models.ForeignKey(
+                    settings.AUTH_USER_MODEL,
+                    on_delete=models.SET_NULL,
+                    null=True,
+                    blank=True,
+                  )
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    indexed_at  = models.DateTimeField(null=True, blank=True, editable=False)
+
+    class Meta:
+        db_table = 'knowledge_documents'
+        ordering = ['-uploaded_at']
+
+    def __str__(self):
+        status = 'indexed' if self.is_indexed else 'not indexed'
+        return f'{self.title} ({status})'

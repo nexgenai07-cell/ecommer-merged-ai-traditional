@@ -1,5 +1,17 @@
 # PATH: apps/ai/views.py
 
+# FLOW: Ye REST endpoint hai (WebSocket nahi) — frontend WebSocket
+# connect karne SE PEHLE isay POST karta hai taake session_key mil sake.
+#
+# Request kahan se aati hai:
+#   core/urls.py → path('api/v1/chat/', include('apps.ai.urls'))
+#   apps/ai/urls.py → path('session/start/', StartChatSessionView.as_view())
+#   → yahan (ye function)
+#
+# → Yahan se aage: ChatSession model mein naya row banta hai, us ka
+#   session_key hi wo cheez hai jo frontend WebSocket URL mein use
+#   karega (Step 2 se connect karne ke liye).
+
 import uuid
 from rest_framework import generics, permissions, status
 from rest_framework.views import APIView
@@ -35,22 +47,28 @@ class StartChatSessionView(APIView):
             store=store,
             # if the user is logged in, link the session to them right away
             user=request.user if request.user.is_authenticated else None,
+            channel='customer',
         )
 
-        return Response(ChatSessionSerializer(session).data, status=status.HTTP_201_CREATED)
+        # FLOW: response mein session_key jata hai → frontend ise
+        # WebSocket URL mein daal kar Step 2 (routing.py) ko trigger karega
 
+        return Response(ChatSessionSerializer(session).data, status=status.HTTP_201_CREATED)
+    
 
 class ChatSessionHistoryView(generics.RetrieveAPIView):
     """
     GET /api/v1/chat/session/{session_key}/history/
-
-    Returns the full conversation (all messages) for a given session.
+    FIX (Requirement 2): soft-deleted sessions ab 404 dete hain —
+    queryset khud hi is_deleted=False filter karta hai, isliye
+    RetrieveAPIView automatically 404 return kar deta hai agar
+    session soft-deleted ho chuki hai.
     """
     serializer_class = ChatSessionHistorySerializer
     permission_classes = [permissions.AllowAny]
     lookup_field = 'session_key'
-    queryset = ChatSession.objects.prefetch_related('messages')
-
+    queryset = ChatSession.objects.filter(is_deleted=False).prefetch_related('messages')
+    
 
 class ClearChatSessionView(APIView):
     """

@@ -1,11 +1,10 @@
 """
 Django base settings — shared across development and production.
 """
-import cloudinary
+
 from pathlib import Path
 from datetime import timedelta
 import os
-import cloudinary
 import dj_database_url
 from dotenv import load_dotenv
 
@@ -16,7 +15,6 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 load_dotenv()
-
 
 # -------------------------------------------------
 # SECURITY
@@ -64,14 +62,13 @@ FRONTEND_URL = os.getenv(
 # -------------------------------------------------
 
 INSTALLED_APPS = [
+    'daphne',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
-    'cloudinary_storage',
     'django.contrib.staticfiles',
-    'cloudinary',
 
     'rest_framework',
     'rest_framework_simplejwt',
@@ -242,19 +239,17 @@ USE_TZ = True
 # -------------------------------------------------
 # STATIC + MEDIA
 # -------------------------------------------------
+
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
-MEDIA_URL = "/media/"
-
-cloudinary.config(
-    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
-    api_key=os.getenv("CLOUDINARY_API_KEY"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
-    secure=True,
+STATICFILES_STORAGE = (
+    "whitenoise.storage.CompressedManifestStaticFilesStorage"
 )
 
-
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # -------------------------------------------------
 # CACHE
@@ -287,4 +282,37 @@ QDRANT_COLLECTION = 'products'
 # ============================================
 # GEMINI AI
 # ============================================
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+
+
+# ============================================
+# GEMINI AI — multiple keys ke sath fallback support
+# ============================================
+# .env file mein comma-separated keys likhein:
+# GEMINI_API_KEYS=key1,key2,key3
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')  # backward-compat — akeli/pehli key
+
+_gemini_keys_raw = os.getenv('GEMINI_API_KEYS', '')
+if _gemini_keys_raw:
+    GEMINI_API_KEYS = [k.strip() for k in _gemini_keys_raw.split(',') if k.strip()]
+elif GEMINI_API_KEY:
+    GEMINI_API_KEYS = [GEMINI_API_KEY]
+else:
+    GEMINI_API_KEYS = []
+    
+# ============================================
+# GROQ — Final fallback jab sari Gemini keys exhaust ho jayein (chat/agent only, embeddings ke liye nahi)
+# ============================================
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+
+INTERNAL_API_URL = os.getenv('INTERNAL_API_URL', 'http://localhost:8000')
+
+# ALLOWED_HOSTS ab uncomment aur env-driven honi chahiye
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+
+# Railway apne edge pe HTTPS terminate karta hai aur request Django ko HTTP
+# ke tor par forward karta hai, is header ke sath — Django ko batana zaroori
+# hai ke asal request HTTPS thi (warna CSRF/cookie issues aa sakte hain)
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+# Admin panel aur POST requests HTTPS domain se aayengi — CSRF ko batana hoga
+CSRF_TRUSTED_ORIGINS = os.getenv('CSRF_TRUSTED_ORIGINS', '').split(',') if os.getenv('CSRF_TRUSTED_ORIGINS') else []
