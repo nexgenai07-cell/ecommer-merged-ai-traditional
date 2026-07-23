@@ -195,6 +195,11 @@ REST_FRAMEWORK = {
     ),
     "DEFAULT_PAGINATION_CLASS": "core.pagination.StandardResultsPagination",
     "PAGE_SIZE": 10,
+     # NEW — Requirement 11
+    "DEFAULT_THROTTLE_RATES": {
+        "chat_user": "60/min",
+        "chat_anon": "60/min",
+    },
 }
 
 

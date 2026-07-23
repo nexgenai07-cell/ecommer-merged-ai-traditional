@@ -14,8 +14,10 @@ from apps.users.permissions import IsAdmin      # FLOW: yahi check karta hai rol
 from apps.ai.models import ChatSession
 from apps.ai.serializers import ChatSessionSerializer
 
+from apps.ai.mixins import ChatAuthErrorMixin
+from apps.ai.throttles import ChatUserRateThrottle
 
-class StartAdminChatSessionView(APIView):
+class StartAdminChatSessionView(ChatAuthErrorMixin, APIView):
     """
     POST /api/v1/chat/admin/session/start/
 
@@ -24,6 +26,7 @@ class StartAdminChatSessionView(APIView):
     (ws/admin-chat/<session_key>/) se connect karne k liye use hoga.
     """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]        # FLOW: yahan hi 403 lag jata hai agar admin nahi hai
+    throttle_classes = [ChatUserRateThrottle]
 
     def post(self, request):
         session_key = uuid.uuid4().hex

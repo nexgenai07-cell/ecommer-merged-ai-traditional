@@ -11,6 +11,8 @@ from apps.users.permissions import IsAdmin
 from apps.ai.admin_tools.pending_actions import get_pending_action
 from apps.ai.admin_tools.registry import execute_pending_action_by_id, cancel_pending_action_by_id
 
+from apps.ai.mixins import ChatAuthErrorMixin
+from apps.ai.throttles import ChatUserRateThrottle
 
 def _check_ownership(request, action_id):
     """Returns None if OK, or a Response object if the request should be rejected."""
@@ -22,9 +24,10 @@ def _check_ownership(request, action_id):
     return None
 
 
-class ConfirmAdminActionView(APIView):
+class ConfirmAdminActionView(ChatAuthErrorMixin, APIView):
     """POST /api/v1/chat/admin/action/{action_id}/confirm/"""
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
+    throttle_classes = [ChatUserRateThrottle]
 
     def post(self, request, action_id):
         rejection = _check_ownership(request, action_id)
@@ -41,9 +44,10 @@ class ConfirmAdminActionView(APIView):
         return Response({'action_id': action_id, 'status': 'confirmed'}, status=status.HTTP_200_OK)
 
 
-class CancelAdminActionView(APIView):
+class CancelAdminActionView(ChatAuthErrorMixin, APIView):
     """POST /api/v1/chat/admin/action/{action_id}/cancel/"""
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
+    throttle_classes = [ChatUserRateThrottle]
 
     def post(self, request, action_id):
         rejection = _check_ownership(request, action_id)

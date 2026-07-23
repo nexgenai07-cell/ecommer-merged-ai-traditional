@@ -1,17 +1,17 @@
 # PATH: apps/ai/consumers.py
 
-# FLOW: apps/ai/routing.py se yahan jump hota hai jab WebSocket connect
-# hota hai. Ye poori conversation ki "control room" hai — har message
-# yahan se guzarta hai.
-
 import json
+import html
 from channels.generic.websocket import AsyncWebsocketConsumer
 from asgiref.sync import sync_to_async
 from langchain_core.messages import HumanMessage, AIMessage
 
-from apps.ai.agents.shopping_agent import run_shopping_agent    # FLOW → apps/ai/agents/shopping_agent.py
+from apps.ai.agents.shopping_agent import run_shopping_agent
 from apps.ai.models import ChatSession, ChatMessage
-from apps.ai.customer_context import get_customer_context   # FLOW → apps/ai/customer_context.py
+from apps.ai.customer_context import get_customer_context
+from apps.ai.rate_limiting import check_all_rate_limits
+from apps.ai.message_sanitization import validate_message, escape_for_storage, unescape_for_context, MessageValidationError
+from apps.ai.ws_auth import extract_token_from_scope, is_token_expired_or_invalid
 from apps.stores.models import Store
 
 MAX_HISTORY_MESSAGES = 12
@@ -20,20 +20,20 @@ MAX_HISTORY_MESSAGES = 12
 class ChatConsumer(AsyncWebsocketConsumer):
 
     async def connect(self):
-
-        # FLOW: connection accept hoti hai, "connected" message wapis
-        # bheja jata hai — frontend ko pata chal jata hai socket ready hai
-
         self.session_key = self.scope['url_route']['kwargs']['session_key']
 
-        # NEW — Requirement 2: soft-deleted session pe connect na hone dein
         session_valid = await self.check_session_not_deleted()
         if not session_valid:
             await self.close(code=4404)
             return
-        
-        self.room_group_name = f"chat_{self.session_key}"
 
+        # Requirement 13 — token (optional; guest connections won't have one)
+        self.token = extract_token_from_scope(self.scope)
+        # Requirement 11 — best-effort client IP for guest rate limiting
+        client = self.scope.get('client')
+        self.client_ip = client[0] if client else None
+
+        self.room_group_name = f"chat_{self.session_key}"
         await self.channel_layer.group_add(self.room_group_name, self.channel_name)
         await self.accept()
 
@@ -43,42 +43,55 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "session_key": self.session_key
         }))
 
+    async def disconnect(self, close_code):
+        if hasattr(self, 'room_group_name'):
+            await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
+
     @sync_to_async
     def check_session_not_deleted(self):
-        # Session abhi exist nahi karti (pehli baar connect ho rahi hai) -> allow (naya session banega)
         session = ChatSession.objects.filter(session_key=self.session_key).first()
         return session is None or not session.is_deleted
 
-    async def disconnect(self, close_code):
-        await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
-
     async def receive(self, text_data):
-
-        # FLOW: Frontend se message aate hi YE function chalta hai.
-        # Yahan se get_agent_response() call hoti hai (neeche), jo
-        # asal AI logic tak le jaati hai.
-
         try:
             data = json.loads(text_data)
         except (json.JSONDecodeError, TypeError):
+            await self.send(text_data=json.dumps({"type": "error", "message": "Invalid message format — expected JSON."}))
+            return
+
+        # Requirement 13 — expired/invalid token pe connection band
+        if getattr(self, 'token', None) and is_token_expired_or_invalid(self.token):
             await self.send(text_data=json.dumps({
-                "type": "error",
-                "message": "Invalid message format — expected JSON.",
+                "type": "error", "code": "SESSION_EXPIRED",
+                "message": "Session expired, please log in again.",
+            }))
+            await self.close(code=4401)
+            return
+
+        # Requirement 11 — rate limiting
+        user_id = await self.get_session_user_id()
+        allowed = await sync_to_async(check_all_rate_limits)(self.session_key, user_id, getattr(self, 'client_ip', None))
+        if not allowed:
+            await self.send(text_data=json.dumps({
+                "type": "error", "code": "RATE_LIMITED",
+                "message": "Too many messages — please wait a moment before sending again.",
             }))
             return
+
         user_message = data.get("message", "")
+
+        # Requirement 12 — validate before doing anything else
+        try:
+            validate_message(user_message)
+        except MessageValidationError as e:
+            await self.send(text_data=json.dumps({"type": "error", "message": str(e)}))
+            return
 
         try:
             response_text, products_metadata = await self.get_agent_response(user_message)
-            # FLOW ↑: get_agent_response() se do cheezein wapis aati hain —
-            # AI ka text jawab, aur products/categories ka structured data
         except Exception as e:
             response_text, products_metadata = f"Sorry, something went wrong: {str(e)}", []
 
-            # FLOW: yahan se response WAPIS frontend ko WebSocket se jata hai — flow ka aakhri step
-
-        # metadata' field mein product_id/category_id waale products
-        # bheje jate hain, taake frontend UI cards render kar sake.
         await self.send(text_data=json.dumps({
             "type": "message",
             "sender": "ai",
@@ -87,26 +100,23 @@ class ChatConsumer(AsyncWebsocketConsumer):
         }))
 
     @sync_to_async
+    def get_session_user_id(self):
+        session = ChatSession.objects.filter(session_key=self.session_key).first()
+        return session.user_id if session else None
+
+    @sync_to_async
     def get_agent_response(self, user_message):
-
-        # FLOW: Ye function 3 kaam karta hai — (1) session/history DB se
-        # fetch karta hai, (2) AI agent ko call karta hai (asal "sochne"
-        # wala kaam), (3) result ko DB mein save karta hai.
-
-        chat_session, _ = ChatSession.objects.select_related('user').get_or_create(
+        chat_session, _ = ChatSession.objects.get_or_create(
             session_key=self.session_key,
-            defaults={'store': Store.objects.first()},
+            defaults={'store': Store.objects.first(), 'channel': 'customer'},
         )
         user = chat_session.user
-        # User ka message pehle hi save kar dete hain
 
-        ChatMessage.objects.create(session=chat_session, sender='user', message=user_message)
-        # Pichli conversation history nikalte hain — AI ko context dene ke liye
+        # Requirement 12 — escaped version DB mein save hota hai
+        ChatMessage.objects.create(session=chat_session, sender='user', message=escape_for_storage(user_message))
 
         if user is not None:
-            messages_qs = ChatMessage.objects.filter(
-                session__user=user, session__channel='customer'   # NEW — sirf customer-channel history
-            ).select_related('session').order_by('-created_at')
+            messages_qs = ChatMessage.objects.filter(session__user=user, session__channel='customer').select_related('session').order_by('-created_at')
         else:
             messages_qs = chat_session.messages.order_by('-created_at')
 
@@ -115,19 +125,17 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         chat_history = []
         for msg in previous_messages:
+            # Requirement 12 — unescape karke LLM ko context dena, taake escaped entities pollute na karein
+            text = unescape_for_context(msg.message)
             if msg.sender == 'user':
-                chat_history.append(HumanMessage(content=msg.message))
+                chat_history.append(HumanMessage(content=text))
             else:
-                chat_history.append(AIMessage(content=msg.message))
-
-                # FLOW → apps/ai/customer_context.py — purchase history summary nikalti hai
+                chat_history.append(AIMessage(content=text))
 
         customer_context = get_customer_context(user)
 
-        # FLOW → apps/ai/agents/shopping_agent.py — YAHAN SE ASAL AI KAAM SHURU HOTA HAI
-
         output, products_metadata = run_shopping_agent(
-            user_message,
+            user_message,  # LLM is turn ka raw (validated) message dekhta hai
             session_key=self.session_key,
             user=user,
             chat_history=chat_history,
@@ -140,14 +148,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 for block in output
             ).strip()
 
-            # FLOW: AI ka jawab bhi DB mein save hota hai — agli baar history mein aayega
-
-        # metadata bhi ChatMessage mein save hoti hai (jaisa model
-        # comment mein already documented tha: "product cards, order info...")
         ChatMessage.objects.create(
-            session=chat_session,
-            sender='ai',
-            message=output,
+            session=chat_session, sender='ai', message=output,
             metadata={"products": products_metadata} if products_metadata else None,
         )
 

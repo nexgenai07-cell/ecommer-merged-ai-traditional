@@ -22,8 +22,10 @@ from apps.users.permissions import IsAdmin
 from .models import ChatSession, ChatMessage, AuditLog
 from .serializers import ChatSessionSerializer, ChatSessionHistorySerializer, AuditLogSerializer
 
+from apps.ai.mixins import ChatAuthErrorMixin
+from apps.ai.throttles import ChatUserRateThrottle
 
-class StartChatSessionView(APIView):
+class StartChatSessionView(ChatAuthErrorMixin, APIView):
     """
     POST /api/v1/chat/session/start/
 
@@ -34,6 +36,7 @@ class StartChatSessionView(APIView):
     """
     # Anyone can start a chat session, even without logging in
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [ChatUserRateThrottle]
 
     def post(self, request):
         # Generate a unique session key — frontend stores this and reuses it
@@ -56,7 +59,7 @@ class StartChatSessionView(APIView):
         return Response(ChatSessionSerializer(session).data, status=status.HTTP_201_CREATED)
     
 
-class ChatSessionHistoryView(generics.RetrieveAPIView):
+class ChatSessionHistoryView(ChatAuthErrorMixin, generics.RetrieveAPIView):
     """
     GET /api/v1/chat/session/{session_key}/history/
     FIX (Requirement 2): soft-deleted sessions ab 404 dete hain —
@@ -66,11 +69,12 @@ class ChatSessionHistoryView(generics.RetrieveAPIView):
     """
     serializer_class = ChatSessionHistorySerializer
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [ChatUserRateThrottle]
     lookup_field = 'session_key'
     queryset = ChatSession.objects.filter(is_deleted=False).prefetch_related('messages')
     
 
-class ClearChatSessionView(APIView):
+class ClearChatSessionView(ChatAuthErrorMixin, APIView):
     """
     DELETE /api/v1/chat/session/{session_key}/clear/
 
@@ -78,6 +82,7 @@ class ClearChatSessionView(APIView):
     The session itself stays so the same session_key keeps working.
     """
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [ChatUserRateThrottle]
 
     def delete(self, request, session_key):
         try:
