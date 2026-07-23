@@ -28,7 +28,7 @@ def get_order_details(user, order_id: str) -> dict:
     return {'success': True, 'order': results[0]}
 
 
-def propose_update_order(session_key: str, order_id: str, fields: dict) -> dict:
+def propose_update_order(session_key: str,user_id: int, order_id: str, fields: dict) -> dict:
     """FLOW: preview banata hai — sirf 'status'/'tracking_number' allow karta hai"""
     """
     Order update ka preview. Backend endpoint (AdminOrderStatusUpdateView)
@@ -69,7 +69,7 @@ def execute_update_order(user, payload: dict) -> dict:
     return {'success': True, 'order_id': order_id, **result['data']}
 
 
-def propose_cancel_order(session_key: str, order_id: str, reason: str = "") -> dict:
+def propose_cancel_order(session_key: str,user_id: int, order_id: str, reason: str = "") -> dict:
     """
     Order cancel ka preview. Note: backend endpoint 'reason' field store
     nahi karta (sirf status update karta hai) — lekin reason AuditLog mein

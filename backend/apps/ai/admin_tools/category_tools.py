@@ -8,7 +8,7 @@ from apps.ai.admin_tools.api_client import call_internal_api     # FLOW → api_
 from apps.ai.admin_tools.pending_actions import create_pending_action       # FLOW → pending_actions.py (Redis mein preview store hoti hai)
 
 
-def propose_create_category(session_key: str, name: str, description: str = "") -> dict:
+def propose_create_category(session_key: str,user_id: int, name: str, description: str = "") -> dict:
 
     """FLOW: registry.py ke create_category tool se call hota hai.
     Yahan koi DB/API change NAHI hota — sirf Redis mein pending action save hoti hai."""
@@ -40,7 +40,7 @@ def execute_create_category(user, payload: dict) -> dict:
     return {'success': True, 'category': result['data']}
 
 
-def propose_update_category(session_key: str, category_id: int, fields: dict) -> dict:
+def propose_update_category(session_key: str,user_id: int, category_id: int, fields: dict) -> dict:
     preview = {'action': 'update_category', 'category_id': category_id, 'fields': fields}
     pending_kwargs = {'category_id': category_id, 'fields': fields}
     action_id = create_pending_action(session_key, 'update_category', pending_kwargs, preview)
@@ -59,7 +59,7 @@ def execute_update_category(user, payload: dict) -> dict:
     return {'success': True, 'category': result['data']}
 
 
-def propose_delete_category(session_key: str, category_id: int) -> dict:
+def propose_delete_category(session_key: str,user_id: int, category_id: int) -> dict:
     preview = {'action': 'delete_category', 'category_id': category_id}
     action_id = create_pending_action(session_key, 'delete_category', {'category_id': category_id}, preview)
     return {'requires_confirmation': True, 'action_id': action_id, 'preview': preview}

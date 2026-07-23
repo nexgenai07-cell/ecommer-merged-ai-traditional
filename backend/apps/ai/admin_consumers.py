@@ -68,10 +68,13 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
         except Exception as e:
             response_text, metadata = f"Sorry, something went wrong: {str(e)}", None
 
+        requires_confirmation = bool(metadata and metadata.get('pending_action'))
+
         await self.send(text_data=json.dumps({
             "type": "message",
             "sender": "ai",
             "message": response_text,
+            "requires_confirmation": requires_confirmation,   # NEW
             "metadata": metadata,
         }))
 

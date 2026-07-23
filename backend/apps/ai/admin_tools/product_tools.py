@@ -27,30 +27,30 @@ def _generate_sku(name: str) -> str:
     return f"{prefix}-{suffix}"
 
 
-def propose_create_product(session_key: str, name: str, price: float, stock: int,
+def propose_create_product(session_key: str, user_id: int, name: str, price: float, stock: int,
                             category_id: int = None, description: str = "",
                             original_price: float = None, sku: str = None,
                             low_stock_threshold: int = None) -> dict:
-    """Product creation ka preview banata hai — POST abhi nahi bheji jati."""
     if not sku:
         sku = _generate_sku(name)
 
     payload = {
-        'name': name,
-        'description': description or '',
-        'price': price,
-        'original_price': original_price,
-        'stock': stock,
-        'sku': sku,
-        'category': category_id,  # serializer field ka naam 'category' hai, 'category_id' nahi
-        'is_active': True,
+        'name': name, 'description': description or '', 'price': price,
+        'original_price': original_price, 'stock': stock, 'sku': sku,
+        'category': category_id, 'is_active': True,
     }
     if low_stock_threshold is not None:
         payload['low_stock_threshold'] = low_stock_threshold
 
-    preview = {'action': 'create_product', **{k: v for k, v in payload.items() if k != 'category'}, 'category_id': category_id}
-    action_id = create_pending_action(session_key, 'create_product', payload, preview)
-    return {'requires_confirmation': True, 'action_id': action_id, 'preview': preview}
+    preview = {**{k: v for k, v in payload.items() if k != 'category'}, 'category_id': category_id}
+    result = create_pending_action(session_key, user_id, 'create_product', payload, preview)
+    return {
+        'requires_confirmation': True,
+        'action_id': result['action_id'],
+        'action_type': 'create_product',
+        'preview': preview,
+        'expires_at': result['expires_at'],
+    }
 
 
 def execute_create_product(user, payload: dict) -> dict:
@@ -61,7 +61,7 @@ def execute_create_product(user, payload: dict) -> dict:
     return {'success': True, 'product': result['data']}
 
 
-def propose_update_product(session_key: str, product_id: int, fields: dict) -> dict:
+def propose_update_product(session_key: str, user_id: int, product_id: int, fields: dict) -> dict:
     """
     Product update ka preview. 'fields' dict mein jo bhi keys hain wahi
     update hongi (jaise {'price': 5000} ya {'stock': 20, 'name': 'New Name'}).
@@ -87,7 +87,7 @@ def execute_update_product(user, payload: dict) -> dict:
     return {'success': True, 'product': result['data']}
 
 
-def propose_delete_product(session_key: str, product_id: int) -> dict:
+def propose_delete_product(session_key: str,user_id: int, product_id: int) -> dict:
     """Product delete (soft delete — is_active=False) ka preview."""
     preview = {'action': 'delete_product', 'product_id': product_id}
     action_id = create_pending_action(session_key, 'delete_product', {'product_id': product_id}, preview)

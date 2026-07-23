@@ -26,7 +26,7 @@ def check_inventory(user, product_id: int) -> dict:
     }
 
 
-def propose_update_inventory(session_key: str, product_id: int, quantity: int) -> dict:
+def propose_update_inventory(session_key: str,user_id: int, product_id: int, quantity: int) -> dict:
     """FLOW: registry.py ke update_inventory tool se call hota hai — preview banata hai."""
     """Stock update ka preview — asal PATCH confirm ke baad."""
     preview = {'action': 'update_inventory', 'product_id': product_id, 'new_quantity': quantity}
