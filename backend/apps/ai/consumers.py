@@ -1,7 +1,8 @@
 # PATH: apps/ai/consumers.py
 
 import json
-import html
+import time
+import asyncio
 from channels.generic.websocket import AsyncWebsocketConsumer
 from asgiref.sync import sync_to_async
 from langchain_core.messages import HumanMessage, AIMessage
@@ -12,9 +13,11 @@ from apps.ai.customer_context import get_customer_context
 from apps.ai.rate_limiting import check_all_rate_limits
 from apps.ai.message_sanitization import validate_message, escape_for_storage, unescape_for_context, MessageValidationError
 from apps.ai.ws_auth import extract_token_from_scope, is_token_expired_or_invalid
+from apps.ai.suggestions import get_initial_suggestions
 from apps.stores.models import Store
 
 MAX_HISTORY_MESSAGES = 12
+IDLE_THRESHOLD_SECONDS = 30
 
 
 class ChatConsumer(AsyncWebsocketConsumer):
@@ -27,9 +30,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
             await self.close(code=4404)
             return
 
-        # Requirement 13 — token (optional; guest connections won't have one)
         self.token = extract_token_from_scope(self.scope)
-        # Requirement 11 — best-effort client IP for guest rate limiting
         client = self.scope.get('client')
         self.client_ip = client[0] if client else None
 
@@ -37,20 +38,74 @@ class ChatConsumer(AsyncWebsocketConsumer):
         await self.channel_layer.group_add(self.room_group_name, self.channel_name)
         await self.accept()
 
+        session_user = await self.get_session_user()
+        initial_suggestions = await sync_to_async(get_initial_suggestions)(session_user)
+
         await self.send(text_data=json.dumps({
             "type": "connected",
             "message": "WebSocket connected successfully",
-            "session_key": self.session_key
+            "session_key": self.session_key,
+            "suggestions": initial_suggestions,
         }))
+
+        # NEW — Requirement 10: idle-detection state + background watcher.
+        # last_activity resets har naye client message pe; idle_already_sent
+        # bhi tab reset hota hai — taake "ek idle period mein sirf ek baar"
+        # ka rule follow ho, lekin agli baar phir se idle hone par dobara fire ho sake.
+        self.last_activity = time.monotonic()
+        self.idle_already_sent = False
+        self.page_context = None  # frontend agar "page_context" bheje to yahan store hoga
+        self.idle_task = asyncio.create_task(self._idle_watcher())
 
     async def disconnect(self, close_code):
         if hasattr(self, 'room_group_name'):
             await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
+        # NEW — background task ko band karna zaroori hai, warna connection
+        # band hone ke baad bhi ye chalta rahega
+        if hasattr(self, 'idle_task'):
+            self.idle_task.cancel()
 
     @sync_to_async
     def check_session_not_deleted(self):
         session = ChatSession.objects.filter(session_key=self.session_key).first()
         return session is None or not session.is_deleted
+
+    @sync_to_async
+    def get_session_user(self):
+        session = ChatSession.objects.select_related('user').filter(session_key=self.session_key).first()
+        return session.user if session else None
+
+    async def _idle_watcher(self):
+        """
+        NEW — Requirement 10. Har second check karta hai: agar last message
+        se 30 second guzar chuke hain AUR is idle-period mein pehle se
+        proactive message nahi bheja gaya, to ek proactive message bhejta
+        hai — aur uske baad chup ho jata hai jab tak user dobara active na ho.
+        """
+        try:
+            while True:
+                await asyncio.sleep(1)
+                elapsed = time.monotonic() - self.last_activity
+                if elapsed >= IDLE_THRESHOLD_SECONDS and not self.idle_already_sent:
+                    await self._send_proactive_message()
+                    self.idle_already_sent = True
+        except asyncio.CancelledError:
+            pass
+
+    async def _send_proactive_message(self):
+        if self.page_context:
+            message = f"Kuch aur dhoondna hai {self.page_context} ke ilawa?"
+        else:
+            message = "Kuch dhoondne mein madad chahiye?"
+
+        await self.send(text_data=json.dumps({
+            "type": "message",
+            "sender": "ai",
+            "message": message,
+            "proactive": True,
+            "metadata": None,
+            "suggestions": ["Find a product", "Talk to support"],
+        }))
 
     async def receive(self, text_data):
         try:
@@ -59,28 +114,26 @@ class ChatConsumer(AsyncWebsocketConsumer):
             await self.send(text_data=json.dumps({"type": "error", "message": "Invalid message format — expected JSON."}))
             return
 
-        # Requirement 13 — expired/invalid token pe connection band
+        # NEW — Requirement 10: har naye message pe idle-timer reset
+        self.last_activity = time.monotonic()
+        self.idle_already_sent = False
+        if data.get('page_context'):
+            self.page_context = data['page_context']
+
         if getattr(self, 'token', None) and is_token_expired_or_invalid(self.token):
-            await self.send(text_data=json.dumps({
-                "type": "error", "code": "SESSION_EXPIRED",
-                "message": "Session expired, please log in again.",
-            }))
+            await self.send(text_data=json.dumps({"type": "error", "code": "SESSION_EXPIRED", "message": "Session expired, please log in again."}))
             await self.close(code=4401)
             return
 
-        # Requirement 11 — rate limiting
         user_id = await self.get_session_user_id()
         allowed = await sync_to_async(check_all_rate_limits)(self.session_key, user_id, getattr(self, 'client_ip', None))
         if not allowed:
-            await self.send(text_data=json.dumps({
-                "type": "error", "code": "RATE_LIMITED",
-                "message": "Too many messages — please wait a moment before sending again.",
-            }))
+            await self.send(text_data=json.dumps({"type": "error", "code": "RATE_LIMITED", "message": "Too many messages — please wait a moment before sending again."}))
             return
 
         user_message = data.get("message", "")
+        attachment_file_id = (data.get("attachment") or {}).get("file_id")
 
-        # Requirement 12 — validate before doing anything else
         try:
             validate_message(user_message)
         except MessageValidationError as e:
@@ -88,16 +141,25 @@ class ChatConsumer(AsyncWebsocketConsumer):
             return
 
         try:
-            response_text, products_metadata = await self.get_agent_response(user_message)
+            response_text, products_metadata, suggestions = await self.get_agent_response(user_message, attachment_file_id)
         except Exception as e:
-            response_text, products_metadata = f"Sorry, something went wrong: {str(e)}", []
+            await self.send(text_data=json.dumps({"type": "error", "message": f"Sorry, something went wrong: {str(e)}"}))
+            return
 
-        await self.send(text_data=json.dumps({
-            "type": "message",
-            "sender": "ai",
-            "message": response_text,
-            "metadata": {"products": products_metadata} if products_metadata else None,
-        }))
+        words = response_text.split(' ')
+        CHUNK_SIZE_WORDS = 4
+        chunks = [' '.join(words[i:i + CHUNK_SIZE_WORDS]) + (' ' if i + CHUNK_SIZE_WORDS < len(words) else '')
+                  for i in range(0, len(words), CHUNK_SIZE_WORDS)]
+        if not chunks:
+            chunks = ['']
+
+        for idx, chunk in enumerate(chunks):
+            is_last = (idx == len(chunks) - 1)
+            payload = {"type": "message_chunk", "sender": "ai", "chunk": chunk, "done": is_last}
+            if is_last:
+                payload["metadata"] = {"products": products_metadata} if products_metadata else None
+                payload["suggestions"] = suggestions
+            await self.send(text_data=json.dumps(payload))
 
     @sync_to_async
     def get_session_user_id(self):
@@ -105,18 +167,29 @@ class ChatConsumer(AsyncWebsocketConsumer):
         return session.user_id if session else None
 
     @sync_to_async
-    def get_agent_response(self, user_message):
+    def get_agent_response(self, user_message, attachment_file_id=None):
         chat_session, _ = ChatSession.objects.get_or_create(
             session_key=self.session_key,
             defaults={'store': Store.objects.first(), 'channel': 'customer'},
         )
         user = chat_session.user
 
-        # Requirement 12 — escaped version DB mein save hota hai
-        ChatMessage.objects.create(session=chat_session, sender='user', message=escape_for_storage(user_message))
+        user_msg_metadata = None
+        if attachment_file_id:
+            from apps.ai.models import ChatUpload
+            upload = ChatUpload.objects.filter(id=attachment_file_id).first()
+            if upload:
+                user_msg_metadata = {'attachment_url': upload.file.url}
+
+        ChatMessage.objects.create(
+            session=chat_session, sender='user',
+            message=escape_for_storage(user_message), metadata=user_msg_metadata,
+        )
 
         if user is not None:
-            messages_qs = ChatMessage.objects.filter(session__user=user, session__channel='customer').select_related('session').order_by('-created_at')
+            messages_qs = ChatMessage.objects.filter(
+                session__user=user, session__channel='customer'
+            ).select_related('session').order_by('-created_at')
         else:
             messages_qs = chat_session.messages.order_by('-created_at')
 
@@ -125,7 +198,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         chat_history = []
         for msg in previous_messages:
-            # Requirement 12 — unescape karke LLM ko context dena, taake escaped entities pollute na karein
             text = unescape_for_context(msg.message)
             if msg.sender == 'user':
                 chat_history.append(HumanMessage(content=text))
@@ -134,8 +206,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         customer_context = get_customer_context(user)
 
-        output, products_metadata = run_shopping_agent(
-            user_message,  # LLM is turn ka raw (validated) message dekhta hai
+        output, products_metadata, suggestions = run_shopping_agent(
+            user_message,
             session_key=self.session_key,
             user=user,
             chat_history=chat_history,
@@ -153,4 +225,4 @@ class ChatConsumer(AsyncWebsocketConsumer):
             metadata={"products": products_metadata} if products_metadata else None,
         )
 
-        return output, products_metadata
+        return output, products_metadata, suggestions

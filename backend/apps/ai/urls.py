@@ -5,7 +5,8 @@ from .views import StartChatSessionView, ChatSessionHistoryView, ClearChatSessio
 from .admin_views import StartAdminChatSessionView
 from .session_views import ChatSessionListView, AdminChatSessionListView, DeleteChatSessionView   # NEW
 from .admin_action_views import ConfirmAdminActionView, CancelAdminActionView   # NEW
-
+from .upload_views import ChatUploadView
+from .feedback_views import MessageFeedbackView
 
 urlpatterns = [
     path('session/start/', StartChatSessionView.as_view(), name='chat-session-start'),
@@ -17,6 +18,9 @@ urlpatterns = [
     path('admin/sessions/', AdminChatSessionListView.as_view(), name='admin-chat-session-list'),  # NEW — Requirement 1
     path('admin/action/<str:action_id>/confirm/', ConfirmAdminActionView.as_view(), name='admin-action-confirm'),  # NEW
     path('admin/action/<str:action_id>/cancel/', CancelAdminActionView.as_view(), name='admin-action-cancel'),    # NEW
+    path('upload/', ChatUploadView.as_view(), name='chat-upload'),
+    path('message/<int:message_id>/feedback/', MessageFeedbackView.as_view(), name='chat-message-feedback'), 
+    
 ]
 
 audit_log_urlpatterns = [

@@ -14,7 +14,6 @@ _SUPPORTED_RANGES = (
 
 
 def _resolve_date_range(date_range: str):
-
     """FLOW: Ye helper sab 4 tools ke andar call hota hai —
     'last_30_days' jaisa keyword ko actual start_date/end_date mein convert karta hai."""
 
@@ -53,7 +52,6 @@ def _resolve_date_range(date_range: str):
 
 
 def sales_report_tool(user, date_range: str = "last_30_days") -> dict:
-
     """FLOW: registry.py se call hota hai → _resolve_date_range() se dates banti hain
     → api_client.py se GET /api/v1/analytics/sales/ hit hota hai
     → apps/analytics/views.py tak request jati hai → response yahan wapis aata hai"""
@@ -77,13 +75,16 @@ def sales_report_tool(user, date_range: str = "last_30_days") -> dict:
     return {
         'success': True,
         'date_range': date_range,
+        'period': {'start': start_date, 'end': end_date},
         'summary': {'days_with_data': len(rows), 'daily_breakdown': rows},
-        'totals': {'total_orders': total_orders, 'total_revenue': total_revenue},
+        'totals': {
+            'total_orders': int(total_orders), 
+            'total_revenue': float(total_revenue)
+        },
     }
 
 
 def revenue_report_tool(user, date_range: str = "last_30_days") -> dict:
-
     """FLOW: sales_report_tool() jaisa hi pattern, /api/v1/analytics/revenue/ hit karta hai"""
 
     """GET /api/v1/analytics/revenue/ — revenue grouped by period (cancelled orders excluded)."""
@@ -104,7 +105,11 @@ def revenue_report_tool(user, date_range: str = "last_30_days") -> dict:
     return {
         'success': True,
         'date_range': date_range,
-        'revenue_breakdown': {'by_period': rows, 'total_revenue': total_revenue},
+        'period': {'start': start_date, 'end': end_date},
+        'revenue_breakdown': {
+            'by_period': rows, 
+            'total_revenue': float(total_revenue)
+        },
     }
 
 
@@ -127,26 +132,25 @@ def best_sellers_tool(user, date_range: str = "last_30_days", limit: int = 5) ->
         {
             'product_id': r.get('product_id'),
             'name': r.get('product_name'),
-            'units_sold': r.get('total_sold'),
-            'revenue': r.get('total_revenue'),
+            'units_sold': int(r.get('total_sold', 0) or 0),
+            'revenue': float(r.get('total_revenue', 0.0) or 0.0),
         }
         for r in rows
     ]
 
-    return {'success': True, 'date_range': date_range, 'best_sellers': best_sellers}
+    return {
+        'success': True,
+        'date_range': date_range,
+        'period': {'start': start_date, 'end': end_date},
+        'best_sellers': best_sellers,
+    }
 
 
 def customer_growth_tool(user, date_range: str = "last_30_days") -> dict:
-
-    """FLOW: /api/v1/analytics/customers/growth/ hit karta hai.
-    Note: 'retention' hamesha None hai — koi cohort-tracking table DB mein nahi hai abhi."""
+    """FLOW: /api/v1/analytics/customers/growth/ hit karta hai."""
     
     """
     GET /api/v1/analytics/customers/growth/ — new customer count per period.
-    Note: 'retention' (PDF output field) is not tracked anywhere in the
-    database (no repeat-purchase/cohort table exists) — same kind of gap
-    as order status-history noted in order_tools.py. Returned as None
-    with an explanatory note rather than a made-up number.
     """
     start_date, end_date = _resolve_date_range(date_range)
     params = {'period': 'daily'}
@@ -165,7 +169,8 @@ def customer_growth_tool(user, date_range: str = "last_30_days") -> dict:
     return {
         'success': True,
         'date_range': date_range,
-        'new_customers': total_new_customers,
+        'period': {'start': start_date, 'end': end_date},
+        'new_customers': int(total_new_customers),
         'by_period': rows,
         'retention': None,
         'note': 'Retention is not tracked in the database yet — only new-customer counts are available.',

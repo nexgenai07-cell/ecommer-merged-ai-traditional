@@ -36,7 +36,12 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
             "type": "connected",
             "message": "Admin WebSocket connected successfully",
             "session_key": self.session_key,
+            "suggestions": [
+                "View products", "Check inventory",
+                "View sales report", "Check low stock",
+            ],
         }))
+        
 
     async def disconnect(self, close_code):
         if hasattr(self, 'room_group_name'):
@@ -82,9 +87,10 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
             return
 
         try:
-            response_text, metadata = await self.get_agent_response(user_message)
+            # UPDATED: Receive 3 items now
+            response_text, metadata, suggestions = await self.get_agent_response(user_message)
         except Exception as e:
-            response_text, metadata = f"Sorry, something went wrong: {str(e)}", None
+            response_text, metadata, suggestions = f"Sorry, something went wrong: {str(e)}", None, []
 
         requires_confirmation = bool(metadata and metadata.get('pending_action'))
 
@@ -92,6 +98,7 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
             "type": "message", "sender": "ai", "message": response_text,
             "requires_confirmation": requires_confirmation,
             "metadata": metadata,
+            "suggestions": suggestions,   # UPDATED: Sending suggestions to frontend WebSocket
         }))
 
     @sync_to_async
@@ -121,10 +128,13 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
             else:
                 chat_history.append(AIMessage(content=text))
 
-        output, metadata = run_admin_agent(user_message, session_key=self.session_key, user=user, chat_history=chat_history)
+        # UPDATED: Unpack 3-tuple returned from run_admin_agent
+        output, metadata, suggestions = run_admin_agent(user_message, session_key=self.session_key, user=user, chat_history=chat_history)
 
         if isinstance(output, list):
             output = " ".join(block.get("text", "") if isinstance(block, dict) else str(block) for block in output).strip()
 
         ChatMessage.objects.create(session=chat_session, sender='ai', message=output, metadata=metadata)
-        return output, metadata
+        
+        # UPDATED: Return 3 values
+        return output, metadata, suggestions

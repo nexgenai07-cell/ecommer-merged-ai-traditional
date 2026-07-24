@@ -3,6 +3,7 @@
 from django.db import models
 from django.conf import settings
 
+import uuid as uuid_lib
 
 class ChatSession(models.Model):
     CHANNEL_CHOICES = [
@@ -58,6 +59,8 @@ class ChatMessage(models.Model):
                    help_text='Structured data: product cards, order info, cart state etc.'
                  )
     created_at = models.DateTimeField(auto_now_add=True)
+    rating      = models.CharField(max_length=4, choices=[('up', 'Up'), ('down', 'Down')], null=True, blank=True)  # NEW
+    rated_at    = models.DateTimeField(null=True, blank=True)   # NEW
 
     class Meta:
         db_table = 'chat_messages'
@@ -146,3 +149,12 @@ class KnowledgeDocument(models.Model):
     def __str__(self):
         status = 'indexed' if self.is_indexed else 'not indexed'
         return f'{self.title} ({status})'
+
+class ChatUpload(models.Model):
+    id          = models.UUIDField(primary_key=True, default=uuid_lib.uuid4, editable=False)
+    file        = models.FileField(upload_to='chat_uploads/')
+    uploaded_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    created_at  = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'chat_uploads'
