@@ -63,6 +63,20 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
             return False
         return session.user is not None and getattr(session.user, 'role', None) == 'admin'
 
+    # NEW — FIX: group-event handler for messages pushed from OUTSIDE this
+    # consumer (e.g. apps/ai/admin_action_views.py ConfirmAdminActionView,
+    # which runs as a plain synchronous DRF request — a completely separate
+    # request/response cycle with no open `receive()` to reply through).
+    # Until now, group_add() added this connection to "admin_chat_<session_key>"
+    # but nothing ever called channel_layer.group_send() on that group, and
+    # no handler existed to receive such an event even if something did — so
+    # confirming via the REST button executed the action but the chat UI
+    # never found out. Channels routes a group_send event to a method named
+    # after its "type" key with dots turned into underscores, so a payload
+    # sent with type="chat.message" arrives here.
+    async def chat_message(self, event):
+        await self.send(text_data=json.dumps(event["payload"]))
+
     async def receive(self, text_data):
         try:
             data = json.loads(text_data)

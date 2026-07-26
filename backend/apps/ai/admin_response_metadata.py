@@ -136,3 +136,98 @@ def extract_admin_metadata(intermediate_steps):
         result['pending_action'] = pending_action
     result['analytics'] = analytics if analytics else None   # NEW — hamesha key present, null agar koi analytics tool nahi chala
     return result
+
+
+# NEW — FIX (Requirement 5 confirm-button bug): jab admin text ("haan") likh
+# kar confirm karta hai, LLM khud hi executor ka result dekh kar natural
+# language mein jawab likh deta hai. REST button flow (admin_action_views.py)
+# mein koi LLM call nahi hoti — is liye humein khud hi executor ke result se
+# ek chota, readable confirmation message aur ChatConsumer jaisa hi metadata
+# shape banana padta hai, taake dono flows (text vs button) se same tarah ka
+# message chat mein dikhe.
+
+def describe_executed_admin_action(tool_name: str, result: dict) -> str:
+    """Executed pending-action ke result se ek chota Roman-Urdu confirmation
+    message banata hai — REST confirm/cancel endpoints ke liye."""
+    if not isinstance(result, dict):
+        return "Action complete ho gaya hai."
+
+    if not result.get('success'):
+        error = result.get('error') or 'Wajah maloom nahi ho saki.'
+        return f"Ye action fail ho gaya: {error}"
+
+    if tool_name == 'create_product':
+        p = result.get('product') or {}
+        return f"Product '{p.get('name', '')}' create ho gaya hai ✅ (ID: {p.get('id', '')})"
+
+    if tool_name == 'update_product':
+        p = result.get('product') or {}
+        return f"Product '{p.get('name', '')}' (ID: {p.get('id', '')}) update ho gaya hai ✅"
+
+    if tool_name == 'delete_product':
+        name = result.get('product_name')
+        pid = result.get('product_id')
+        if name:
+            return f"Product '{name}' (ID: {pid}) successfully delete ho gaya hai ✅"
+        return f"Product ID {pid} successfully delete ho gaya hai ✅"
+
+    if tool_name == 'create_category':
+        c = result.get('category') or {}
+        return f"Category '{c.get('name', '')}' create ho gayi hai ✅ (ID: {c.get('id', '')})"
+
+    if tool_name == 'update_category':
+        c = result.get('category') or {}
+        return f"Category '{c.get('name', '')}' (ID: {c.get('id', '')}) update ho gayi hai ✅"
+
+    if tool_name == 'delete_category':
+        name = result.get('category_name')
+        cid = result.get('category_id')
+        if name:
+            return f"Category '{name}' (ID: {cid}) successfully delete ho gayi hai ✅"
+        return f"Category ID {cid} successfully delete ho gayi hai ✅"
+
+    if tool_name == 'update_inventory':
+        return f"Product ID {result.get('product_id')} ka stock {result.get('quantity')} set ho gaya hai ✅"
+
+    if tool_name == 'update_order':
+        return f"Order {result.get('order_id')} update ho gaya hai ✅"
+
+    if tool_name == 'cancel_order':
+        return f"Order {result.get('order_id')} cancel ho gaya hai ✅"
+
+    return "Action complete ho gaya hai ✅"
+
+
+def build_executed_admin_metadata(tool_name: str, result: dict) -> dict:
+    """extract_admin_metadata() jaisa hi shape banata hai ({'products': [...],
+    'categories': [...], 'customers': [...], 'analytics': None}) — taake
+    frontend ka existing metadata-rendering code REST confirm/cancel se aane
+    wale message ke liye bhi kaam kare, bina kisi frontend change ke."""
+    products, categories = [], []
+
+    if isinstance(result, dict) and result.get('success'):
+        if tool_name in ('create_product', 'update_product') and isinstance(result.get('product'), dict):
+            p = result['product']
+            category = p.get('category')
+            products.append({
+                'product_id': p.get('id'),
+                'category_id': category.get('id') if isinstance(category, dict) else None,
+                'name': p.get('name'),
+                'price': p.get('price'),
+                'image': p.get('primary_image', p.get('image')),
+            })
+        elif tool_name == 'delete_product':
+            products.append({
+                'product_id': result.get('product_id'),
+                'category_id': None,
+                'name': result.get('product_name'),
+                'price': None,
+                'image': None,
+            })
+        elif tool_name in ('create_category', 'update_category') and isinstance(result.get('category'), dict):
+            c = result['category']
+            categories.append({'category_id': c.get('id'), 'name': c.get('name')})
+        elif tool_name == 'delete_category':
+            categories.append({'category_id': result.get('category_id'), 'name': result.get('category_name')})
+
+    return {'products': products, 'categories': categories, 'customers': [], 'analytics': None}
