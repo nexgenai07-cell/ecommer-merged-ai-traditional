@@ -24,12 +24,11 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'unsafe-default-key-change-me')
 
 DEBUG = os.getenv('DEBUG', 'False') == 'True'
 
-# ALLOWED_HOSTS = [ "localhost",
-#     "127.0.0.1",
-#     ".vercel.app",]
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,.up.railway.app,*').split(',')
+
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 # Stripe configuration
-# STRIPE_WEBHOOK_SECRET will be updated after setting up Stripe CLI/webhook.
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
@@ -135,27 +134,25 @@ ASGI_APPLICATION = "core.asgi.application"
 # DATABASE
 # -------------------------------------------------
 
-# DATABASES = {
-#     "default": {
-#         "ENGINE": "django.db.backends.postgresql",
-#         "NAME": os.getenv("DB_NAME"),
-#         "USER": os.getenv("DB_USER"),
-#         "PASSWORD": os.getenv("DB_PASSWORD"),
-#         "HOST": os.getenv("DB_HOST"),
-#         "PORT": os.getenv("DB_PORT", "5432"),
-#         "OPTIONS": {
-#             "sslmode": "require",
-#         },
-#     }
-# }
+DATABASE_URL = os.getenv('DATABASE_URL')
 
-DATABASES = {
-    "default": dj_database_url.parse(
-        "postgresql://neondb_owner:npg_0HpNgaCXI1RE@ep-tiny-cloud-atmezn6j-pooler.c-9.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
-        conn_max_age=600,
-        ssl_require=True,
-    )
-}
+if DATABASE_URL:
+    DATABASES = {
+        "default": dj_database_url.parse(
+            DATABASE_URL,
+            conn_max_age=600,
+            ssl_require=True,
+        )
+    }
+else:
+    # Fallback Neon Database Connection
+    DATABASES = {
+        "default": dj_database_url.parse(
+            "postgresql://neondb_owner:npg_0HpNgaCXI1RE@ep-tiny-cloud-atmezn6j-pooler.c-9.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
+            conn_max_age=600,
+            ssl_require=True,
+        )
+    }
 
 # -------------------------------------------------
 # AUTH
@@ -195,13 +192,11 @@ REST_FRAMEWORK = {
     ),
     "DEFAULT_PAGINATION_CLASS": "core.pagination.StandardResultsPagination",
     "PAGE_SIZE": 10,
-     # NEW — Requirement 11
     "DEFAULT_THROTTLE_RATES": {
         "chat_user": "60/min",
         "chat_anon": "60/min",
     },
 }
-
 
 # -------------------------------------------------
 # JWT
@@ -215,13 +210,22 @@ SIMPLE_JWT = {
 }
 
 # -------------------------------------------------
-# CORS
+# CORS & CSRF
 # -------------------------------------------------
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:3000",
 ]
+if os.getenv('CORS_ALLOWED_ORIGINS'):
+    CORS_ALLOWED_ORIGINS.extend([o.strip() for o in os.getenv('CORS_ALLOWED_ORIGINS').split(',') if o.strip()])
+
+CSRF_TRUSTED_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+if os.getenv('CSRF_TRUSTED_ORIGINS'):
+    CSRF_TRUSTED_ORIGINS.extend([o.strip() for o in os.getenv('CSRF_TRUSTED_ORIGINS').split(',') if o.strip()])
 
 # -------------------------------------------------
 # CHANNELS
@@ -277,7 +281,6 @@ else:
         }
     }
 
-
 # ============================================
 # QDRANT — Vector Database
 # ============================================
@@ -286,16 +289,9 @@ QDRANT_API_KEY = os.getenv('QDRANT_API_KEY', None)
 QDRANT_COLLECTION = 'products'
 
 # ============================================
-# GEMINI AI
+# GEMINI AI — multiple keys support
 # ============================================
-
-
-# ============================================
-# GEMINI AI — multiple keys ke sath fallback support
-# ============================================
-# .env file mein comma-separated keys likhein:
-# GEMINI_API_KEYS=key1,key2,key3
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')  # backward-compat — akeli/pehli key
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
 _gemini_keys_raw = os.getenv('GEMINI_API_KEYS', '')
 if _gemini_keys_raw:
@@ -304,21 +300,9 @@ elif GEMINI_API_KEY:
     GEMINI_API_KEYS = [GEMINI_API_KEY]
 else:
     GEMINI_API_KEYS = []
-    
+
 # ============================================
-# GROQ — Final fallback jab sari Gemini keys exhaust ho jayein (chat/agent only, embeddings ke liye nahi)
+# GROQ & INTERNAL API
 # ============================================
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
-
 INTERNAL_API_URL = os.getenv('INTERNAL_API_URL', 'http://localhost:8000')
-
-# ALLOWED_HOSTS ab uncomment aur env-driven honi chahiye
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
-
-# Railway apne edge pe HTTPS terminate karta hai aur request Django ko HTTP
-# ke tor par forward karta hai, is header ke sath — Django ko batana zaroori
-# hai ke asal request HTTPS thi (warna CSRF/cookie issues aa sakte hain)
-SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-
-# Admin panel aur POST requests HTTPS domain se aayengi — CSRF ko batana hoga
-CSRF_TRUSTED_ORIGINS = os.getenv('CSRF_TRUSTED_ORIGINS', '').split(',') if os.getenv('CSRF_TRUSTED_ORIGINS') else []
