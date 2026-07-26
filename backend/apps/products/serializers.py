@@ -8,7 +8,7 @@ class CategorySerializer(serializers.Serializer):
 
 # Converts product image data into API response format.
 class ProductImageSerializer(serializers.ModelSerializer):
-    image = serializers.CharField(read_only=True)
+    image = serializers.SerializerMethodField()
 
     class Meta:
         model = ProductImage
