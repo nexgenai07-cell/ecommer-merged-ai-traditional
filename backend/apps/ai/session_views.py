@@ -11,6 +11,9 @@ from rest_framework.response import Response
 from apps.users.permissions import IsAdmin
 from .models import ChatSession, ChatMessage
 
+from apps.ai.mixins import ChatAuthErrorMixin
+from apps.ai.throttles import ChatUserRateThrottle, ChatAnonRateThrottle
+
 
 def _build_session_list_response(request, base_queryset):
     """
@@ -60,30 +63,33 @@ def _build_session_list_response(request, base_queryset):
     return Response({'count': count, 'sessions': sessions_data}, status=status.HTTP_200_OK)
 
 
-class ChatSessionListView(APIView):
+class ChatSessionListView(ChatAuthErrorMixin, APIView):
     """GET /api/v1/chat/sessions/ — customer's own past sessions."""
     permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = [ChatUserRateThrottle, ChatAnonRateThrottle]
 
     def get(self, request):
         base_qs = ChatSession.objects.filter(user=request.user, channel='customer')
         return _build_session_list_response(request, base_qs)
 
 
-class AdminChatSessionListView(APIView):
+class AdminChatSessionListView(ChatAuthErrorMixin, APIView):
     """GET /api/v1/chat/admin/sessions/ — admin's own past sessions."""
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
+    throttle_classes = [ChatUserRateThrottle, ChatAnonRateThrottle]
 
     def get(self, request):
         base_qs = ChatSession.objects.filter(user=request.user, channel='admin')
         return _build_session_list_response(request, base_qs)
 
 
-class DeleteChatSessionView(APIView):
+class DeleteChatSessionView(ChatAuthErrorMixin, APIView):
     """
     DELETE /api/v1/chat/session/{session_key}/ — Requirement 2.
     Soft delete only — no rows are physically removed.
     """
     permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = [ChatUserRateThrottle, ChatAnonRateThrottle]
 
     def delete(self, request, session_key):
         try:

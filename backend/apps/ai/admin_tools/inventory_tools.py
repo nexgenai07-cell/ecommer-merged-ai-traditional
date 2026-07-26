@@ -26,13 +26,22 @@ def check_inventory(user, product_id: int) -> dict:
     }
 
 
-def propose_update_inventory(session_key: str, product_id: int, quantity: int) -> dict:
+def propose_update_inventory(session_key: str, user_id: int, product_id: int, quantity: int) -> dict:
     """FLOW: registry.py ke update_inventory tool se call hota hai — preview banata hai."""
     """Stock update ka preview — asal PATCH confirm ke baad."""
     preview = {'action': 'update_inventory', 'product_id': product_id, 'new_quantity': quantity}
     pending_kwargs = {'product_id': product_id, 'quantity': quantity}
-    action_id = create_pending_action(session_key, 'update_inventory', pending_kwargs, preview)
-    return {'requires_confirmation': True, 'action_id': action_id, 'preview': preview}
+    # FIX — pehle 'user_id' argument yahan pass nahi ho raha tha, jis
+    # wajah se create_pending_action() ke andar arguments shift ho jate
+    # thay aur akhri 'preview' argument missing reh jata tha -> TypeError.
+    result = create_pending_action(session_key, user_id, 'update_inventory', pending_kwargs, preview)
+    return {
+        'requires_confirmation': True,
+        'action_id': result['action_id'],
+        'action_type': 'update_inventory',
+        'preview': preview,
+        'expires_at': result['expires_at'],
+    }
 
 
 def execute_update_inventory(user, payload: dict) -> dict:
@@ -51,7 +60,7 @@ def low_stock(user, threshold: int = None) -> dict:
 
     """FLOW: Read-only — GET /api/v1/products/low-stock/ hit karta hai,
     phir agar admin ne extra threshold diya ho to client-side filter lagata hai."""
-    
+
     """
     Read-only. GET /api/v1/products/low-stock/ har product ke apne
     low_stock_threshold ke against check karta hai (endpoint khud koi

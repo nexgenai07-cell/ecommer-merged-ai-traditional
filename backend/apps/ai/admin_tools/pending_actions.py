@@ -1,48 +1,80 @@
 # PATH: apps/ai/admin_tools/pending_actions.py
-
-# FLOW: Ye poore confirmation-gating system ka core hai. registry.py
-# ke sab propose_* aur confirm_pending_action functions isay use karte
-# hain. Data Redis cache mein store hota hai (django.core.cache).
+#
+# Requirement 5 — Admin Confirm/Cancel Structured Action.
+#
+# action_id ab GLOBAL hai (session_key uske andar nahi) — taake REST
+# endpoint (jo sirf action_id jaanta hai, session_key nahi) usay dhoondh
+# sake. UUID v4 (unguessable), 5-minute business-rule expiry.
+#
+# Cache TTL (15 min) business-rule expiry (5 min) se JAAN-BOOJH KAR
+# zyada rakhi hai — taake "expired" (410) aur "not found/resolved" (404)
+# mein farq kiya ja sake. Agar dono ka TTL same hota, expire hone ke
+# baad hum kabhi bata hi nahi pate ke action expire hua tha ya kabhi
+# tha hi nahi.
 
 import uuid
 from django.core.cache import cache
+from django.utils import timezone
+from datetime import timedelta
 
-PENDING_ACTION_TTL_SECONDS = 600  # 10 minutes — itni dair mein confirm na kare to expire
+LOGICAL_TTL_SECONDS = 300      # business rule: 5 minutes
+CACHE_SAFETY_TTL_SECONDS = 900  # Redis mein isse zyada dair tak rakhte hain
+
+ACTION_TYPE_CHOICES = [
+    'create_product', 'update_product', 'delete_product',
+    'create_category', 'update_category', 'delete_category',
+    'update_inventory', 'update_order', 'cancel_order',
+]
 
 
-def create_pending_action(session_key: str, tool_name: str, kwargs: dict, preview: dict) -> str:
+def _cache_key(action_id: str) -> str:
+    return f"admin_pending_action:{action_id}"
 
-    """FLOW: product_tools.py/category_tools.py/inventory_tools.py/order_tools.py
-    ke sab propose_* functions se call hota hai. Redis mein ek naya
-    entry banta hai, action_id return hota hai."""
 
+def create_pending_action(session_key: str, user_id: int, tool_name: str, kwargs: dict, preview: dict) -> dict:
     """
-    Ek pending (abhi execute nahi hui) action ko cache mein store karta hai.
-    Returns: action_id jo admin ko confirmation maangte waqt reference k liye diya jata hai.
+    Returns: {'action_id': ..., 'expires_at': iso_string}
     """
-    action_id = uuid.uuid4().hex[:12]
-    cache_key = f"pending_action:{session_key}:{action_id}"
-    cache.set(cache_key, {
+    action_id = str(uuid.uuid4())
+    expires_at = timezone.now() + timedelta(seconds=LOGICAL_TTL_SECONDS)
+
+    cache.set(_cache_key(action_id), {
+        'session_key': session_key,
+        'user_id': user_id,
         'tool_name': tool_name,
         'kwargs': kwargs,
         'preview': preview,
-    }, timeout=PENDING_ACTION_TTL_SECONDS)
-    return action_id
+        'expires_at': expires_at.isoformat(),
+        'resolved': False,
+    }, timeout=CACHE_SAFETY_TTL_SECONDS)
 
-def get_pending_action(session_key: str, action_id: str) -> dict | None:
-
-    """FLOW: registry.py ke confirm_pending_action se call hota hai —
-    admin ke 'haan' bolne pe Redis se pending action wapis nikalti hai."""
-
-    """Pending action ko cache se nikalta hai (confirm karte waqt use hota hai)."""
-    cache_key = f"pending_action:{session_key}:{action_id}"
-    return cache.get(cache_key)
+    return {'action_id': action_id, 'expires_at': expires_at.isoformat()}
 
 
-def clear_pending_action(session_key: str, action_id: str):
+def get_pending_action(action_id: str) -> dict | None:
+    """Raw fetch — no expiry/resolved check. Callers check that themselves."""
+    return cache.get(_cache_key(action_id))
 
-    """FLOW: confirm_pending_action mein, execute hone ke turant baad call hota hai — Redis se hata deta hai."""
-    
-    """Confirm/reject hone k baad cache se hata dete hain."""
-    cache_key = f"pending_action:{session_key}:{action_id}"
-    cache.delete(cache_key)
+
+def is_expired(pending: dict) -> bool:
+    expires_at = timezone.datetime.fromisoformat(pending['expires_at'])
+    return timezone.now() > expires_at
+
+
+def mark_resolved(action_id: str):
+    """
+    Doesn't delete — keeps the record (still inside its 15-min cache
+    window) so a SECOND confirm/cancel attempt on the same action_id
+    can still be found and correctly reported as 'already resolved'
+    (404) rather than silently vanishing.
+    """
+    pending = cache.get(_cache_key(action_id))
+    if pending is not None:
+        pending['resolved'] = True
+        cache.set(_cache_key(action_id), pending, timeout=CACHE_SAFETY_TTL_SECONDS)
+
+
+# Kept for backward-compat with any old call sites expecting this name —
+# now just an alias.
+def clear_pending_action(action_id: str):
+    mark_resolved(action_id)

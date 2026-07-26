@@ -24,7 +24,7 @@ class CartProductSerializer(serializers.ModelSerializer):
 
     def get_primary_image(self, obj):
         img = obj.primary_image
-        return img.image_url if img and img.image else None
+        return img.image.url if img and img.image else None
 
 
 class CartItemSerializer(serializers.ModelSerializer):

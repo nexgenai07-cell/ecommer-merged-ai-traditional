@@ -123,9 +123,12 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
         })
 
         # FLOW: result["intermediate_steps"] mein har tool call ka record hai —
-        # ye extract_product_metadata() ko diya jata hai
+        # ye extract_product_metadata() aur get_customer_followup_suggestions() dono ko diya jata hai
 
-        return result["output"], extract_product_metadata(result.get("intermediate_steps", []))
+        from apps.ai.suggestions import get_customer_followup_suggestions   # NEW
+        steps = result.get("intermediate_steps", [])
+
+        return result["output"], extract_product_metadata(steps), get_customer_followup_suggestions(steps)
 
     def make_groq_attempt(model_name):
         def attempt():
@@ -136,7 +139,11 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
                 "chat_history": chat_history,
                 "customer_context": customer_context,
             })
-            return result["output"], extract_product_metadata(result.get("intermediate_steps", []))
+
+            from apps.ai.suggestions import get_customer_followup_suggestions   # NEW
+            steps = result.get("intermediate_steps", [])
+
+            return result["output"], extract_product_metadata(steps), get_customer_followup_suggestions(steps)
         return attempt
 
     fallback_fns = []

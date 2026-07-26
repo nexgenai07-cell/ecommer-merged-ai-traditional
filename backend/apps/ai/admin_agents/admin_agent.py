@@ -12,7 +12,7 @@ from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from apps.ai.admin_tools.registry import get_admin_agent_tools      # FLOW → apps/ai/admin_tools/registry.py
-from apps.ai.gemini_utils import gemini_keys, call_with_fallback    # FLOW → apps/ai/gemini_utils.py (same file jo customer side use karti hai)
+from apps.ai.gemini_utils import gemini_keys, call_with_fallback    # FLOW → apps/ai/gemini_utils.py
 
 
 SYSTEM_PROMPT = """You are the Admin Assistant for an e-commerce platform's dashboard. You help
@@ -102,9 +102,6 @@ request is ambiguous, ask a clarifying question instead of guessing."""
 
 def _build_executor(llm, session_key, user):
 
-    # FLOW: yahan sab admin tools (create/update/delete product,
-    # category, inventory, order, + analytics) ek list mein milte hain
-
     tools = get_admin_agent_tools(session_key, user)
 
     prompt = ChatPromptTemplate.from_messages([
@@ -125,8 +122,6 @@ def _build_executor(llm, session_key, user):
 
 
 def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
-    from apps.ai.admin_response_metadata import extract_admin_metadata
-
     chat_history = chat_history or []
 
     def gemini_attempt():
@@ -138,17 +133,32 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
         )
         executor = _build_executor(llm, session_key, user)
 
-        # FLOW: LLM yahan decide karta hai kaunsa admin tool call karna hai
-
         result = executor.invoke({"input": user_input, "chat_history": chat_history})
-        return result["output"], extract_admin_metadata(result.get("intermediate_steps", []))
+        
+        # Metadata and Suggestions extraction
+        from apps.ai.admin_response_metadata import extract_admin_metadata
+        from apps.ai.suggestions import get_admin_followup_suggestions
+        
+        metadata = extract_admin_metadata(result.get("intermediate_steps", []))
+        suggestions = get_admin_followup_suggestions(metadata.get('pending_action'))
+        
+        return result["output"], metadata, suggestions
 
     def make_groq_attempt(model_name):
         def attempt():
             llm = ChatGroq(model=model_name, groq_api_key=settings.GROQ_API_KEY, temperature=0.2)
             executor = _build_executor(llm, session_key, user)
+            
             result = executor.invoke({"input": user_input, "chat_history": chat_history})
-            return result["output"], extract_admin_metadata(result.get("intermediate_steps", []))
+            
+            # Metadata and Suggestions extraction
+            from apps.ai.admin_response_metadata import extract_admin_metadata
+            from apps.ai.suggestions import get_admin_followup_suggestions
+            
+            metadata = extract_admin_metadata(result.get("intermediate_steps", []))
+            suggestions = get_admin_followup_suggestions(metadata.get('pending_action'))
+            
+            return result["output"], metadata, suggestions
         return attempt
 
     fallback_fns = []
@@ -156,6 +166,5 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
         fallback_fns.append(make_groq_attempt("llama-3.3-70b-versatile"))
         fallback_fns.append(make_groq_attempt("llama-3.1-8b-instant"))
 
-    # FLOW → gemini_utils.py se hoke wapis admin_consumers.py aata hai
-
+    # Return 3 values (output, metadata, suggestions)
     return call_with_fallback(gemini_attempt, fallback_fns=fallback_fns)
