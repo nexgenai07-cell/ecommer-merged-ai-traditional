@@ -4,6 +4,8 @@ import json
 import logging  # NEW — server-side error logging ke liye
 import time
 import asyncio
+import base64
+import mimetypes
 from channels.generic.websocket import AsyncWebsocketConsumer
 from asgiref.sync import sync_to_async
 from langchain_core.messages import HumanMessage, AIMessage
@@ -191,11 +193,31 @@ class ChatConsumer(AsyncWebsocketConsumer):
         user = chat_session.user
 
         user_msg_metadata = None
+        attachment_image = None  # NEW — FIX: ye actual image data hai jo ab agent ko jayega
         if attachment_file_id:
             from apps.ai.models import ChatUpload
             upload = ChatUpload.objects.filter(id=attachment_file_id).first()
             if upload:
                 user_msg_metadata = {'attachment_url': upload.file.url}
+                # NEW — FIX: pehle yahan sirf URL metadata mein save ho kar
+                # reh jaata tha, file ka content kabhi read/use nahi hota
+                # tha — is liye AI ko image kabhi milti hi nahi thi. Ab hum
+                # actual bytes read karke base64 mein agent ko dete hain
+                # (storage-agnostic — local disk ya S3 dono ke sath chalega,
+                # publicly-accessible URL par depend nahi karta).
+                try:
+                    with upload.file.open('rb') as f:
+                        image_bytes = f.read()
+                    mime_type = mimetypes.guess_type(upload.file.name)[0] or 'image/jpeg'
+                    attachment_image = {
+                        'base64': base64.b64encode(image_bytes).decode('utf-8'),
+                        'mime_type': mime_type,
+                    }
+                except Exception:
+                    logger.exception(
+                        "Failed to read chat attachment file_id=%s for session_key=%s",
+                        attachment_file_id, self.session_key,
+                    )
 
         ChatMessage.objects.create(
             session=chat_session, sender='user',
@@ -228,6 +250,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
             user=user,
             chat_history=chat_history,
             customer_context=customer_context,
+            image=attachment_image,   # NEW — FIX: ab image agent tak pohanchti hai
         )
 
         if isinstance(output, list):

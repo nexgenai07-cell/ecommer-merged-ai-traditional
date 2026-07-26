@@ -9,6 +9,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
 from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage  # NEW — FIX: image attachment ko message content block ke tor pe bhejne ke liye
 
 from apps.ai.tools.registry import SHOPPING_AGENT_TOOLS     # FLOW → apps/ai/tools/registry.py
 from apps.ai.tools.cart_order_tools import get_cart_order_tools      # FLOW → apps/ai/tools/cart_order_tools.py
@@ -65,6 +66,13 @@ CORE BEHAVIOR — never leave the customer with a dead end:
 8. Never make up product names, prices, stock, or order details — always
    base your answer on what the tools actually return.
 
+9. IMAGES: The customer may attach an image along with their message (e.g. a
+   photo of a product they want, or something similar they saw elsewhere). If
+   an image is present, look at it and describe in your own words what you
+   see relevant to shopping (item type, color, style), then use search_products
+   with a query based on that description to find matching or similar items —
+   never claim you can't see an attached image if one was actually provided.
+
 Be warm and natural, like a helpful friend in a shop — not robotic or
 transactional."""
 
@@ -85,6 +93,7 @@ def _build_executor(llm, session_key, user):
         ("system", SYSTEM_PROMPT),
         MessagesPlaceholder("chat_history", optional=True),
         ("human", "{input}"),
+        MessagesPlaceholder("image_message", optional=True),  # NEW — FIX: attachment ke liye
         MessagesPlaceholder("agent_scratchpad"),
     ])
 
@@ -98,7 +107,29 @@ def _build_executor(llm, session_key, user):
     )
 
 
-def run_shopping_agent(user_input: str, session_key: str, user=None, chat_history=None, customer_context: str = ""):
+# NEW — FIX: attachment ka actual image data (consumers.py se base64 + mime_type
+# ke roop mein aata hai) ko LangChain message content block mein convert karta hai.
+# Groq ke configured models (llama-3.3-70b-versatile, llama-3.1-8b-instant) VISION
+# CAPABLE NAHI hain — unhe raw image bhejne se error aayega — is liye unke liye
+# sirf ek text note bhejte hain taake agent ko pata ho ke image thi, chahe dekh na sake.
+def _build_image_message(image: dict, vision_capable: bool):
+    if not image:
+        return []
+    if vision_capable:
+        content = [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{image['mime_type']};base64,{image['base64']}"},
+            }
+        ]
+        return [HumanMessage(content=content)]
+    return [HumanMessage(content=(
+        "[Customer attached an image, but this fallback assistant can't view images "
+        "right now — if relevant, ask them to briefly describe what's in it.]"
+    ))]
+
+
+def run_shopping_agent(user_input: str, session_key: str, user=None, chat_history=None, customer_context: str = "", image: dict = None):
     from apps.ai.response_metadata import extract_product_metadata      # FLOW → apps/ai/response_metadata.py
 
     chat_history = chat_history or []
@@ -120,6 +151,7 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
             "input": user_input,
             "chat_history": chat_history,
             "customer_context": customer_context,
+            "image_message": _build_image_message(image, vision_capable=True),  # NEW — FIX
         })
 
         # FLOW: result["intermediate_steps"] mein har tool call ka record hai —
@@ -138,6 +170,7 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
                 "input": user_input,
                 "chat_history": chat_history,
                 "customer_context": customer_context,
+                "image_message": _build_image_message(image, vision_capable=False),  # NEW — FIX
             })
 
             from apps.ai.suggestions import get_customer_followup_suggestions   # NEW
