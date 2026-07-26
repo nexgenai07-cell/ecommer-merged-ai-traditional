@@ -19,6 +19,11 @@ class ProductImageSerializer(serializers.ModelSerializer):
             "created_at",
         ]
 
+    def get_image(self, obj):
+        if obj.image:
+            return obj.image.url
+        return None
+
 # Used for the product listing API with essential product information.
 class ProductListSerializer(serializers.ModelSerializer):
     primary_image = serializers.SerializerMethodField()
