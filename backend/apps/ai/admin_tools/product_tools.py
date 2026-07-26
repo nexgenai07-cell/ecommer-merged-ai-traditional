@@ -43,6 +43,8 @@ def propose_create_product(session_key: str, user_id: int, name: str, price: flo
         payload['low_stock_threshold'] = low_stock_threshold
 
     preview = {**{k: v for k, v in payload.items() if k != 'category'}, 'category_id': category_id}
+    # NOTE: is function mein pehle se hi user_id sahi tarah pass ho raha tha —
+    # yehi wo "sahi" pattern hai jo neeche baaki propose_* functions mein bhi apply kiya gaya hai.
     result = create_pending_action(session_key, user_id, 'create_product', payload, preview)
     return {
         'requires_confirmation': True,
@@ -73,8 +75,23 @@ def propose_update_product(session_key: str, user_id: int, product_id: int, fiel
 
     preview = {'action': 'update_product', 'product_id': product_id, 'fields': fields}
     pending_kwargs = {'product_id': product_id, 'fields': fields}
-    action_id = create_pending_action(session_key, 'update_product', pending_kwargs, preview)
-    return {'requires_confirmation': True, 'action_id': action_id, 'preview': preview}
+    # FIX — pehle yahan "create_pending_action(session_key, 'update_product', pending_kwargs, preview)"
+    # likha tha, yani 'user_id' argument hi missing tha. Isse Python
+    # arguments ko shift kar deta tha (user_id slot mein tool-name string
+    # chali jati thi) aur akhri 'preview' argument bilkul missing reh
+    # jata tha -> TypeError: "create_pending_action() missing 1 required
+    # positional argument: 'preview'". Ab user_id sahi tarah pass ho raha hai.
+    result = create_pending_action(session_key, user_id, 'update_product', pending_kwargs, preview)
+    # FIX — pehle "action_id = create_pending_action(...)" likha tha, jo
+    # poora {'action_id':..., 'expires_at':...} dict 'action_id' field mein
+    # daal deta tha (string ki jagah). Ab 'result' se sahi field nikal rahe hain.
+    return {
+        'requires_confirmation': True,
+        'action_id': result['action_id'],
+        'action_type': 'update_product',
+        'preview': preview,
+        'expires_at': result['expires_at'],
+    }
 
 
 def execute_update_product(user, payload: dict) -> dict:
@@ -87,11 +104,19 @@ def execute_update_product(user, payload: dict) -> dict:
     return {'success': True, 'product': result['data']}
 
 
-def propose_delete_product(session_key: str,user_id: int, product_id: int) -> dict:
+def propose_delete_product(session_key: str, user_id: int, product_id: int) -> dict:
     """Product delete (soft delete — is_active=False) ka preview."""
     preview = {'action': 'delete_product', 'product_id': product_id}
-    action_id = create_pending_action(session_key, 'delete_product', {'product_id': product_id}, preview)
-    return {'requires_confirmation': True, 'action_id': action_id, 'preview': preview}
+    # FIX — yehi wo exact bug tha jo "test 2 aur test 3 delete karo" wale
+    # request pe error de raha tha. Pehle 'user_id' argument missing tha.
+    result = create_pending_action(session_key, user_id, 'delete_product', {'product_id': product_id}, preview)
+    return {
+        'requires_confirmation': True,
+        'action_id': result['action_id'],
+        'action_type': 'delete_product',
+        'preview': preview,
+        'expires_at': result['expires_at'],
+    }
 
 
 def execute_delete_product(user, payload: dict) -> dict:

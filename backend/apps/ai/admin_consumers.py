@@ -1,6 +1,7 @@
 # PATH: apps/ai/admin_consumers.py
 
 import json
+import logging  # NEW — server-side error logging ke liye
 from channels.generic.websocket import AsyncWebsocketConsumer
 from asgiref.sync import sync_to_async
 from langchain_core.messages import HumanMessage, AIMessage
@@ -12,6 +13,14 @@ from apps.ai.message_sanitization import validate_message, escape_for_storage, u
 from apps.ai.ws_auth import extract_token_from_scope, is_token_expired_or_invalid
 
 MAX_HISTORY_MESSAGES = 12
+
+# NEW — FIX: raw Python exceptions (jaise "create_pending_action() missing
+# 1 required positional argument") pehle seedha admin ko chat message mein
+# dikh rahe thay. Ab hum ek logger banate hain (asal error server logs
+# mein jayega) aur admin ko hamesha ek generic, friendly message dete
+# hain — kabhi bhi str(e) seedha frontend ko nahi bhejte.
+logger = logging.getLogger(__name__)
+FRIENDLY_ERROR_MESSAGE = "Sorry, kuch masla ho gaya hai. Please thodi dair baad dobara koshish karein."
 
 
 class AdminChatConsumer(AsyncWebsocketConsumer):
@@ -89,8 +98,15 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
         try:
             # UPDATED: Receive 3 items now
             response_text, metadata, suggestions = await self.get_agent_response(user_message)
-        except Exception as e:
-            response_text, metadata, suggestions = f"Sorry, something went wrong: {str(e)}", None, []
+        except Exception:
+            # FIX — pehle yahan "f'Sorry, something went wrong: {str(e)}'"
+            # bheja jata tha, jo raw Python error (jaise TypeError ka
+            # message: "create_pending_action() missing 1 required
+            # positional argument: 'preview'") seedha admin ko dikha deta
+            # tha. Ab: asal error logger.exception() se server logs mein
+            # jata hai, admin ko hamesha generic friendly message milta hai.
+            logger.exception("AdminChatConsumer.get_agent_response failed for session_key=%s", self.session_key)
+            response_text, metadata, suggestions = FRIENDLY_ERROR_MESSAGE, None, []
 
         requires_confirmation = bool(metadata and metadata.get('pending_action'))
 

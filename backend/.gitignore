@@ -18,3 +18,5 @@ media/
 
 # VS Code
 .vscode/
+
+.git/

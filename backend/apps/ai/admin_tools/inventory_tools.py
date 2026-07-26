@@ -1,76 +1,137 @@
-# PATH: apps/ai/admin_tools/inventory_tools.py
+# PATH: apps/ai/admin_tools/order_tools.py
 
-# FLOW: registry.py se yahan aata hai. Note: koi alag "Inventory"
-# endpoint nahi hai — stock seedha Product model ka field hai, is liye
-# ye tools bhi Product endpoints hi use karte hain (api_client.py se).
+# FLOW: registry.py se yahan aata hai. Same propose_*/execute_* pattern.
+# Note: get_order_details/track_order lightweight endpoint use karte
+# hain (AdminOrderFilterView) — koi "full order detail" admin endpoint
+# nahi hai abhi.
 
 from apps.ai.admin_tools.api_client import call_internal_api
 from apps.ai.admin_tools.pending_actions import create_pending_action
 
 
-def check_inventory(user, product_id: int) -> dict:
-    """FLOW: Read-only — GET /api/v1/products/{id}/ se stock nikalta hai."""
-    """Read-only — GET /api/v1/products/{id}/ se stock nikalta hai."""
-    result = call_internal_api(user, 'GET', f'/api/v1/products/{product_id}/')
+def get_order_details(user, order_id: str) -> dict:
+    """FLOW: Read-only — GET /api/v1/admin/orders/filter/?order_number=... hit karta hai"""
+    """
+    Read-only. AdminOrderFilterView se order dhoondta hai (order_number filter se).
+    Note: ye halka data hai (items/shipping address shamil nahi) — sirf
+    id, order_number, customer{name,phone}, total_amount, discount_amount,
+    status, created_at milta hai.
+    """
+    result = call_internal_api(user, 'GET', '/api/v1/admin/orders/filter/', params={'order_number': order_id})
     if not result['success']:
         return {'success': False, 'error': result['error']}
 
-    data = result['data']
+    results = (result['data'] or {}).get('results', [])
+    if not results:
+        return {'success': False, 'error': f'Order {order_id} not found.'}
+
+    return {'success': True, 'order': results[0]}
+
+
+def propose_update_order(session_key: str, user_id: int, order_id: str, fields: dict) -> dict:
+    """FLOW: preview banata hai — sirf 'status'/'tracking_number' allow karta hai"""
+    """
+    Order update ka preview. Backend endpoint (AdminOrderStatusUpdateView)
+    sirf 'status' aur 'tracking_number' fields accept karta hai — agar
+    admin ne koi aur field diya ho, us ko filter kar dete hain aur AI ko
+    bata dete hain ke sirf ye 2 fields update ho sakti hain.
+    """
+    allowed_fields = {'status', 'tracking_number'}
+    filtered_fields = {k: v for k, v in fields.items() if k in allowed_fields}
+    ignored_fields = set(fields.keys()) - allowed_fields
+
+    preview = {
+        'action': 'update_order',
+        'order_id': order_id,
+        'fields': filtered_fields,
+    }
+    if ignored_fields:
+        preview['note'] = f"These fields are not supported by the order update endpoint and were ignored: {', '.join(ignored_fields)}"
+
+    pending_kwargs = {'order_id': order_id, 'fields': filtered_fields}
+    # FIX — pehle 'user_id' argument yahan pass nahi ho raha tha, jis
+    # wajah se create_pending_action() ke andar arguments shift ho jate
+    # thay aur akhri 'preview' argument missing reh jata tha -> TypeError.
+    result = create_pending_action(session_key, user_id, 'update_order', pending_kwargs, preview)
     return {
-        'success': True,
-        'product_id': data.get('id'),
-        'name': data.get('name'),
-        'quantity': data.get('stock'),
-        'low_stock_threshold': data.get('low_stock_threshold'),
-        'in_stock': data.get('in_stock'),
+        'requires_confirmation': True,
+        'action_id': result['action_id'],
+        'action_type': 'update_order',
+        'preview': preview,
+        'expires_at': result['expires_at'],
     }
 
 
-def propose_update_inventory(session_key: str,user_id: int, product_id: int, quantity: int) -> dict:
-    """FLOW: registry.py ke update_inventory tool se call hota hai — preview banata hai."""
-    """Stock update ka preview — asal PATCH confirm ke baad."""
-    preview = {'action': 'update_inventory', 'product_id': product_id, 'new_quantity': quantity}
-    pending_kwargs = {'product_id': product_id, 'quantity': quantity}
-    action_id = create_pending_action(session_key, 'update_inventory', pending_kwargs, preview)
-    return {'requires_confirmation': True, 'action_id': action_id, 'preview': preview}
+def execute_update_order(user, payload: dict) -> dict:
+    """FLOW: confirm hone ke baad YAHAN asal order status update hota hai."""
+    """Confirm hone ke baad PUT /api/v1/admin/orders/{order_number}/status/ call karta hai."""
+    order_id = payload['order_id']
+    fields = payload['fields']
 
+    # FLOW → api_client.py → PUT /api/v1/admin/orders/{order_number}/status/
+    # → apps/orders/views.py ka AdminOrderStatusUpdateView (stock restore,
+    #   payment refund waghera bhi WAHAN automatically hoti hai)
 
-def execute_update_inventory(user, payload: dict) -> dict:
-    """FLOW: confirm_pending_action se call hota hai — YAHAN asal stock update hota hai."""
-    """Confirm hone ke baad PATCH /api/v1/products/{id}/ sirf 'stock' field ke sath."""
-    product_id = payload['product_id']
-    quantity = payload['quantity']
-    # FLOW → api_client.py → PATCH /api/v1/products/{id}/ (sirf 'stock' field)
-    result = call_internal_api(user, 'PATCH', f'/api/v1/products/{product_id}/', json_body={'stock': quantity})
+    result = call_internal_api(user, 'PUT', f'/api/v1/admin/orders/{order_id}/status/', json_body=fields)
     if not result['success']:
         return {'success': False, 'error': result['error']}
-    return {'success': True, 'product_id': product_id, 'quantity': quantity}
+    return {'success': True, 'order_id': order_id, **result['data']}
 
 
-def low_stock(user, threshold: int = None) -> dict:
-
-    """FLOW: Read-only — GET /api/v1/products/low-stock/ hit karta hai,
-    phir agar admin ne extra threshold diya ho to client-side filter lagata hai."""
-    
+def propose_cancel_order(session_key: str, user_id: int, order_id: str, reason: str = "") -> dict:
     """
-    Read-only. GET /api/v1/products/low-stock/ har product ke apne
-    low_stock_threshold ke against check karta hai (endpoint khud koi
-    query param accept nahi karta — ye ek existing limitation hai jo
-    hum ne code mein dekhi). Agar admin ne extra 'threshold' diya hai,
-    hum client-side pe additional filter laga dete hain (results ko
-    us threshold se aur chhaanti hai) — taake tool ka contract match ho.
+    Order cancel ka preview. Note: backend endpoint 'reason' field store
+    nahi karta (sirf status update karta hai) — lekin reason AuditLog mein
+    save ho jayega (registry.py confirm_pending_action mein wired hai),
+    taake koi record rahe ke cancel kyun kiya gaya.
     """
-    result = call_internal_api(user, 'GET', '/api/v1/products/low-stock/')
+    preview = {'action': 'cancel_order', 'order_id': order_id, 'reason': reason}
+    pending_kwargs = {'order_id': order_id, 'reason': reason}
+    # FIX — 'user_id' argument missing tha, ab pass ho raha hai.
+    result = create_pending_action(session_key, user_id, 'cancel_order', pending_kwargs, preview)
+    return {
+        'requires_confirmation': True,
+        'action_id': result['action_id'],
+        'action_type': 'cancel_order',
+        'preview': preview,
+        'expires_at': result['expires_at'],
+    }
+
+
+def execute_cancel_order(user, payload: dict) -> dict:
+    """FLOW: confirm hone ke baad status='cancelled' bhejta hai —
+    stock restore/refund backend (AdminOrderStatusUpdateView) khud handle karta hai."""
+    """
+    Confirm hone ke baad PUT .../status/ ke sath status='cancelled' bhejta hai.
+    Backend ye khud automatically stock restore aur payment refund-mark
+    kar deta hai (jaisa AdminOrderStatusUpdateView mein already likha hai).
+    """
+    order_id = payload['order_id']
+    result = call_internal_api(user, 'PUT', f'/api/v1/admin/orders/{order_id}/status/', json_body={'status': 'cancelled'})
     if not result['success']:
-        return {'success': False, 'error': result['error'], 'low_stock_products': []}
+        return {'success': False, 'error': result['error']}
+    return {'success': True, 'order_id': order_id, 'reason': payload.get('reason', ''), **result['data']}
 
-    products = result['data'] or []
-    mapped = [
-        {'product_id': p['id'], 'name': p['name'], 'quantity': p['stock']}
-        for p in products
-    ]
 
-    if threshold is not None:
-        mapped = [p for p in mapped if p['quantity'] <= threshold]
+def track_order(user, order_id: str) -> dict:
+    """FLOW: get_order_details() ko hi reuse karta hai (upar wala function), sirf shape thora alag deta hai."""
+    """
+    Read-only. Poori "timeline" (status history) database mein exist nahi
+    karti (koi OrderStatusHistory table nahi hai) — isliye timeline mein
+    sirf current status + known timestamps deते hain, purani history nahi.
+    """
+    details = get_order_details(user, order_id)     # FLOW: isi file ka upar wala function
+    if not details['success']:
+        return details
 
-    return {'success': True, 'low_stock_products': mapped}
+    order = details['order']
+    return {
+        'success': True,
+        'order_id': order.get('order_number'),
+        'status': order.get('status'),
+        'timeline': [
+            {'event': 'created', 'timestamp': order.get('created_at')},
+            {'event': 'current_status', 'status': order.get('status')},
+        ],
+        'note': 'Detailed status-change history is not tracked in the database — only current status is available.',
+    }

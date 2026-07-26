@@ -1,6 +1,7 @@
 # PATH: apps/ai/consumers.py
 
 import json
+import logging  # NEW — server-side error logging ke liye
 import time
 import asyncio
 from channels.generic.websocket import AsyncWebsocketConsumer
@@ -18,6 +19,14 @@ from apps.stores.models import Store
 
 MAX_HISTORY_MESSAGES = 12
 IDLE_THRESHOLD_SECONDS = 30
+
+# NEW — FIX: raw Python exceptions (jaise "create_pending_action() missing
+# 1 required positional argument") pehle seedha customer ko chat message
+# mein dikh rahe thay. Ab hum ek logger banate hain (asal error server
+# logs mein jayega) aur user ko hamesha ek generic, friendly message dete
+# hain — kabhi bhi str(e) seedha frontend ko nahi bhejte.
+logger = logging.getLogger(__name__)
+FRIENDLY_ERROR_MESSAGE = "Sorry, kuch masla ho gaya hai. Please thodi dair baad dobara koshish karein."
 
 
 class ChatConsumer(AsyncWebsocketConsumer):
@@ -142,8 +151,15 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
         try:
             response_text, products_metadata, suggestions = await self.get_agent_response(user_message, attachment_file_id)
-        except Exception as e:
-            await self.send(text_data=json.dumps({"type": "error", "message": f"Sorry, something went wrong: {str(e)}"}))
+        except Exception:
+            # FIX — pehle yahan "f'Sorry, something went wrong: {str(e)}'"
+            # bheja jata tha, jo raw Python error (jaise TypeError ka
+            # message) seedha user ko dikha deta tha. Ab: asal error
+            # logger.exception() se server logs mein jata hai (Railway
+            # logs mein dekha ja sakta hai), aur user ko hamesha generic
+            # friendly message milta hai.
+            logger.exception("ChatConsumer.get_agent_response failed for session_key=%s", self.session_key)
+            await self.send(text_data=json.dumps({"type": "error", "message": FRIENDLY_ERROR_MESSAGE}))
             return
 
         words = response_text.split(' ')
