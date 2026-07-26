@@ -139,7 +139,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
         user_id = await self.get_session_user_id()
         allowed = await sync_to_async(check_all_rate_limits)(self.session_key, user_id, getattr(self, 'client_ip', None))
         if not allowed:
-            await self.send(text_data=json.dumps({"type": "error", "code": "RATE_LIMITED", "message": "Too many messages — please wait a moment before sending again."}))
+            await self.send(text_data=json.dumps({"type": "error", "code": "RATE_LIMITED", "message": "Too many requests, please try again later."}))
             return
 
         user_message = data.get("message", "")

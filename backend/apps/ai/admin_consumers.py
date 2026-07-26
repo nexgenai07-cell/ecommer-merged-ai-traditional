@@ -97,7 +97,7 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
         if not allowed:
             await self.send(text_data=json.dumps({
                 "type": "error", "code": "RATE_LIMITED",
-                "message": "Too many messages — please wait a moment before sending again.",
+                "message": "Too many requests, please try again later.",
             }))
             return
 

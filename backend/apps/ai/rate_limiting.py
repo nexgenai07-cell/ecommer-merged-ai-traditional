@@ -10,7 +10,7 @@ from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
-MAX_MESSAGES = 10
+MAX_MESSAGES = 5
 WINDOW_SECONDS = 10
 
 
