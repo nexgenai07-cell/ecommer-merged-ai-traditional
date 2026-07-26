@@ -70,7 +70,24 @@ def get_customer_followup_suggestions(intermediate_steps) -> list:
 
 
 def get_admin_followup_suggestions(pending_action) -> list:
-    """Requirement 4 — admin side. Simple: if a confirmation is pending, offer quick actions."""
-    if pending_action:
-        return ["Confirm", "Cancel"]
+    """Requirement 4 — admin side.
+
+    NEW — FIX (duplicate Confirm/Cancel UI bug): pehle jab bhi ek
+    pending_action hota tha, ye function ["Confirm", "Cancel"] return
+    kar deta tha — jo structured pending_action card (jo already
+    admin_response_metadata.py se metadata.pending_action ke roop mein
+    frontend ko jata hai, aur real confirm/cancel action endpoints call
+    karta hai) ke UPAR ek DOOSRA, alag "Confirm"/"Cancel" pill-button
+    pair render kar deta tha. Wo dusra pair sirf plain text
+    "Confirm"/"Cancel" message wapis chat mein bhejta tha — real
+    confirm/cancel endpoint ko call NAHI karta — is liye admin ko do
+    button pair dikhte thay jo ek jaisi cheez karte lag rahe thay lekin
+    asal mein alag raste se chalte thay (confusing + risky UX).
+
+    FIX: jab pending_action already present hai, structured card hi
+    confirm/cancel ka SIRF ek raasta honi chahiye — is liye ab hum
+    yahan koi generic "Confirm"/"Cancel" (ya "Haan"/"Nahi" jaisa)
+    suggestion return NAHI karte. Sirf pending_action na hone par khali
+    list return hoti hai — waisi hi jaisi pehle thi.
+    """
     return []
