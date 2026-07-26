@@ -1,3 +1,5 @@
+from email.mime import image
+
 from rest_framework import serializers
 from .models import Product, ProductImage, ProductHistory, StockMovement
 
@@ -8,20 +10,20 @@ class CategorySerializer(serializers.Serializer):
 
 # Converts product image data into API response format.
 class ProductImageSerializer(serializers.ModelSerializer):
-    image = serializers.SerializerMethodField()
+    image_url = serializers.SerializerMethodField()
 
     class Meta:
         model = ProductImage
         fields = [
             "id",
-            "image",
+            "image_url",
             "is_primary",
             "created_at",
         ]
 
-    def get_image(self, obj):
+    def get_image_url(self, obj):
         if obj.image:
-            return obj.image.url
+            return obj.image.url.replace("http://", "https://")
         return None
 
 # Used for the product listing API with essential product information.
@@ -57,20 +59,20 @@ class ProductListSerializer(serializers.ModelSerializer):
 
 # Returns the primary product image URL.
     def get_primary_image(self, obj):
-        img = obj.images.filter(is_primary=True).first() or obj.images.first()
+       img = obj.images.filter(is_primary=True).first() or obj.images.first()
 
-        if not img:
+       if not img:
+          return None
+
+       image = img.image
+  
+       if not image:
             return None
 
-        image = img.image
+       if hasattr(image, "url"):
+           return image.url.replace("http://", "https://")
 
-        if not image:
-            return None
-
-        if hasattr(image, "url"):
-            return image.url
-
-        return str(image)
+       return str(image)
 
 # Used for the Low Stock API to display products that need restocking.
 class LowStockProductSerializer(serializers.ModelSerializer):
