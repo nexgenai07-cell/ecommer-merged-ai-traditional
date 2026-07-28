@@ -75,9 +75,10 @@ class ProductViewSet(viewsets.ModelViewSet):
         return [permissions.IsAuthenticated(), IsAdmin()]
 
     def perform_destroy(self, instance):
-        # Soft delete — data is never actually removed
+    # Soft delete — data is never actually removed
+        instance.is_delete = True
         instance.is_active = False
-        instance.save()
+        instance.save(update_fields=["is_delete", "is_active"])
 
     def update(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -194,7 +195,10 @@ class ProductViewSet(viewsets.ModelViewSet):
         Ab isके liye alag, chota LowStockProductSerializer use ho raha hai
         jo sirf doc-required fields return karta hai.
         """
-        qs = Product.objects.filter(is_active=True)
+        qs = Product.objects.filter(
+    is_active=True,
+    is_delete=False,
+)
 
         # Compare stock vs threshold in Python (clear and simple for small catalogs)
         low_stock_products = [p for p in qs if p.stock <= p.low_stock_threshold]

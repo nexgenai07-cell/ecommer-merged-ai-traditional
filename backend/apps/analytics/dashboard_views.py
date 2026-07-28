@@ -96,7 +96,10 @@ class DashboardView(APIView):
         total_revenue = delivered_orders.aggregate(total=Sum('total_amount'))['total'] or 0
         total_orders = Order.objects.count()
         total_customers = Customer.objects.count()
-        total_products = Product.objects.filter(is_active=True).count()
+        total_products = Product.objects.filter(
+    is_active=True,
+    is_delete=False,
+        ).count()
 
 
         this_period_revenue = delivered_orders.filter(
@@ -128,9 +131,19 @@ class DashboardView(APIView):
 
 
         pending_orders = Order.objects.filter(status='pending').count()
-        low_stock_products = Product.objects.filter(is_active=True).count()
-        low_stock_products = sum(1 for p in Product.objects.filter(is_active=True) if p.stock <= p.low_stock_threshold)
+        low_stock_products = Product.objects.filter(
+    is_active=True,
+    is_delete=False,
+).count()
 
+        low_stock_products = sum(
+    1
+    for p in Product.objects.filter(
+        is_active=True,
+        is_delete=False,
+    )
+    if p.stock <= p.low_stock_threshold
+)
 
         data = {
             'total_revenue': total_revenue,
@@ -348,7 +361,10 @@ class LowPerformingProductsView(APIView):
         sold_map = {row['product_id']: row['total_sold'] for row in sold_product_ids}
 
 
-        products = Product.objects.filter(is_active=True)
+        products = Product.objects.filter(
+    is_active=True,
+    is_delete=False,
+        )
         ranked = sorted(products, key=lambda p: sold_map.get(p.id, 0))[:limit]
 
 
@@ -528,7 +544,10 @@ class InventoryAlertsView(APIView):
 
 
     def get(self, request):
-        products = Product.objects.filter(is_active=True)
+        products = Product.objects.filter(
+    is_active=True,
+    is_delete=False,
+    )
         alerts = [
             {'product_id': p.id, 'name': p.name, 'stock': p.stock, 'threshold': p.low_stock_threshold}
             for p in products if p.stock <= p.low_stock_threshold

@@ -55,21 +55,20 @@ class DiscountViewSet(viewsets.ModelViewSet):
     # ordered by newest first for the admin panel.
     def get_queryset(self):
         # Admin sees both active and inactive discounts
-        return Discount.objects.all().order_by("-created_at")
+        return Discount.objects.filter(
+    is_delete=False
+       ).order_by("-created_at")
 
     # Performs a soft delete by marking the discount inactive
     # instead of permanently removing it from the database.
     def perform_destroy(self, instance):
-        """
-        Soft delete instead of permanently deleting.
-
-        FIX: update_fields now includes "updated_at" as well as
-        "is_active" — previously only "is_active" was listed, which
-        meant the auto_now updated_at timestamp was computed in memory
-        but never written to the database on delete/restore.
-        """
-        instance.is_active = False
-        instance.save(update_fields=["is_active", "updated_at"])
+       """
+    Soft delete instead of permanently deleting.
+    """
+       
+       instance.is_delete = True
+       instance.is_active = False
+       instance.save(update_fields=["is_delete", "is_active", "updated_at"])
 
 
 # Validates coupon codes submitted during checkout

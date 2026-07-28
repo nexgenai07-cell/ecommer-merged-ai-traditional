@@ -142,20 +142,31 @@ class LoginView(APIView):
 
         user = serializer.validated_data["user"]
 
-        # Do not allow login until email is verified
+# Do not allow login until email is verified
         if not user.email_verified:
+           return Response(
+        {
+            "email_not_verified": True,
+            "email": user.email,
+            "message": "Please verify your email before logging in."
+        },
+        status=status.HTTP_403_FORBIDDEN,
+    )
+
+# NEW: Do not allow login if account is soft deleted
+        if user.is_delete:
             return Response(
-                {
-                    "email_not_verified": True,
-                    "email": user.email,
-                    "message": "Please verify your email before logging in."
-                },
-                status=status.HTTP_403_FORBIDDEN,
-            )
+        {
+            "account_deactivated": True,
+            "email": user.email,
+            "message": "This account has been deleted. Would you like to reactivate it?"
+        },
+        status=status.HTTP_403_FORBIDDEN,
+    )
 
         two_fa = TwoFactorAuth.objects.filter(
-            user=user,
-            is_enabled=True,
+                 user=user,
+                 is_enabled=True,
         ).first()
 
         if two_fa:
@@ -345,8 +356,9 @@ class DeleteAccountView(APIView):
         serializer.is_valid(raise_exception=True)
 
         user = request.user
+        user.is_delete = True
         user.is_active = False
-        user.save()
+        user.save(update_fields=["is_delete", "is_active"])
 
         from rest_framework_simplejwt.token_blacklist.models import (
             OutstandingToken,
@@ -362,7 +374,7 @@ class DeleteAccountView(APIView):
             {"message": "Account deleted successfully."},
             status=status.HTTP_200_OK,
         )
-
+        
 # Returns all active login sessions
 # belonging to the authenticated user.
 class SessionListView(generics.ListAPIView):

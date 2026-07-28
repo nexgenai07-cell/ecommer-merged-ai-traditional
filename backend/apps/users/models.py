@@ -51,6 +51,10 @@ class User(AbstractBaseUser, PermissionsMixin):
     # (we just show a "please verify" banner) rather than being locked out.
     email_verified  = models.BooleanField(default=False)
     is_active       = models.BooleanField(default=True)
+    # Soft delete flag.
+    # False = active account
+    # True  = account has been deleted (soft delete)
+    is_delete       = models.BooleanField(default=False)
     is_staff        = models.BooleanField(default=False)
     created_at      = models.DateTimeField(auto_now_add=True)
     updated_at      = models.DateTimeField(auto_now=True)

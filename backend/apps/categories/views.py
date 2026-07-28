@@ -21,15 +21,17 @@ class CategoryViewSet(viewsets.ModelViewSet):
     pagination_class = None
 
     def get_queryset(self):
-        queryset = Category.objects.all().order_by("name")
-
+        queryset = Category.objects.filter(is_delete=False).order_by("name")
         # Customers and guests only see active categories.
         # Admins see both active and inactive categories.
         if not (
             self.request.user.is_authenticated
             and self.request.user.role == "admin"
         ):
-            queryset = queryset.filter(is_active=True)
+            queryset = queryset.filter(
+    is_active=True,
+    is_delete=False,
+         )
 
         return queryset
 
@@ -57,8 +59,9 @@ class CategoryViewSet(viewsets.ModelViewSet):
         """
         Soft delete category instead of removing it from the database.
         """
+        instance.is_delete = True
         instance.is_active = False
-        instance.save(update_fields=["is_active"])
+        instance.save(update_fields=["is_delete", "is_active"])
 
     def destroy(self, request, *args, **kwargs):
         """

@@ -69,6 +69,10 @@ class AddToWishlistSerializer(serializers.Serializer):
     product_id = serializers.IntegerField()
 
     def validate_product_id(self, value):
-        if not Product.objects.filter(id=value, is_active=True).exists():
+        if not Product.objects.filter(
+    id=value,
+    is_active=True,
+    is_delete=False,
+     ).exists():
             raise serializers.ValidationError("Product not found.")
         return value

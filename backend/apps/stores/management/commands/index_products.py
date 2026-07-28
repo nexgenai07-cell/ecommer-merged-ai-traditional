@@ -77,7 +77,10 @@ class Command(BaseCommand):
         else:
             self.stdout.write(f'Collection "{COLLECTION}" already exists — will upsert.')
 
-        products = Product.objects.filter(is_active=True).select_related('category')
+        products = Product.objects.filter(
+    is_active=True,
+    is_delete=False,
+).select_related("category")
         total = products.count()
         self.stdout.write(f'Found {total} active products to index...\n')
 

@@ -155,7 +155,10 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
         if not value:
             return value
 
-        qs = Product.objects.filter(sku=value)
+        qs = Product.objects.filter(
+    sku=value,
+    is_delete=False,
+)
 
         if self.instance:
             qs = qs.exclude(pk=self.instance.pk)
@@ -179,7 +182,10 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
     
 # Prevents duplicate product names.
     def validate_name(self, value):
-      qs = Product.objects.filter(name=value)
+      qs = Product.objects.filter(
+    name=value,
+    is_delete=False,
+)
 
       if self.instance:
         qs = qs.exclude(pk=self.instance.pk)

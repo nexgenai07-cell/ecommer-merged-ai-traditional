@@ -41,7 +41,10 @@ class CategorySerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
     def validate_name(self, value):
-        qs = Category.objects.filter(name=value)
+        qs = Category.objects.filter(
+    name=value,
+    is_delete=False,
+)
 
         if self.instance:
             qs = qs.exclude(pk=self.instance.pk)

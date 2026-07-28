@@ -38,6 +38,7 @@ class Product(models.Model):
     )
 
     is_active = models.BooleanField(default=True)
+    is_delete = models.BooleanField(default=False)
     publish_at = models.DateTimeField(null=True, blank=True)
     low_stock_threshold = models.PositiveIntegerField(default=5)
 
@@ -68,7 +69,10 @@ class Product(models.Model):
         if not self.sku:
             while True:
                 sku = f"SKU-{uuid.uuid4().hex[:8].upper()}"
-                if not Product.objects.filter(sku=sku).exists():
+                if not Product.objects.filter(
+    sku=sku,
+    is_delete=False,
+).exists():
                     self.sku = sku
                     break
 
@@ -174,6 +178,7 @@ class Discount(models.Model):
     start_date       = models.DateTimeField()
     end_date         = models.DateTimeField()
     is_active        = models.BooleanField(default=True)
+    is_delete = models.BooleanField(default=False)
     created_at       = models.DateTimeField(auto_now_add=True)
     updated_at       = models.DateTimeField(auto_now=True)
 
