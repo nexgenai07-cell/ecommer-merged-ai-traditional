@@ -49,8 +49,26 @@ def propose_update_order(session_key: str,user_id: int, order_id: str, fields: d
         preview['note'] = f"These fields are not supported by the order update endpoint and were ignored: {', '.join(ignored_fields)}"
 
     pending_kwargs = {'order_id': order_id, 'fields': filtered_fields}
-    action_id = create_pending_action(session_key, 'update_order', pending_kwargs, preview)
-    return {'requires_confirmation': True, 'action_id': action_id, 'preview': preview}
+    # FIX — same bug class as product_tools.py/category_tools.py/inventory_tools.py:
+    # 'user_id' argument tha hi nahi, is liye create_pending_action() ke
+    # andar arguments ek slot shift ho jate thay ('update_order' string
+    # user_id ki jagah chali jati, pending_kwargs tool_name ki jagah, aur
+    # 'preview' argument bilkul missing reh jata) -> TypeError:
+    # "create_pending_action() missing 1 required positional argument:
+    # 'preview'". Ab user_id sahi tarah pass ho raha hai.
+    result = create_pending_action(session_key, user_id, 'update_order', pending_kwargs, preview)
+    # FIX — pehle poora {'action_id':..., 'expires_at':...} dict seedha
+    # 'action_id' field mein daal diya jata tha (string ki jagah), aur
+    # 'action_type'/'expires_at' return hi nahi hote thay — jis wajah se
+    # frontend ka pending_action card aur admin_response_metadata.py ka
+    # extraction incomplete rehte thay.
+    return {
+        'requires_confirmation': True,
+        'action_id': result['action_id'],
+        'action_type': 'update_order',
+        'preview': preview,
+        'expires_at': result['expires_at'],
+    }
 
 
 def execute_update_order(user, payload: dict) -> dict:
@@ -78,8 +96,16 @@ def propose_cancel_order(session_key: str,user_id: int, order_id: str, reason: s
     """
     preview = {'action': 'cancel_order', 'order_id': order_id, 'reason': reason}
     pending_kwargs = {'order_id': order_id, 'reason': reason}
-    action_id = create_pending_action(session_key, 'cancel_order', pending_kwargs, preview)
-    return {'requires_confirmation': True, 'action_id': action_id, 'preview': preview}
+    # FIX — same 'user_id' missing + result-dict-not-unpacked bug as
+    # propose_update_order() above.
+    result = create_pending_action(session_key, user_id, 'cancel_order', pending_kwargs, preview)
+    return {
+        'requires_confirmation': True,
+        'action_id': result['action_id'],
+        'action_type': 'cancel_order',
+        'preview': preview,
+        'expires_at': result['expires_at'],
+    }
 
 
 def execute_cancel_order(user, payload: dict) -> dict:

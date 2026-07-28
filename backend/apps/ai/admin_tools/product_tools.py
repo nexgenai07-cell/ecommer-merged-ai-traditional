@@ -122,10 +122,28 @@ def propose_delete_product(session_key: str, user_id: int, product_id: int) -> d
 def execute_delete_product(user, payload: dict) -> dict:
     """Confirm hone ke baad DELETE /api/v1/products/{id}/ call karta hai (soft delete)."""
     product_id = payload['product_id']
+
+    # NEW — FIX: delete hone ke BAAD product ka naam GET nahi kiya ja sakta
+    # (record ja chuka hota hai / is_active=False ho jata hai), is liye
+    # delete se PEHLE naam nikal lete hain — taake confirmation message
+    # mein "Product 'socks' (ID: 96) delete ho gaya" jaisa naam dikha sakein,
+    # sirf ID nahi.
+    name_lookup = call_internal_api(user, 'GET', f'/api/v1/products/{product_id}/')
+    product_name = (
+        name_lookup['data'].get('name')
+        if name_lookup['success'] and isinstance(name_lookup['data'], dict)
+        else None
+    )
+
     result = call_internal_api(user, 'DELETE', f'/api/v1/products/{product_id}/')
     if not result['success']:
         return {'success': False, 'error': result['error']}
-    return {'success': True, 'message': f'Product {product_id} deleted (soft delete — is_active=False).'}
+    return {
+        'success': True,
+        'product_id': product_id,
+        'product_name': product_name,
+        'message': f'Product {product_id} deleted (soft delete — is_active=False).',
+    }
 
 def list_products(user, category_id: int = None, search: str = None, limit: int = 20) -> dict:
     """

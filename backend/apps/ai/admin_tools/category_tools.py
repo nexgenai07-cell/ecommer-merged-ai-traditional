@@ -94,12 +94,27 @@ def propose_delete_category(session_key: str, user_id: int, category_id: int) ->
 def execute_delete_category(user, payload: dict) -> dict:
     category_id = payload['category_id']
 
+    # NEW — FIX: delete ke baad naam wapis nahi mil sakta, is liye pehle
+    # nikal lete hain (product delete flow jaisa hi pattern) — taake
+    # confirmation message naam ke sath ban sake.
+    name_lookup = call_internal_api(user, 'GET', f'/api/v1/categories/{category_id}/')
+    category_name = (
+        name_lookup['data'].get('name')
+        if name_lookup['success'] and isinstance(name_lookup['data'], dict)
+        else None
+    )
+
     # FLOW → api_client.py → DELETE /api/v1/categories/{id}/
 
     result = call_internal_api(user, 'DELETE', f'/api/v1/categories/{category_id}/')
     if not result['success']:
         return {'success': False, 'error': result['error']}
-    return {'success': True, 'message': f'Category {category_id} deleted.'}
+    return {
+        'success': True,
+        'category_id': category_id,
+        'category_name': category_name,
+        'message': f'Category {category_id} deleted.',
+    }
 
 
 def get_categories(user) -> dict:
