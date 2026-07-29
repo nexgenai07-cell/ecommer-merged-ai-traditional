@@ -53,12 +53,23 @@ class ProductViewSet(viewsets.ModelViewSet):
     pagination_class = StandardResultsPagination
 
     def get_queryset(self):
-        qs = Product.objects.select_related('category').prefetch_related('images')
-        if self.action in ['list', 'retrieve', 'search']:
-            # Customers should only ever see active products
-            if not (self.request.user.is_authenticated and self.request.user.role == 'admin'):
-                qs = qs.filter(is_active=True)
-        return qs
+      qs = Product.objects.filter(
+        is_delete=False
+      ).select_related(
+        "category"
+      ).prefetch_related(
+        "images"
+       )
+
+    # Customers only see published products.
+      if self.action in ["list", "retrieve", "search"]:
+        if not (
+            self.request.user.is_authenticated
+            and self.request.user.role == "admin"
+        ):
+            qs = qs.filter(is_active=True)
+
+      return qs
 
     def get_serializer_class(self):
         if self.action == 'list' or self.action == 'search':
@@ -75,10 +86,15 @@ class ProductViewSet(viewsets.ModelViewSet):
         return [permissions.IsAuthenticated(), IsAdmin()]
 
     def perform_destroy(self, instance):
-    # Soft delete — data is never actually removed
-        instance.is_delete = True
-        instance.is_active = False
-        instance.save(update_fields=["is_delete", "is_active"])
+       """
+    Soft delete the product.
+
+    Only mark the record as deleted.
+    Do NOT modify is_active because it is used independently
+    as the Publish/Draft toggle.
+    """
+       instance.is_delete = True
+       instance.save(update_fields=["is_delete", "updated_at"])
 
     def update(self, request, *args, **kwargs):
         instance = self.get_object()

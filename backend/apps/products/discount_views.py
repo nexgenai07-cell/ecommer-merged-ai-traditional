@@ -64,11 +64,13 @@ class DiscountViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
        """
     Soft delete instead of permanently deleting.
+
+    Only mark the object as deleted.
+    Do NOT modify is_active because it is used
+    independently as the Enable/Disable toggle.
     """
-       
        instance.is_delete = True
-       instance.is_active = False
-       instance.save(update_fields=["is_delete", "is_active", "updated_at"])
+       instance.save(update_fields=["is_delete", "updated_at"])
 
 
 # Validates coupon codes submitted during checkout
