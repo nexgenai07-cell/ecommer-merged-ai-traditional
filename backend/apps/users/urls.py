@@ -4,6 +4,7 @@ from django.urls import path
 from rest_framework_simplejwt.views import TokenRefreshView
 
 from .views import (
+    ReactivateAccountView,
     RegisterView,
     LoginView,
     LogoutView,
@@ -158,7 +159,12 @@ urlpatterns = [
         ReactivateConfirmView.as_view(),
         name="reactivate_confirm"
     ),
-
+    
+    path(
+    "reactivate/",
+     ReactivateAccountView.as_view(),
+    name="reactivate_account",
+),
 
     # =========================
     # TWO FACTOR AUTHENTICATION
