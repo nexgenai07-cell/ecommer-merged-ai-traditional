@@ -56,12 +56,15 @@ class CategoryViewSet(viewsets.ModelViewSet):
             )
 
     def perform_destroy(self, instance):
-        """
-        Soft delete category instead of removing it from the database.
-        """
-        instance.is_delete = True
-        instance.is_active = False
-        instance.save(update_fields=["is_delete", "is_active"])
+       """
+    Soft delete category instead of permanently deleting it.
+
+    Only mark the category as deleted.
+    Do NOT modify is_active because it is a separate
+    Active/Inactive status.
+    """
+       instance.is_delete = True
+       instance.save(update_fields=["is_delete", "updated_at"])
 
     def destroy(self, request, *args, **kwargs):
         """

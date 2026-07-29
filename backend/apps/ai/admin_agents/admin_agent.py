@@ -112,13 +112,24 @@ def _build_executor(llm, session_key, user):
     ])
 
     agent = create_tool_calling_agent(llm, tools, prompt)
-
+    
+    #changed
+    #return AgentExecutor(
+    #agent=agent,
+    #tools=tools,
+    #verbose=settings.DEBUG,
+    #return_intermediate_steps=True,
+        #)
     return AgentExecutor(
-        agent=agent,
-        tools=tools,
-        verbose=settings.DEBUG,
-        return_intermediate_steps=True,
-    )
+    agent=agent,
+    tools=tools,
+    verbose=settings.DEBUG,
+    return_intermediate_steps=True,
+
+    max_iterations=3,
+    early_stopping_method="force",
+    handle_parsing_errors=True,
+)
 
 
 def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
