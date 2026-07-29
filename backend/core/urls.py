@@ -14,7 +14,7 @@ from apps.ai.urls import audit_log_urlpatterns
 from apps.whatsapp.admin_urls import admin_whatsapp_urlpatterns
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
+    path('admin/', admin.site.urls), #gives all urls from users
 
     # Module 1
     path('api/v1/auth/', include('apps.users.urls')),
