@@ -408,3 +408,56 @@ class RevokeAllSessionsView(APIView):
             {"message": "All sessions have been signed out."},
             status=status.HTTP_200_OK,
         )
+        
+class ReactivateAccountView(APIView):
+
+    permission_classes = [
+        permissions.AllowAny
+    ]
+
+    def post(self, request):
+
+        email = request.data.get("email")
+
+        if not email:
+            return Response(
+                {
+                    "message": "Email is required."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+
+        user = User.objects.filter(
+            email=email,
+            is_delete=True
+        ).first()
+
+
+        if not user:
+            return Response(
+                {
+                    "message": "Deleted account not found."
+                },
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+
+        user.is_delete = False
+        user.is_active = True
+
+        user.save(
+            update_fields=[
+                "is_delete",
+                "is_active"
+            ]
+        )
+
+
+        return Response(
+            {
+                "message": "Account reactivated successfully.",
+                "email": user.email
+            },
+            status=status.HTTP_200_OK
+        )

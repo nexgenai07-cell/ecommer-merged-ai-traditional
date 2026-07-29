@@ -1,52 +1,114 @@
 # PATH: apps/users/serializers.py
-
+from .models import User, UserSession, TwoFactorAuth
 from rest_framework import serializers
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
-from .models import User, UserSession
 
 
 class RegisterSerializer(serializers.ModelSerializer):
-# Handles new customer registration by validating input,
-# confirming passwords match, checking duplicate emails,
-# and creating a new customer account.
     """
     Used for public registration.
     Role is always forced to 'customer' — admin cannot be created here.
     """
-    password = serializers.CharField(write_only=True, validators=[validate_password])
-    confirm_password = serializers.CharField(write_only=True)
+
+    password = serializers.CharField(
+        write_only=True,
+        validators=[validate_password]
+    )
+
+    confirm_password = serializers.CharField(
+        write_only=True
+    )
 
     class Meta:
         model = User
-        fields = ['name', 'email', 'phone', 'password', 'confirm_password']
+        fields = [
+            'name',
+            'email',
+            'phone',
+            'password',
+            'confirm_password'
+        ]
+        extra_kwargs = {
+            'email': {
+                'validators': []
+            }
+        }
 
     def validate_email(self, value):
-        if User.objects.filter(email=value).exists():
-            raise serializers.ValidationError('A user with this email already exists.')
+
+        # Check if this email belongs to a previously deleted account
+        deleted_user = User.objects.filter(
+            email=value,
+            is_delete=True
+        ).first()
+
+        if deleted_user:
+            raise serializers.ValidationError(
+                {
+                    "account_deleted": True,
+                    "message": (
+                        "This account was deleted. "
+                        "Please reactivate your account."
+                    ),
+                    "email": value,
+                }
+            )
+
+        # Check active accounts only
+        if User.objects.filter(
+            email=value,
+            is_delete=False
+        ).exists():
+            raise serializers.ValidationError(
+                "A user with this email already exists."
+            )
+
         return value
 
     def validate(self, data):
+
         if data['password'] != data['confirm_password']:
-            raise serializers.ValidationError({'confirm_password': 'Passwords do not match.'})
+            raise serializers.ValidationError(
+                {
+                    'confirm_password': 'Passwords do not match.'
+                }
+            )
+
         return data
 
     def create(self, validated_data):
-        validated_data.pop('confirm_password')
-        # role is never taken from input — always customer
+
+        validated_data.pop(
+            'confirm_password'
+        )
+
         user = User.objects.create_user(
             email=validated_data['email'],
             password=validated_data['password'],
             name=validated_data['name'],
-            phone=validated_data.get('phone', ''),
+            phone=validated_data.get(
+                'phone',
+                ''
+            ),
             role='customer',
         )
+
         return user
 
 
 class LoginSerializer(serializers.Serializer):
-# Authenticates user credentials and verifies that
-# the account is active before allowing login.
+    """
+    Handles user login.
+
+    Flow:
+    1. Validate email/password
+    2. Check email verification
+    3. Check deleted/deactivated account
+    4. Check 2FA requirement
+    5. Continue normal login
+    """
+
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True)
 
@@ -54,21 +116,44 @@ class LoginSerializer(serializers.Serializer):
         email = data.get('email')
         password = data.get('password')
 
-        user = authenticate(username=email, password=password)
+        # Find user first (even deleted users)
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            raise serializers.ValidationError(
+                "Invalid email or password."
+            )
 
-        if not user:
-            raise serializers.ValidationError('Invalid email or password.')
+        # Check password manually because authenticate()
+        # rejects inactive users before we can inspect them
+        if not user.check_password(password):
+            raise serializers.ValidationError(
+                "Invalid email or password."
+            )
 
+        # NEW: deleted account response
+        if user.is_delete:
+            raise serializers.ValidationError(
+                {
+                    "account_deactivated": True,
+                    "email": user.email,
+                    "message": "This account has been deleted. Would you like to reactivate your account?"
+                }
+            )
+
+        # Normal inactive account
         if not user.is_active:
-            raise serializers.ValidationError('This account has been deactivated.')
+            raise serializers.ValidationError(
+                "This account is inactive."
+            )
 
-        data['user'] = user
+        data["user"] = user
         return data
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
- # Returns the logged-in user's profile information
-# and indicates whether two-factor authentication is enabled.
+    # Returns the logged-in user's profile information
+    # and indicates whether two-factor authentication is enabled.
     """Used for GET /me/ and PUT /me/update/"""
 
     two_factor_enabled = serializers.SerializerMethodField()
@@ -95,14 +180,17 @@ class UserProfileSerializer(serializers.ModelSerializer):
         ]
 
     def get_two_factor_enabled(self, obj):
-        try:
-            return obj.two_factor.is_enabled
-        except:
-            return False
+        two_factor = getattr(obj, "two_factor", None)
+
+        if two_factor:
+            return two_factor.is_enabled
+
+        return False
+
 
 class PasswordResetRequestSerializer(serializers.Serializer):
-# Validates password reset information and ensures
-# the new password confirmation matches.
+    # Validates password reset information and ensures
+    # the new password confirmation matches.
     email = serializers.EmailField()
 
     def validate_email(self, value):
@@ -115,8 +203,8 @@ class PasswordResetRequestSerializer(serializers.Serializer):
 
 
 class PasswordResetConfirmSerializer(serializers.Serializer):
-# Verifies the current password before allowing
-# the user to update it with a new secure password.
+    # Verifies the current password before allowing
+    # the user to update it with a new secure password.
     token = serializers.CharField()
     uid = serializers.CharField()
     new_password = serializers.CharField(validators=[validate_password])
@@ -154,8 +242,8 @@ class ChangePasswordSerializer(serializers.Serializer):
 
 
 class DeleteAccountSerializer(serializers.Serializer):
-# Confirms the user's password before allowing
-# permanent account deletion.
+    # Confirms the user's password before allowing
+    # permanent account deletion.
     """Requires the user's password as confirmation before deleting — prevents
     accidental deletion or deletion by someone who briefly has device access."""
     password = serializers.CharField(write_only=True)
@@ -169,8 +257,8 @@ class DeleteAccountSerializer(serializers.Serializer):
 
 class UserSessionSerializer(serializers.ModelSerializer):
     """Used by GET /sessions/ to list a user's active logins (devices/browsers)."""
-# Formats active login sessions and identifies
-# which session belongs to the current device.
+    # Formats active login sessions and identifies
+    # which session belongs to the current device.
 
     # FIX: "is_current" field ADD kiya gaya — pehle ye field exist hi nahi
     # karta tha, jab ke Requirements doc ke sample response mein
