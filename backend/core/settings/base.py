@@ -35,18 +35,6 @@ STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
 # -------------------------------------------------
-# REDIS
-# -------------------------------------------------
-# NEW — FIX: moved up from the bottom of the file (was only declared right
-# before CACHES) so the SAME value can also be used by CHANNEL_LAYERS below.
-# Both the cache (rate limiting + admin pending-actions store) and the
-# channel layer (WebSocket group broadcasts, e.g. the admin confirm/cancel
-# push) need Redis to work correctly in production — see the comments in
-# both blocks below for what silently breaks without it.
-
-REDIS_URL = os.getenv("REDIS_URL", "")
-
-# -------------------------------------------------
 # EMAIL
 # -------------------------------------------------
 
@@ -158,13 +146,76 @@ if DATABASE_URL:
         )
     }
 else:
-    # Fallback Neon Database Connection
+    # Safe local fallback using SQLite
     DATABASES = {
-        "default": dj_database_url.parse(
-            "postgresql://neondb_owner:npg_0HpNgaCXI1RE@ep-tiny-cloud-atmezn6j-pooler.c-9.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
-            conn_max_age=600,
-            ssl_require=True,
-        )
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
+
+# -------------------------------------------------
+# REDIS / CHANNELS / CACHE CONFIGURATION
+# -------------------------------------------------
+
+REDIS_URL = os.getenv("REDIS_URL", "")
+
+if REDIS_URL:
+    # Upstash Redis requires SSL/TLS configuration ('rediss://')
+    if REDIS_URL.startswith("rediss://"):
+        CHANNEL_LAYERS = {
+            "default": {
+                "BACKEND": "channels_redis.core.RedisChannelLayer",
+                "CONFIG": {
+                    "hosts": [{
+                        "address": REDIS_URL,
+                        "ssl_cert_reqs": None,  # Bypasses SSL handshake timeouts on Upstash
+                    }],
+                    "capacity": 1500,
+                    "expiry": 10,
+                },
+            },
+        }
+        CACHES = {
+            "default": {
+                "BACKEND": "django.core.cache.backends.redis.RedisCache",
+                "LOCATION": REDIS_URL,
+                "OPTIONS": {
+                    "ssl_cert_reqs": None,
+                }
+            }
+        }
+    else:
+        # Standard Local Redis (e.g., redis://127.0.0.1:6379)
+        CHANNEL_LAYERS = {
+            "default": {
+                "BACKEND": "channels_redis.core.RedisChannelLayer",
+                "CONFIG": {
+                    "hosts": [REDIS_URL],
+                },
+            },
+        }
+        CACHES = {
+            "default": {
+                "BACKEND": "django.core.cache.backends.redis.RedisCache",
+                "LOCATION": REDIS_URL,
+            }
+        }
+else:
+    warnings.warn(
+        "REDIS_URL not set — falling back to LocMemCache & InMemoryChannelLayer. "
+        "WebSocket group broadcasts and rate limits will only work within a single process.",
+        RuntimeWarning,
+    )
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels.layers.InMemoryChannelLayer",
+        },
+    }
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        }
     }
 
 # -------------------------------------------------
@@ -241,48 +292,6 @@ if os.getenv('CSRF_TRUSTED_ORIGINS'):
     CSRF_TRUSTED_ORIGINS.extend([o.strip() for o in os.getenv('CSRF_TRUSTED_ORIGINS').split(',') if o.strip()])
 
 # -------------------------------------------------
-# CHANNELS
-# -------------------------------------------------
-# FIX: was hardcoded to InMemoryChannelLayer, which only delivers
-# channel_layer.group_send() messages to consumers running in the SAME
-# process. apps/ai/admin_action_views.py (ConfirmAdminActionView /
-# CancelAdminActionView — plain synchronous DRF requests, NOT WebSocket
-# consumers) now pushes the admin confirm/cancel result to the open
-# "admin_chat_<session_key>" WebSocket group via group_send(). If Railway
-# ever runs more than one worker/process — or the HTTP request and the
-# WebSocket connection simply land on different processes — those pushed
-# messages would silently vanish (no error, the admin's chat would just
-# never update). Redis-backed channel layer fixes this by sharing group
-# membership/messages across processes, using the same REDIS_URL already
-# configured for CACHES below.
-#
-# Requires the `channels_redis` package (pip install channels_redis /
-# add to requirements.txt) — falls back to InMemoryChannelLayer only when
-# REDIS_URL isn't set (e.g. local dev without Redis running).
-
-if REDIS_URL:
-    CHANNEL_LAYERS = {
-        "default": {
-            "BACKEND": "channels_redis.core.RedisChannelLayer",
-            "CONFIG": {
-                "hosts": [REDIS_URL],
-            },
-        },
-    }
-else:
-    warnings.warn(
-        "REDIS_URL not set — falling back to InMemoryChannelLayer. "
-        "WebSocket group broadcasts (e.g. admin confirm/cancel push) will "
-        "only work within a single process. Set REDIS_URL in production.",
-        RuntimeWarning,
-    )
-    CHANNEL_LAYERS = {
-        "default": {
-            "BACKEND": "channels.layers.InMemoryChannelLayer",
-        },
-    }
-
-# -------------------------------------------------
 # INTERNATIONALIZATION
 # -------------------------------------------------
 
@@ -305,49 +314,6 @@ STATICFILES_STORAGE = (
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-
-# -------------------------------------------------
-# CACHE
-# -------------------------------------------------
-# FIX: previously fell back to DummyCache when REDIS_URL wasn't set.
-# DummyCache's get() ALWAYS returns None and set() is a silent no-op — no
-# exception is ever raised. That silently disables two security-relevant
-# features with zero warning:
-#   1. apps/ai/rate_limiting.py — check_rate_limit() reads
-#      `cache.get(cache_key) or []`, which is always `[]` with DummyCache,
-#      so the sliding-window history never accumulates and the limit can
-#      NEVER trip, no matter how large a burst is sent. This matches
-#      exactly what was reported: 11 rapid messages, zero rejections.
-#   2. apps/ai/admin_tools/pending_actions.py — the admin confirm/cancel
-#      preview (action_id) is stored via this same cache; with DummyCache
-#      it would never actually persist between requests.
-# The rate_limiting.py fail-closed `except Exception` guard doesn't help
-# here either, since DummyCache doesn't raise — it just quietly does
-# nothing. LocMemCache actually stores data (in-process), so both features
-# work correctly for a single-process deployment; Redis is still required
-# for correctness across multiple worker processes/replicas — set
-# REDIS_URL on Railway for production.
-
-if REDIS_URL:
-    CACHES = {
-        "default": {
-            "BACKEND": "django.core.cache.backends.redis.RedisCache",
-            "LOCATION": REDIS_URL,
-        }
-    }
-else:
-    warnings.warn(
-        "REDIS_URL not set — falling back to LocMemCache. WS rate "
-        "limiting and admin action confirmations will only work correctly "
-        "within a single process (data is not shared across workers/"
-        "replicas). Set REDIS_URL in production.",
-        RuntimeWarning,
-    )
-    CACHES = {
-        "default": {
-            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-        }
-    }
 
 # ============================================
 # QDRANT — Vector Database
