@@ -7,6 +7,7 @@
 from django.urls import path
 from rest_framework_simplejwt.views import TokenRefreshView
 from .views import (
+    ReactivateAccountView,
     RegisterView,
     LoginView,
     LogoutView,
@@ -38,9 +39,8 @@ urlpatterns = [
     # Verifies reset token and saves the user's new password.
     path('me/update/', MeView.as_view(), name='me_update'),
     # Returns the logged-in user's profile.
-    
-    
-    
+    #reactive account
+    path( "reactivate-account/", ReactivateAccountView.as_view(), name="reactivate-account"), 
     # Account security (this document)
     path('change-password/', ChangePasswordView.as_view(), name='change_password'),
     # Changes the current user's password after verifying the old password.
