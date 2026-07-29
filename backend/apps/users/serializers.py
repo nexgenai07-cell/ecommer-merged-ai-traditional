@@ -98,25 +98,13 @@ class RegisterSerializer(serializers.ModelSerializer):
 
 
 class LoginSerializer(serializers.Serializer):
-    """
-    Handles user login.
-
-    Flow:
-    1. Validate email/password
-    2. Check email verification
-    3. Check deleted/deactivated account
-    4. Check 2FA requirement
-    5. Continue normal login
-    """
-
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True)
 
     def validate(self, data):
-        email = data.get('email')
-        password = data.get('password')
+        email = data.get("email")
+        password = data.get("password")
 
-        # Find user first (even deleted users)
         try:
             user = User.objects.get(email=email)
         except User.DoesNotExist:
@@ -124,27 +112,31 @@ class LoginSerializer(serializers.Serializer):
                 "Invalid email or password."
             )
 
-        # Check password manually because authenticate()
-        # rejects inactive users before we can inspect them
+        # Check password manually because Django authenticate()
+        # blocks is_active=False users before we can check is_delete.
         if not user.check_password(password):
             raise serializers.ValidationError(
                 "Invalid email or password."
             )
 
-        # NEW: deleted account response
+        # Deleted account response
+        # IMPORTANT: keep this after password verification
+        # so nobody can discover deleted accounts.
         if user.is_delete:
             raise serializers.ValidationError(
                 {
                     "account_deactivated": True,
                     "email": user.email,
-                    "message": "This account has been deleted. Would you like to reactivate your account?"
+                    "message": (
+                        "This account has been deleted. "
+                        "Would you like to reactivate it?"
+                    ),
                 }
             )
 
-        # Normal inactive account
         if not user.is_active:
             raise serializers.ValidationError(
-                "This account is inactive."
+                "This account has been deactivated."
             )
 
         data["user"] = user

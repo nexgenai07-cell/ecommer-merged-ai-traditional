@@ -7,7 +7,7 @@
 from django.urls import path
 from rest_framework_simplejwt.views import TokenRefreshView
 from .views import (
-    ReactivateAccountView,
+    ReactivateConfirmView,
     RegisterView,
     LoginView,
     LogoutView,
@@ -18,6 +18,8 @@ from .views import (
     DeleteAccountView,
     SessionListView,
     RevokeAllSessionsView,
+    ReactivateRequestView,
+    ReactivateAccountView
 )
 from .twofactor_views import Enable2FAView, Verify2FAView, Disable2FAView, TwoFactorLoginVerifyView
 from .email_verification_views import SendVerificationEmailView, VerifyEmailView
@@ -39,8 +41,6 @@ urlpatterns = [
     # Verifies reset token and saves the user's new password.
     path('me/update/', MeView.as_view(), name='me_update'),
     # Returns the logged-in user's profile.
-    #reactive account
-    path( "reactivate-account/", ReactivateAccountView.as_view(), name="reactivate-account"), 
     # Account security (this document)
     path('change-password/', ChangePasswordView.as_view(), name='change_password'),
     # Changes the current user's password after verifying the old password.
@@ -50,7 +50,7 @@ urlpatterns = [
     # Returns all active login sessions for the current user.
     path('sessions/revoke-all/', RevokeAllSessionsView.as_view(), name='revoke_all_sessions'),
     # Logs the user out from all devices except the current session.
-    
+    path('reactivate/', ReactivateAccountView.as_view(), name='reactivate_account')
     
     
     # Two-Factor Authentication
@@ -74,4 +74,15 @@ urlpatterns = [
     # Sends a verification email to confirm the user's email address.
     path('verify-email/', VerifyEmailView.as_view(), name='verify_email'),
     # Verifies the email using the token received in the email link.
+    path(
+    "reactivate/request/",
+    ReactivateRequestView.as_view(),
+    name="reactivate_request",
+),
+
+path(
+    "reactivate/confirm/",
+    ReactivateConfirmView.as_view(),
+    name="reactivate_confirm",
+),
 ]

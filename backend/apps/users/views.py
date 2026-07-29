@@ -1,6 +1,6 @@
 # PATH: apps/users/views.py
 
-from rest_framework import status, generics, permissions
+from rest_framework import status, generics, permissions, serializers
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -138,35 +138,48 @@ class LoginView(APIView):
 
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+
+        if not serializer.is_valid():
+
+            if "account_deactivated" in serializer.errors:
+                return Response(
+                    {
+                        "account_deactivated": True,
+                        "email": serializer.errors["email"][0],
+                        "message": serializer.errors["message"][0],
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+            raise serializers.ValidationError(serializer.errors)
 
         user = serializer.validated_data["user"]
 
-# Do not allow login until email is verified
-        if not user.email_verified:
-           return Response(
-        {
-            "email_not_verified": True,
-            "email": user.email,
-            "message": "Please verify your email before logging in."
-        },
-        status=status.HTTP_403_FORBIDDEN,
-    )
-
-# NEW: Do not allow login if account is soft deleted
+        # Account deleted check must happen first
         if user.is_delete:
             return Response(
-        {
-            "account_deactivated": True,
-            "email": user.email,
-            "message": "This account has been deleted. Would you like to reactivate it?"
-        },
-        status=status.HTTP_403_FORBIDDEN,
-    )
+                {
+                    "account_deactivated": True,
+                    "email": user.email,
+                    "message": "This account has been deleted. Would you like to reactivate it?",
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # Do not allow login until email is verified
+        if not user.email_verified:
+            return Response(
+                {
+                    "email_not_verified": True,
+                    "email": user.email,
+                    "message": "Please verify your email before logging in.",
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         two_fa = TwoFactorAuth.objects.filter(
-                 user=user,
-                 is_enabled=True,
+            user=user,
+            is_enabled=True,
         ).first()
 
         if two_fa:
@@ -200,6 +213,7 @@ class LoginView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
 # Logs out the current user by blacklisting
 # the provided refresh token.
 class LogoutView(APIView):
@@ -321,7 +335,7 @@ class MeView(generics.RetrieveUpdateAPIView):
 
     def get_object(self):
         return self.request.user
-    
+
 # Allows authenticated users to securely
 # change their password.
 class ChangePasswordView(APIView):
@@ -374,7 +388,7 @@ class DeleteAccountView(APIView):
             {"message": "Account deleted successfully."},
             status=status.HTTP_200_OK,
         )
-        
+
 # Returns all active login sessions
 # belonging to the authenticated user.
 class SessionListView(generics.ListAPIView):
@@ -408,8 +422,8 @@ class RevokeAllSessionsView(APIView):
             {"message": "All sessions have been signed out."},
             status=status.HTTP_200_OK,
         )
-        
-class ReactivateAccountView(APIView):
+
+class ReactivateRequestView(APIView):
 
     permission_classes = [
         permissions.AllowAny
@@ -427,12 +441,10 @@ class ReactivateAccountView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-
         user = User.objects.filter(
             email=email,
             is_delete=True
         ).first()
-
 
         if not user:
             return Response(
@@ -441,7 +453,6 @@ class ReactivateAccountView(APIView):
                 },
                 status=status.HTTP_404_NOT_FOUND
             )
-
 
         user.is_delete = False
         user.is_active = True
@@ -453,6 +464,92 @@ class ReactivateAccountView(APIView):
             ]
         )
 
+        return Response(
+            {
+                "message": "Account reactivated successfully.",
+                "email": user.email
+            },
+            status=status.HTTP_200_OK
+        )
+
+class ReactivateConfirmView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+
+        email = request.data.get("email")
+
+        if not email:
+            return Response(
+                {"message": "Email is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = User.objects.filter(
+            email=email,
+            is_delete=True,
+        ).first()
+
+        if not user:
+            return Response(
+                {"message": "Invalid reactivation request."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        user.is_delete = False
+        user.is_active = True
+        user.save(
+            update_fields=[
+                "is_delete",
+                "is_active",
+                "updated_at",
+            ]
+        )
+
+        return Response(
+            {
+                "message": "Account reactivated successfully.",
+                "email": user.email,
+            },
+            status=status.HTTP_200_OK,
+        )
+        
+class ReactivateAccountView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        email = request.data.get("email")
+
+        if not email:
+            return Response(
+                {
+                    "message": "Email is required."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        user = User.objects.filter(
+            email=email,
+            is_delete=True
+        ).first()
+
+        if not user:
+            return Response(
+                {
+                    "message": "Deleted account not found."
+                },
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        user.is_delete = False
+        user.is_active = True
+
+        user.save(
+            update_fields=[
+                "is_delete",
+                "is_active"
+            ]
+        )
 
         return Response(
             {
