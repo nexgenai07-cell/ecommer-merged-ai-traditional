@@ -117,7 +117,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "metadata": None,
             "suggestions": ["Find a product", "Talk to support"],
         }))
-
+        
+        
     async def receive(self, text_data):
         try:
             data = json.loads(text_data)
