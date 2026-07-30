@@ -287,8 +287,8 @@ if REDIS_URL:
                 "hosts": [{
                     "address": REDIS_URL,
                     "socket_keepalive": True,
-                    "socket_connect_timeout": 5,
-                    "socket_timeout": 5,
+                    "socket_connect_timeout": 25,
+                    "socket_timeout": 25,
                     "retry_on_timeout": True,
                     "health_check_interval": 30,
                 }],

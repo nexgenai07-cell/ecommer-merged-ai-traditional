@@ -1,7 +1,7 @@
 # PATH: apps/ai/admin_consumers.py
 
 import json
-import logging  # NEW — server-side error logging ke liye
+import logging
 from channels.generic.websocket import AsyncWebsocketConsumer
 from asgiref.sync import sync_to_async
 from langchain_core.messages import HumanMessage, AIMessage
@@ -14,11 +14,6 @@ from apps.ai.ws_auth import extract_token_from_scope, is_token_expired_or_invali
 
 MAX_HISTORY_MESSAGES = 12
 
-# NEW — FIX: raw Python exceptions (jaise "create_pending_action() missing
-# 1 required positional argument") pehle seedha admin ko chat message mein
-# dikh rahe thay. Ab hum ek logger banate hain (asal error server logs
-# mein jayega) aur admin ko hamesha ek generic, friendly message dete
-# hain — kabhi bhi str(e) seedha frontend ko nahi bhejte.
 logger = logging.getLogger(__name__)
 FRIENDLY_ERROR_MESSAGE = "Sorry, kuch masla ho gaya hai. Please thodi dair baad dobara koshish karein."
 
@@ -26,20 +21,75 @@ FRIENDLY_ERROR_MESSAGE = "Sorry, kuch masla ho gaya hai. Please thodi dair baad 
 class AdminChatConsumer(AsyncWebsocketConsumer):
 
     async def connect(self):
-        self.session_key = self.scope['url_route']['kwargs']['session_key']
+        print("[WS-DEBUG] ===== admin connect() CALLED =====", flush=True)
 
-        is_authorized = await self.check_admin_session()
-        if not is_authorized:
+        self.session_key = self.scope['url_route']['kwargs']['session_key']
+        print(f"[WS-DEBUG] session_key from URL = {self.session_key}", flush=True)
+
+        try:
+            session = await self.get_session_debug_info()
+        except Exception:
+            print("[WS-DEBUG] ❌ CRASHED inside check_admin_session() DB query", flush=True)
+            logger.exception("[WS-DEBUG] admin session lookup failed for session_key=%s", self.session_key)
+            await self.close(code=4500)
+            return
+
+        if session is None:
+            print("[WS-DEBUG] ❌ REJECTED — no ChatSession row exists for this session_key at all", flush=True)
             await self.close(code=4403)
             return
 
-        self.token = extract_token_from_scope(self.scope)
+        print(f"[WS-DEBUG] session found -> channel={session['channel']}  is_deleted={session['is_deleted']}  "
+              f"user_id={session['user_id']}  user_role={session['user_role']}", flush=True)
+
+        if session['is_deleted']:
+            print("[WS-DEBUG] ❌ REJECTED — session.is_deleted=True", flush=True)
+            await self.close(code=4403)
+            return
+
+        if session['user_id'] is None:
+            print("[WS-DEBUG] ❌ REJECTED — session.user is None (session was created WITHOUT an authenticated "
+                  "user — check if the 'start session' request sent the admin's Authorization/JWT header)", flush=True)
+            await self.close(code=4403)
+            return
+
+        if session['user_role'] != 'admin':
+            print(f"[WS-DEBUG] ❌ REJECTED — session.user.role = '{session['user_role']}' (expected 'admin')", flush=True)
+            await self.close(code=4403)
+            return
+
+        print("[WS-DEBUG] ✅ check_admin_session passed", flush=True)
+
+        try:
+            self.token = extract_token_from_scope(self.scope)
+            print(f"[WS-DEBUG] token from query string = {'<present>' if self.token else None}", flush=True)
+        except Exception:
+            print("[WS-DEBUG] ❌ CRASHED inside extract_token_from_scope()", flush=True)
+            logger.exception("[WS-DEBUG] extract_token_from_scope failed")
+            await self.close(code=4500)
+            return
+
         client = self.scope.get('client')
         self.client_ip = client[0] if client else None
 
         self.room_group_name = f"admin_chat_{self.session_key}"
-        await self.channel_layer.group_add(self.room_group_name, self.channel_name)
-        await self.accept()
+        try:
+            print(f"[WS-DEBUG] calling channel_layer.group_add('{self.room_group_name}') ...", flush=True)
+            await self.channel_layer.group_add(self.room_group_name, self.channel_name)
+            print("[WS-DEBUG] ✅ group_add() succeeded", flush=True)
+        except Exception:
+            print("[WS-DEBUG] ❌ CRASHED inside channel_layer.group_add() — most likely Redis/channel-layer issue", flush=True)
+            logger.exception("[WS-DEBUG] group_add failed for room=%s", self.room_group_name)
+            await self.close(code=4500)
+            return
+
+        try:
+            await self.accept()
+            print("[WS-DEBUG] ✅ accept() succeeded — admin handshake complete", flush=True)
+        except Exception:
+            print("[WS-DEBUG] ❌ CRASHED inside accept()", flush=True)
+            logger.exception("[WS-DEBUG] accept() failed for session_key=%s", self.session_key)
+            return
 
         await self.send(text_data=json.dumps({
             "type": "connected",
@@ -50,30 +100,31 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
                 "View sales report", "Check low stock",
             ],
         }))
-        
+        print("[WS-DEBUG] ✅ 'connected' message sent to admin — connect() finished successfully", flush=True)
 
     async def disconnect(self, close_code):
+        print(f"[WS-DEBUG] ===== admin disconnect() CALLED — close_code={close_code} =====", flush=True)
         if hasattr(self, 'room_group_name'):
-            await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
+            try:
+                await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
+            except Exception:
+                print("[WS-DEBUG] ❌ CRASHED inside group_discard() during disconnect", flush=True)
+                logger.exception("[WS-DEBUG] group_discard failed during disconnect")
 
     @sync_to_async
-    def check_admin_session(self):
+    def get_session_debug_info(self):
+        # DEBUG — check_admin_session() ki jagah, taake exact wajah pata chale
+        # (session missing? user None? role galat?) — sirf True/False nahi.
         session = ChatSession.objects.select_related('user').filter(session_key=self.session_key).first()
-        if session is None or session.is_deleted:
-            return False
-        return session.user is not None and getattr(session.user, 'role', None) == 'admin'
+        if session is None:
+            return None
+        return {
+            'channel': session.channel,
+            'is_deleted': session.is_deleted,
+            'user_id': session.user_id,
+            'user_role': getattr(session.user, 'role', None) if session.user else None,
+        }
 
-    # NEW — FIX: group-event handler for messages pushed from OUTSIDE this
-    # consumer (e.g. apps/ai/admin_action_views.py ConfirmAdminActionView,
-    # which runs as a plain synchronous DRF request — a completely separate
-    # request/response cycle with no open `receive()` to reply through).
-    # Until now, group_add() added this connection to "admin_chat_<session_key>"
-    # but nothing ever called channel_layer.group_send() on that group, and
-    # no handler existed to receive such an event even if something did — so
-    # confirming via the REST button executed the action but the chat UI
-    # never found out. Channels routes a group_send event to a method named
-    # after its "type" key with dots turned into underscores, so a payload
-    # sent with type="chat.message" arrives here.
     async def chat_message(self, event):
         await self.send(text_data=json.dumps(event["payload"]))
 
@@ -110,15 +161,8 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
             return
 
         try:
-            # UPDATED: Receive 3 items now
             response_text, metadata, suggestions = await self.get_agent_response(user_message)
         except Exception:
-            # FIX — pehle yahan "f'Sorry, something went wrong: {str(e)}'"
-            # bheja jata tha, jo raw Python error (jaise TypeError ka
-            # message: "create_pending_action() missing 1 required
-            # positional argument: 'preview'") seedha admin ko dikha deta
-            # tha. Ab: asal error logger.exception() se server logs mein
-            # jata hai, admin ko hamesha generic friendly message milta hai.
             logger.exception("AdminChatConsumer.get_agent_response failed for session_key=%s", self.session_key)
             response_text, metadata, suggestions = FRIENDLY_ERROR_MESSAGE, None, []
 
@@ -128,7 +172,7 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
             "type": "message", "sender": "ai", "message": response_text,
             "requires_confirmation": requires_confirmation,
             "metadata": metadata,
-            "suggestions": suggestions,   # UPDATED: Sending suggestions to frontend WebSocket
+            "suggestions": suggestions,
         }))
 
     @sync_to_async
@@ -158,13 +202,11 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
             else:
                 chat_history.append(AIMessage(content=text))
 
-        # UPDATED: Unpack 3-tuple returned from run_admin_agent
         output, metadata, suggestions = run_admin_agent(user_message, session_key=self.session_key, user=user, chat_history=chat_history)
 
         if isinstance(output, list):
             output = " ".join(block.get("text", "") if isinstance(block, dict) else str(block) for block in output).strip()
 
         ChatMessage.objects.create(session=chat_session, sender='ai', message=output, metadata=metadata)
-        
-        # UPDATED: Return 3 values
+
         return output, metadata, suggestions
