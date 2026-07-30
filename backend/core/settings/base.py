@@ -259,13 +259,39 @@ if os.getenv('CSRF_TRUSTED_ORIGINS'):
 # Requires the `channels_redis` package (pip install channels_redis /
 # add to requirements.txt) — falls back to InMemoryChannelLayer only when
 # REDIS_URL isn't set (e.g. local dev without Redis running).
+#
+# UPDATE — FIX for "TimeoutError: Timeout reading from ...upstash.io:6379":
+# Upstash (a serverless Redis) silently drops idle TCP connections after a
+# short period. channels_redis keeps a small pool of long-lived connections
+# open for pub/sub, so once Upstash kills one from its side, the next read
+# on that dead socket just hangs until Python's own timeout fires — which
+# is exactly the crash-on-every-connection behaviour reported. Passing
+# these extra per-host options makes the underlying redis-py client detect
+# dead sockets and reconnect instead of hanging:
+#   - socket_keepalive: keeps the OS-level TCP connection alive so idle
+#     sockets aren't silently dropped without either side noticing.
+#   - socket_connect_timeout / socket_timeout: bound how long a single
+#     operation can hang before redis-py raises promptly instead of the
+#     connection hanging indefinitely.
+#   - retry_on_timeout: on a timeout, redis-py retries the operation on a
+#     fresh connection instead of just propagating the crash upward.
+#   - health_check_interval: periodically pings idle connections in the
+#     pool so a dead one is caught and replaced before a real message needs
+#     to go through it.
 
 if REDIS_URL:
     CHANNEL_LAYERS = {
         "default": {
             "BACKEND": "channels_redis.core.RedisChannelLayer",
             "CONFIG": {
-                "hosts": [REDIS_URL],
+                "hosts": [{
+                    "address": REDIS_URL,
+                    "socket_keepalive": True,
+                    "socket_connect_timeout": 5,
+                    "socket_timeout": 5,
+                    "retry_on_timeout": True,
+                    "health_check_interval": 30,
+                }],
             },
         },
     }
