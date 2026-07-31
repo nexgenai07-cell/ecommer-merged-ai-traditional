@@ -5,12 +5,13 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.core.cache import cache
-from django.db.models import Sum, Count, Min, Max
+from django.db.models import Sum, Count, Min, Max, OuterRef, Subquery, IntegerField
 from django.db.models.functions import (
     TruncDate,
     TruncWeek,
     TruncMonth,
     TruncYear,
+    Coalesce,
 )
 from django.utils import timezone
 
@@ -168,12 +169,33 @@ class SalesReportView(APIView):
 
         trunc_fn = get_trunc_function(period)
 
+        # FIX: units-sold ke liye seedha Sum("items__quantity") lagane se
+        # Order-OrderItem join fan-out ho jata — jis order ke 2+ items hon
+        # wo order Count("id")/Sum("total_amount") mein bhi multiple baar
+        # count ho jata (galat total_orders/total_revenue). Isliye pehle
+        # per-order units_sold ek scalar Subquery se nikalte hain (koi
+        # join/fan-out nahi hota), phir bucket ke hisaab se normal
+        # group-by/Sum chalta hai.
+        units_subquery = (
+            OrderItem.objects.filter(order=OuterRef("pk"))
+            .values("order")
+            .annotate(total=Sum("quantity"))
+            .values("total")
+        )
+
+        qs = qs.annotate(
+            units_sold=Coalesce(
+                Subquery(units_subquery, output_field=IntegerField()), 0
+            )
+        )
+
         rows = (
             qs.annotate(bucket=trunc_fn("created_at"))
             .values("bucket")
             .annotate(
                 total_orders=Count("id"),
                 total_revenue=Sum("total_amount"),
+                total_units=Sum("units_sold"),
             )
             .order_by("bucket")
         )
@@ -200,6 +222,7 @@ class SalesReportView(APIView):
                     "date": bucket,
                     "total_orders": row["total_orders"],
                     "total_revenue": row["total_revenue"] or 0,
+                    "total_units": row["total_units"] or 0,   # NEW
                 }
             )
 

@@ -71,6 +71,7 @@ def sales_report_tool(user, date_range: str = "last_30_days") -> dict:
     rows = (result['data'] or {}).get('data', [])
     total_orders = sum(r.get('total_orders', 0) or 0 for r in rows)
     total_revenue = sum(r.get('total_revenue', 0) or 0 for r in rows)
+    total_units = sum(r.get('total_units', 0) or 0 for r in rows)  # FIX — ab SalesReportView 'total_units' bhejta hai
 
     return {
         'success': True,
@@ -79,7 +80,8 @@ def sales_report_tool(user, date_range: str = "last_30_days") -> dict:
         'summary': {'days_with_data': len(rows), 'daily_breakdown': rows},
         'totals': {
             'total_orders': int(total_orders), 
-            'total_revenue': float(total_revenue)
+            'total_revenue': float(total_revenue),
+            'total_units_sold': int(total_units),  # FIX
         },
     }
 

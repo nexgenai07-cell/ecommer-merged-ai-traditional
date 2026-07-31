@@ -46,7 +46,7 @@ def _build_analytics_envelope(tool_name, tool_output):
         envelope['summary'] = {
             'total_orders': int(totals.get('total_orders', 0) or 0),
             'total_revenue': float(totals.get('total_revenue', 0) or 0),
-            'total_units_sold': 0,
+            'total_units_sold': int(totals.get('total_units_sold', 0) or 0),  # FIX — pehle hardcoded 0 tha
         }
     elif tool_name == 'revenue_report':
         breakdown = tool_output.get('revenue_breakdown', {})
