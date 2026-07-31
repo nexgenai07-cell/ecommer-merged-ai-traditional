@@ -78,16 +78,22 @@ def get_admin_followup_suggestions(pending_action) -> list:
     admin_response_metadata.py se metadata.pending_action ke roop mein
     frontend ko jata hai, aur real confirm/cancel action endpoints call
     karta hai) ke UPAR ek DOOSRA, alag "Confirm"/"Cancel" pill-button
-    pair render kar deta tha. Wo dusra pair sirf plain text
-    "Confirm"/"Cancel" message wapis chat mein bhejta tha — real
-    confirm/cancel endpoint ko call NAHI karta — is liye admin ko do
-    button pair dikhte thay jo ek jaisi cheez karte lag rahe thay lekin
-    asal mein alag raste se chalte thay (confusing + risky UX).
+    pair render kar deta tha.
 
     FIX: jab pending_action already present hai, structured card hi
-    confirm/cancel ka SIRF ek raasta honi chahiye — is liye ab hum
-    yahan koi generic "Confirm"/"Cancel" (ya "Haan"/"Nahi" jaisa)
-    suggestion return NAHI karte. Sirf pending_action na hone par khali
-    list return hoti hai — waisi hi jaisi pehle thi.
+    confirm/cancel ka SIRF ek raasta honi chahiye — is liye tab hum
+    koi generic "Confirm"/"Cancel" suggestion return nahi karte.
+
+    BUG THA: pehle ye hamesha unconditionally [] return kar raha tha —
+    chahe pending_action ho ya na ho — is wajah se NORMAL responses
+    (jaise sales_report, list_products) ke liye bhi suggestions hamesha
+    khali aa rahi thi. Ab sirf pending_action ke case mein khali list
+    aayegi, baaki normal turns mein useful default suggestions milengi.
     """
-    return []
+    if pending_action:
+        return []
+
+    return [
+        "View products", "Check inventory",
+        "View sales report", "Check low stock",
+    ]

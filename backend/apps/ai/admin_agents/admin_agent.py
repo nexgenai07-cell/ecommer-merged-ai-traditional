@@ -14,6 +14,22 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from apps.ai.admin_tools.registry import get_admin_agent_tools      # FLOW → apps/ai/admin_tools/registry.py
 from apps.ai.gemini_utils import gemini_keys, call_with_fallback    # FLOW → apps/ai/gemini_utils.py
 
+import re
+
+_TOOL_SYNTAX_PATTERN = re.compile(r"<function=[^>]+>.*?</function>", re.DOTALL)
+
+
+def _strip_leaked_tool_syntax(text: str) -> str:
+    """
+    DEFENSE-IN-DEPTH: agar model kabhi bhi <function=...>...</function>
+    jaisi raw tool-call syntax apne visible answer text mein likh de
+    (jo internal tool name/parameters expose karti hai), ise final
+    response bhejne se PEHLE hata dete hain — chahe system prompt
+    rule kaam kare ya na kare.
+    """
+    if not text:
+        return text
+    return _TOOL_SYNTAX_PATTERN.sub("", text).strip()
 
 SYSTEM_PROMPT = """You are the Admin Assistant for an e-commerce platform's dashboard. You help
 the admin with TWO kinds of tasks ONLY:
@@ -95,6 +111,22 @@ gives aggregate daily counts with no identity; list_customers gives real custome
 phone, total_orders, and total_spent for each customer. Always show the customer_id when
 listing customers — the admin needs it to reference a specific customer later.
 
+=== NEVER EXPOSE TOOL SYNTAX ===
+
+NEVER write literal tool-call syntax in your visible answer — this includes patterns like
+<function=tool_name>{{...}}</function>, function names inside angle brackets, JSON argument
+blobs, or any pseudo-code representing a tool invocation. These are internal implementation
+details and must NEVER appear in text shown to the admin.
+
+If you want to offer to run another tool/report as a next step, say so in plain natural
+language only — e.g. "Chahen to main revenue ka detailed breakdown bhi nikaal sakta hoon,
+bataiye?" — NEVER mention the tool's technical name or its parameters. If you actually want
+to call that tool THIS turn, call it directly through your normal tool-calling mechanism
+instead of describing it in text.
+
+=== GENERAL ===
+
+
 === GENERAL ===
 
 Be precise and professional. Always show exact numbers (prices, quantities, IDs). If a
@@ -152,8 +184,9 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
         
         metadata = extract_admin_metadata(result.get("intermediate_steps", []))
         suggestions = get_admin_followup_suggestions(metadata.get('pending_action'))
-        
-        return result["output"], metadata, suggestions
+
+        clean_output = _strip_leaked_tool_syntax(result["output"])
+        return clean_output, metadata, suggestions
 
     def make_groq_attempt(model_name):
         def attempt():
@@ -169,7 +202,8 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
             metadata = extract_admin_metadata(result.get("intermediate_steps", []))
             suggestions = get_admin_followup_suggestions(metadata.get('pending_action'))
             
-            return result["output"], metadata, suggestions
+            clean_output = _strip_leaked_tool_syntax(result["output"])
+            return clean_output, metadata, suggestions
         return attempt
 
     fallback_fns = []
