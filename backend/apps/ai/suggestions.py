@@ -69,8 +69,28 @@ def get_customer_followup_suggestions(intermediate_steps) -> list:
     return []
 
 
-def get_admin_followup_suggestions(pending_action) -> list:
-    """Requirement 4 — admin side. Simple: if a confirmation is pending, offer quick actions."""
+def get_admin_followup_suggestions(pending_action, intermediate_steps=None) -> list:
+    """Requirement 4 — admin side.
+    1) Agar confirmation pending hai to quick actions do.
+    2) FIX — pehle analytics queries (sales/revenue/best-sellers/customer growth)
+       ke baad koi follow-up suggestion nahi milta tha, chat yahin ruk jati thi.
+       Ab is turn mein call hue tools dekh kar related time-range/detail
+       suggestions dete hain taake admin engaged rahe (jaise last week/month/year)."""
     if pending_action:
         return ["Confirm", "Cancel"]
+
+    tool_names_called = set()
+    for action, _ in (intermediate_steps or []):
+        tool_name = getattr(action, 'tool', None)
+        if tool_name:
+            tool_names_called.add(tool_name)
+
+    if {'sales_report', 'revenue_report'} & tool_names_called:
+        return ["Last Week", "Last Month", "Last Year"]
+    if 'best_sellers' in tool_names_called:
+        return ["Last 30 Days", "Last 90 Days", "Low Performing Products"]
+    if 'customer_growth' in tool_names_called:
+        return ["Last Month", "Last Quarter", "Customer Details"]
+    if 'list_customers' in tool_names_called:
+        return ["Top Spenders", "Recent Customers"]
     return []

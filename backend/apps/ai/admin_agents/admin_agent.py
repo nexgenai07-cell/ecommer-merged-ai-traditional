@@ -5,6 +5,9 @@
 # FARQ: tools apps/ai/admin_tools/registry.py se aate hain (product +
 # category + inventory + order + analytics — sab ek sath).
 
+import re                                                            # NEW — leaked function-call text sanitize karne ke liye
+import logging                                                       # NEW — sanitizer trigger hone par server-side log ke liye
+
 from django.conf import settings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
@@ -13,6 +16,37 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from apps.ai.admin_tools.registry import get_admin_agent_tools      # FLOW → apps/ai/admin_tools/registry.py
 from apps.ai.gemini_utils import gemini_keys, call_with_fallback    # FLOW → apps/ai/gemini_utils.py
+
+logger = logging.getLogger(__name__)
+
+# NEW — FIX (internal info leak): kabhi kabhi chhote fallback models
+# (khaas taur par Groq ka "llama-3.1-8b-instant") LangChain ke asal
+# structured tool-calling mechanism se tool invoke karne ke bajaye,
+# apna function-call intent seedha PLAIN TEXT mein likh dete hain, jaise:
+#   (function=update_product>{"product_id": 123, "fields": {}}</function>)
+# Ye asal mein koi real tool call NAHI hoti (aise cases mein
+# intermediate_steps khali reh jate hain) — ye sirf model ka text
+# hallucination hai jo humare internal tool/function names, parameters,
+# aur action_id admin ko dikha deta tha. Neeche wala regex is tarah ki
+# har leaked pattern ko (chahe woh '(function=' se shuru ho ya
+# '<function=' se, andar json ho ya na ho) response text se hamesha
+# nikaal deta hai — ye ek guaranteed safety net hai, prompt instruction
+# (neeche SYSTEM_PROMPT mein) ke bawajood agar model phir bhi aisa kare.
+_LEAKED_FUNCTION_CALL_PATTERN = re.compile(
+    r'[\(<]\s*function\s*=\s*[a-zA-Z_][a-zA-Z0-9_]*\s*>.*?</function>\s*\)?',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _strip_leaked_tool_syntax(text: str) -> str:
+    if not text:
+        return text
+    cleaned = _LEAKED_FUNCTION_CALL_PATTERN.sub('', text)
+    if cleaned != text:
+        logger.warning("Stripped leaked function-call syntax from admin agent output")
+    # Extra blank lines jo pattern hatane se reh jaati hain unhe saaf karna
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+    return cleaned
 
 
 SYSTEM_PROMPT = """You are the Admin Assistant for an e-commerce platform's dashboard. You help
@@ -95,6 +129,21 @@ gives aggregate daily counts with no identity; list_customers gives real custome
 phone, total_orders, and total_spent for each customer. Always show the customer_id when
 listing customers — the admin needs it to reference a specific customer later.
 
+=== NEVER EXPOSE INTERNAL MECHANICS ===
+
+You have tools available, but the admin must NEVER see how you use them. Concretely:
+- NEVER write out raw function/tool-call syntax as visible text in your answer — no
+  "(function=...)", no "<function=...>...</function>", no JSON tool arguments, no action_id,
+  no tool names (e.g. "update_product", "confirm_pending_action"). Those are internal
+  mechanics, not something to describe or preview to the admin.
+- To actually perform an action, ALWAYS use the real tool-calling mechanism provided to you —
+  never simulate, describe, or narrate a tool call in plain text instead of calling it.
+- If you need more information before you can call a tool (e.g. which field to update), just
+  ask the admin a normal, natural question — do not mention the tool, its parameters, or what
+  you "would" call once you have the answer.
+- When a mutating action needs confirmation, describe it in plain business language (what
+  will change, old value -> new value) — never mention "action_id" or internal tool names.
+
 === GENERAL ===
 
 Be precise and professional. Always show exact numbers (prices, quantities, IDs). If a
@@ -139,10 +188,18 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
         from apps.ai.admin_response_metadata import extract_admin_metadata
         from apps.ai.suggestions import get_admin_followup_suggestions
         
-        metadata = extract_admin_metadata(result.get("intermediate_steps", []))
-        suggestions = get_admin_followup_suggestions(metadata.get('pending_action'))
-        
-        return result["output"], metadata, suggestions
+        intermediate_steps = result.get("intermediate_steps", [])
+        metadata = extract_admin_metadata(intermediate_steps)
+        # UPDATED — analytics-related follow-up suggestions ke liye intermediate_steps
+        # bhi pass karte hain (pehle sirf pending_action dekha jata tha)
+        suggestions = get_admin_followup_suggestions(metadata.get('pending_action'), intermediate_steps)
+
+        # FIX (internal info leak) — kabhi kabhi model (khaas taur par Groq
+        # fallback) tool-call syntax seedha text mein likh deta hai; ye
+        # hamesha final admin-facing text se nikaal dete hain.
+        output = _strip_leaked_tool_syntax(result["output"])
+
+        return output, metadata, suggestions
 
     def make_groq_attempt(model_name):
         def attempt():
@@ -155,10 +212,13 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
             from apps.ai.admin_response_metadata import extract_admin_metadata
             from apps.ai.suggestions import get_admin_followup_suggestions
             
-            metadata = extract_admin_metadata(result.get("intermediate_steps", []))
-            suggestions = get_admin_followup_suggestions(metadata.get('pending_action'))
-            
-            return result["output"], metadata, suggestions
+            intermediate_steps = result.get("intermediate_steps", [])
+            metadata = extract_admin_metadata(intermediate_steps)
+            suggestions = get_admin_followup_suggestions(metadata.get('pending_action'), intermediate_steps)
+
+            output = _strip_leaked_tool_syntax(result["output"])
+
+            return output, metadata, suggestions
         return attempt
 
     fallback_fns = []
