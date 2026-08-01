@@ -80,9 +80,24 @@ update_order, cancel_order) requires EXPLICIT ADMIN CONFIRMATION before it actua
 3. ONLY when the admin clearly confirms, call confirm_pending_action with that exact action_id.
 4. If declined, do not call confirm_pending_action.
 5. NEVER call confirm_pending_action speculatively.
+6. CRITICAL — STOP AFTER SUCCESS: once confirm_pending_action returns a result WITHOUT a
+   "requires_confirmation" key (meaning it succeeded), that action is 100% DONE. In your very
+   next reply: tell the admin plainly it's complete (one short sentence, e.g. "Perfume ka price
+   Rs. 40,000 set ho gaya hai.") and STOP THERE. Do NOT call create_product/update_product/
+   delete_product/create_category/update_category/delete_category/update_inventory/
+   update_order/cancel_order again for that same change, do NOT show another preview, and do
+   NOT ask the admin to confirm again — the action already happened, asking again is
+   confusing and wrong. Only start a NEW propose→confirm cycle if the admin explicitly asks
+   for a DIFFERENT change afterwards.
 
-Read-only operations tools (list_products, get_categories, check_inventory, low_stock,
-get_order_details, track_order) do NOT need confirmation.
+Read-only operations tools (list_products, get_product_details, get_categories,
+check_inventory, low_stock, get_order_details, track_order) do NOT need confirmation.
+
+PRODUCT DETAILS — CRITICAL: list_products only returns summary fields (name, price, stock,
+image) — it does NOT include description, original_price, sku, or low_stock_threshold. NEVER
+say one of those fields is "not set"/"khali hai" based on list_products alone — that's a
+guess, not a fact. Before showing a product's full details, or before proposing ANY update to
+a product, ALWAYS call get_product_details first and read the real values from its response.
 
 === ANALYTICS RULES ===
 
@@ -228,7 +243,7 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
             from apps.ai.suggestions import get_admin_followup_suggestions
 
             metadata = extract_admin_metadata(result.get("intermediate_steps", []))
-            suggestions = get_admin_followup_suggestions(metadata.get('pending_action'))
+            suggestions = get_admin_followup_suggestions(metadata.get('pending_action'), steps)   # FIX — steps pass kiye taake success ke baad bhi relevant suggestions milein
 
             return result["output"], metadata, suggestions
         return attempt
@@ -248,9 +263,10 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
             from apps.ai.admin_response_metadata import extract_admin_metadata
             from apps.ai.suggestions import get_admin_followup_suggestions
             
-            metadata = extract_admin_metadata(result.get("intermediate_steps", []))
-            suggestions = get_admin_followup_suggestions(metadata.get('pending_action'))
-            
+            groq_steps = result.get("intermediate_steps", [])   # FIX — suggestions ko steps dene ke liye
+            metadata = extract_admin_metadata(groq_steps)
+            suggestions = get_admin_followup_suggestions(metadata.get('pending_action'), groq_steps)   # FIX
+
             return result["output"], metadata, suggestions
         return attempt
 

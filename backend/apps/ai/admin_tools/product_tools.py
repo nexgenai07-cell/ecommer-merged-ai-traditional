@@ -12,6 +12,8 @@
 import random
 import string
 
+from django.contrib.auth import get_user_model   # NEW — FIX: propose_update_product ke andar current value fetch karne ke liye
+
 from apps.ai.admin_tools.api_client import call_internal_api
 from apps.ai.admin_tools.pending_actions import create_pending_action
 
@@ -73,7 +75,35 @@ def propose_update_product(session_key: str, user_id: int, product_id: int, fiel
     if 'category_id' in fields:
         fields['category'] = fields.pop('category_id')
 
-    preview = {'action': 'update_product', 'product_id': product_id, 'fields': fields}
+    # NEW — FIX: pehle preview mein sirf NAYI values hoti thin, "purani
+    # value" AI khud (apni memory se, kabhi galat) bana kar bolta tha —
+    # isi wajah se "Rs. 30,000 -> Rs. 40,000" jaisa galat before-value
+    # dikha tha jabke asal purani price 2,500 thi. Ab yahan current
+    # product live fetch karke asal "from -> to" preview banate hain,
+    # taake AI ko guess na karna pade.
+    current_data = {}
+    try:
+        User = get_user_model()
+        acting_user = User.objects.get(id=user_id)
+        current_result = call_internal_api(acting_user, 'GET', f'/api/v1/products/{product_id}/')
+        if current_result['success']:
+            current_data = current_result['data'] or {}
+    except Exception:
+        current_data = {}  # fail-safe — agar fetch na ho paye to bhi preview banta rahe, sirf 'from' None dikhega
+
+    changes = {}
+    for key, new_value in fields.items():
+        old_value = current_data.get(key)
+        if key == 'category' and isinstance(old_value, dict):
+            old_value = old_value.get('id')
+        changes[key] = {'from': old_value, 'to': new_value}
+
+    preview = {
+        'action': 'update_product',
+        'product_id': product_id,
+        'fields': fields,       # backward-compat — purana shape bhi rakha
+        'changes': changes,     # NEW — asal "from -> to" comparison, AI isi se sahi jawab likhega
+    }
     pending_kwargs = {'product_id': product_id, 'fields': fields}
     # FIX — pehle yahan "create_pending_action(session_key, 'update_product', pending_kwargs, preview)"
     # likha tha, yani 'user_id' argument hi missing tha. Isse Python
@@ -126,6 +156,46 @@ def execute_delete_product(user, payload: dict) -> dict:
     if not result['success']:
         return {'success': False, 'error': result['error']}
     return {'success': True, 'message': f'Product {product_id} deleted (soft delete — is_active=False).'}
+
+# NEW — FIX: list_products/search sirf limited fields deta hai
+# (product_id, name, price, stock, image, category_id) — description,
+# original_price, sku, low_stock_threshold kabhi is se nahi aate. Isi
+# wajah se AI in fields ko "not set" bol deta tha chahe DB mein value
+# maujood ho — kyunke usay wo value kabhi tool se mili hi nahi thi.
+# Ye alag, dedicated tool poori detail live fetch karta hai.
+def get_product_details(user, product_id: int) -> dict:
+    """
+    Read-only. Ek product ki POORI detail Django API se fetch karta hai —
+    description, original_price, sku, low_stock_threshold sab shamil.
+    Admin ko product ki detail dikhane se pehle, ya update propose karne
+    se pehle, ye tool call karna chahiye — list_products/search kaafi
+    nahi hai.
+    """
+    result = call_internal_api(user, 'GET', f'/api/v1/products/{product_id}/')
+    if not result['success']:
+        return {'success': False, 'error': result['error']}
+
+    p = result['data'] or {}
+    category = p.get('category')
+    category_id = category.get('id') if isinstance(category, dict) else category
+
+    return {
+        'success': True,
+        'product': {
+            'product_id': p.get('id'),
+            'name': p.get('name'),
+            'category_id': category_id,
+            'price': p.get('price'),
+            'original_price': p.get('original_price'),
+            'stock': p.get('stock'),
+            'sku': p.get('sku'),
+            'description': p.get('description'),
+            'low_stock_threshold': p.get('low_stock_threshold'),
+            'image': p.get('primary_image') or p.get('image'),
+            'is_active': p.get('is_active'),
+        },
+    }
+
 
 def list_products(user, category_id: int = None, search: str = None, limit: int = 20) -> dict:
     """

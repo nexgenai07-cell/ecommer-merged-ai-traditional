@@ -69,8 +69,31 @@ def get_customer_followup_suggestions(intermediate_steps) -> list:
     return []
 
 
-def get_admin_followup_suggestions(pending_action) -> list:
-    """Requirement 4 — admin side. Simple: if a confirmation is pending, offer quick actions."""
+def get_admin_followup_suggestions(pending_action, intermediate_steps=None) -> list:
+    """
+    Requirement 4 — admin side.
+    - Agar ek confirmation abhi pending hai -> Confirm/Cancel dikhao.
+    - NEW — FIX: agar is turn mein confirm_pending_action successfully chal
+      chuka hai (matlab koi mutation abhi complete hui hai), pehle yahan
+      hamesha [] return hota tha — ab admin ko engaged rakhne ke liye
+      relevant next-step suggestions dete hain, based on jo tool abhi chala.
+    """
     if pending_action:
         return ["Confirm", "Cancel"]
+
+    tool_names_called = set()
+    for action, _ in (intermediate_steps or []):
+        tool_name = getattr(action, 'tool', None)
+        if tool_name:
+            tool_names_called.add(tool_name)
+
+    if 'confirm_pending_action' in tool_names_called:
+        return ["View product", "Update another field", "View all products"]
+    if tool_names_called & {'sales_report', 'revenue_report', 'best_sellers', 'customer_growth'}:
+        return ["Compare with last period", "View best sellers", "Check low stock"]
+    if 'list_products' in tool_names_called or 'get_product_details' in tool_names_called:
+        return ["Update this product", "Check inventory"]
+    if 'low_stock' in tool_names_called:
+        return ["Update stock", "View all products"]
+
     return []

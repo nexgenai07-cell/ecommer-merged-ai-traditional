@@ -24,6 +24,7 @@ from apps.ai.admin_tools.product_tools import (
     propose_update_product, execute_update_product,
     propose_delete_product, execute_delete_product,
     list_products as _list_products,
+    get_product_details as _get_product_details,   # NEW — FIX: full product detail tool (description/sku/original_price/low_stock_threshold)
 )
 from apps.ai.admin_tools.category_tools import (
     propose_create_category, execute_create_category,
@@ -159,10 +160,23 @@ def get_admin_operations_tools(session_key: str, user):
 
     @tool
     def list_products(category_id: Optional[int] = None, search: Optional[str] = None, limit: Optional[int] = 20) -> dict:
-        """List products, optionally filtered. Read-only."""
+        """List products, optionally filtered. Read-only. NOTE: this only
+        returns a few summary fields (name, price, stock, image) — it does
+        NOT include description, original_price, sku, or
+        low_stock_threshold. Use get_product_details for those."""
         if limit is None:
             limit = 20
         return _list_products(user, category_id, search, limit)
+
+    @tool
+    def get_product_details(product_id: int) -> dict:
+        """Get the FULL details of ONE product by its ID — including
+        description, original_price, sku, and low_stock_threshold (these
+        are NOT included in list_products). Read-only. ALWAYS call this
+        before telling the admin a product's full details, and before
+        proposing an update to it — never say a field is "not set"
+        unless this tool actually returned it as null/empty."""
+        return _get_product_details(user, product_id)
 
     @tool
     def list_customers(search: Optional[str] = None) -> dict:
@@ -221,7 +235,7 @@ def get_admin_operations_tools(session_key: str, user):
     return [
         create_product, update_product, delete_product,
         create_category, update_category, delete_category, get_categories,
-        list_products, list_customers,
+        list_products, get_product_details, list_customers,
         check_inventory, update_inventory, low_stock,
         get_order_details, update_order, cancel_order, track_order,
         confirm_pending_action,
