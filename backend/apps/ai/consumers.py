@@ -57,7 +57,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "message": "WebSocket connected successfully",
             "session_key": self.session_key,
             "suggestions": initial_suggestions,
-        }))
+        }, ensure_ascii=False))
 
         # NEW — Requirement 10: idle-detection state + background watcher.
         # last_activity resets har naye client message pe; idle_already_sent
@@ -88,10 +88,13 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
     async def _idle_watcher(self):
         """
-        NEW — Requirement 10. Har second check karta hai: agar last message
-        se 30 second guzar chuke hain AUR is idle-period mein pehle se
-        proactive message nahi bheja gaya, to ek proactive message bhejta
-        hai — aur uske baad chup ho jata hai jab tak user dobara active na ho.
+        FIX: Ye sirf ek dafa chalta hai — connect hone ke baad agar customer
+        30 second tak kuch na kahe to ek proactive message bhejta hai, phir
+        khud ko hamesha ke liye band kar leta hai (return). Pehle ye har
+        naye message ke baad dobara reset ho kar chalta rehta tha, isliye
+        beech conversation mein bhi baar-baar ye nudge aa jata tha — ab
+        customer ka pehla message aate hi receive() ise cancel kar deta hai,
+        aur agar wo pehle hi fire ho chuka ho to loop khud return kar chuka hota hai.
         """
         try:
             while True:
@@ -100,6 +103,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 if elapsed >= IDLE_THRESHOLD_SECONDS and not self.idle_already_sent:
                     await self._send_proactive_message()
                     self.idle_already_sent = True
+                    return  # NEW — sirf ek baar bhejna hai, phir loop khatam
         except asyncio.CancelledError:
             pass
 
@@ -116,30 +120,34 @@ class ChatConsumer(AsyncWebsocketConsumer):
             "proactive": True,
             "metadata": None,
             "suggestions": ["Find a product", "Talk to support"],
-        }))
+        }, ensure_ascii=False))
 
     async def receive(self, text_data):
         try:
             data = json.loads(text_data)
         except (json.JSONDecodeError, TypeError):
-            await self.send(text_data=json.dumps({"type": "error", "message": "Invalid message format — expected JSON."}))
+            await self.send(text_data=json.dumps({"type": "error", "message": "Invalid message format — expected JSON."}, ensure_ascii=False))
             return
 
-        # NEW — Requirement 10: har naye message pe idle-timer reset
-        self.last_activity = time.monotonic()
-        self.idle_already_sent = False
+        # FIX: customer ne chat mein kuch bhej diya — idle proactive-nudge
+        # sirf connect ke baad, PEHLE message se pehle wali khamoshi ke liye
+        # tha. Ab ise hamesha ke liye cancel kar dete hain taake ye beech
+        # conversation mein dobara kabhi na aaye (pehle ye reset ho kar
+        # dobara chalta rehta tha, is liye chat ke darmiyan bhi aa jata tha).
+        if hasattr(self, 'idle_task') and not self.idle_task.done():
+            self.idle_task.cancel()
         if data.get('page_context'):
             self.page_context = data['page_context']
 
         if getattr(self, 'token', None) and is_token_expired_or_invalid(self.token):
-            await self.send(text_data=json.dumps({"type": "error", "code": "SESSION_EXPIRED", "message": "Session expired, please log in again."}))
+            await self.send(text_data=json.dumps({"type": "error", "code": "SESSION_EXPIRED", "message": "Session expired, please log in again."}, ensure_ascii=False))
             await self.close(code=4401)
             return
 
         user_id = await self.get_session_user_id()
         allowed = await sync_to_async(check_all_rate_limits)(self.session_key, user_id, getattr(self, 'client_ip', None))
         if not allowed:
-            await self.send(text_data=json.dumps({"type": "error", "code": "RATE_LIMITED", "message": "Too many messages — please wait a moment before sending again."}))
+            await self.send(text_data=json.dumps({"type": "error", "code": "RATE_LIMITED", "message": "Too many messages — please wait a moment before sending again."}, ensure_ascii=False))
             return
 
         user_message = data.get("message", "")
@@ -148,7 +156,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
         try:
             validate_message(user_message)
         except MessageValidationError as e:
-            await self.send(text_data=json.dumps({"type": "error", "message": str(e)}))
+            await self.send(text_data=json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False))
             return
 
         try:
@@ -161,7 +169,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
             # logs mein dekha ja sakta hai), aur user ko hamesha generic
             # friendly message milta hai.
             logger.exception("ChatConsumer.get_agent_response failed for session_key=%s", self.session_key)
-            await self.send(text_data=json.dumps({"type": "error", "message": FRIENDLY_ERROR_MESSAGE}))
+            await self.send(text_data=json.dumps({"type": "error", "message": FRIENDLY_ERROR_MESSAGE}, ensure_ascii=False))
             return
 
         words = response_text.split(' ')
@@ -177,7 +185,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
             if is_last:
                 payload["metadata"] = {"products": products_metadata} if products_metadata else None
                 payload["suggestions"] = suggestions
-            await self.send(text_data=json.dumps(payload))
+            await self.send(text_data=json.dumps(payload, ensure_ascii=False))
 
     @sync_to_async
     def get_session_user_id(self):

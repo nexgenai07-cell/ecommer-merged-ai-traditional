@@ -9,7 +9,7 @@ from decimal import Decimal
 from django.db import transaction
 from langchain_core.tools import tool
 
-from apps.cart.models import Cart, CartItem     # FLOW → cart database tables
+from apps.cart.models import Cart, CartItem, Wishlist     # FLOW → cart database tables
 from apps.products.models import Product
 from apps.stores.models import Store
 from apps.orders.models import Customer, Order, OrderItem, Payment      # FLOW → order database tables
@@ -69,6 +69,104 @@ def get_cart_order_tools(session_key: str, user=None):
             'quantity': cart_item.quantity,
             'cart_total_items': cart_total_items,
         }
+
+    @tool
+    def get_cart() -> dict:
+        """Show everything currently in the customer's shopping cart —
+        each item with its name, price, quantity, and line total, plus the
+        cart subtotal. Use this whenever the customer asks what's in their
+        cart/basket, or before checkout to confirm what they're buying."""
+        cart = _get_or_create_cart(user, session_key)
+        items = list(cart.items.select_related('product').all())
+
+        if not items:
+            return {
+                'success': True,
+                'items': [],
+                'total_items': 0,
+                'subtotal': 0.0,
+                'message': 'Cart is currently empty.',
+            }
+
+        item_list = []
+        subtotal = Decimal('0')
+        for i in items:
+            line_total = i.product.price * i.quantity
+            subtotal += line_total
+            item_list.append({
+                'product_id': i.product.id,
+                'product_name': i.product.name,
+                'price': float(i.product.price),
+                'quantity': i.quantity,
+                'line_total': float(line_total),
+            })
+
+        return {
+            'success': True,
+            'items': item_list,
+            'total_items': sum(i.quantity for i in items),
+            'subtotal': float(subtotal),
+        }
+
+    @tool
+    def get_wishlist() -> dict:
+        """Show everything currently in the customer's wishlist — each
+        product's name, price, whether it's discounted (compare
+        'original_price' vs 'price'), and whether it's in stock. Use this
+        whenever the customer asks what's in their wishlist/favorites/saved
+        items. Requires the customer to be logged in."""
+        if user is None or not user.is_authenticated:
+            return {'success': False, 'error': 'Customer is not logged in. Ask them to log in first to see their wishlist.'}
+
+        wishlist = Wishlist.objects.filter(user=user).first()
+        items = list(wishlist.items.select_related('product').all()) if wishlist else []
+
+        if not items:
+            return {'success': True, 'items': [], 'total_items': 0, 'message': 'Wishlist is currently empty.'}
+
+        item_list = [
+            {
+                'product_id': i.product.id,
+                'product_name': i.product.name,
+                'price': float(i.product.price),
+                'original_price': float(i.product.original_price) if i.product.original_price else None,
+                'in_stock': i.product.in_stock,
+                'stock': i.product.stock,
+            }
+            for i in items
+        ]
+
+        return {'success': True, 'items': item_list, 'total_items': len(item_list)}
+
+    @tool
+    def list_my_orders(limit: int = 10) -> dict:
+        """List the logged-in customer's own past orders — order number,
+        status, and total amount for each. Use this whenever the customer
+        asks about their order history, their order numbers, how many
+        orders they've placed, or wants a list to pick from before asking
+        about one specific order. Requires the customer to be logged in."""
+        if limit is None:
+            limit = 10
+
+        if user is None or not user.is_authenticated:
+            return {'success': False, 'error': 'Customer is not logged in. Ask them to log in first to see their order history.'}
+
+        orders = list(Order.objects.filter(customer__user=user).order_by('-updated_at')[:limit])
+
+        if not orders:
+            return {'success': True, 'orders': [], 'total_found': 0, 'message': 'No orders found for this customer yet.'}
+
+        order_list = [
+            {
+                'order_number': o.order_number,
+                'status': o.status,
+                'total_amount': float(o.total_amount),
+                'discount_amount': float(o.discount_amount) if o.discount_amount else 0.0,
+                'updated_at': str(o.updated_at),
+            }
+            for o in orders
+        ]
+        return {'success': True, 'orders': order_list, 'total_found': len(order_list)}
 
     @tool
     def create_order(shipping_address: str, notes: str = "", guest_name: Optional[str] = None, guest_phone: Optional[str] = None) -> dict:
@@ -188,7 +286,10 @@ def get_cart_order_tools(session_key: str, user=None):
 
     @tool
     def track_order(order_number: str) -> dict:
-        """Get the current status and tracking info of an existing order.
+        """Get the full details of an existing order — status, tracking
+        number, total amount paid, discount applied, payment status, and
+        the list of items in it. Use this for ANY question about a specific
+        order, including status, tracking, amount paid, or discount.
         order_number is REQUIRED — if the customer hasn't given their order
         number yet, ask them for it before calling this tool. The customer
         must also be logged in, and the order must belong to them."""
@@ -199,9 +300,23 @@ def get_cart_order_tools(session_key: str, user=None):
             return {'success': False, 'error': 'Customer is not logged in. Ask them to log in first before tracking an order.'}
 
         try:
-            order = Order.objects.get(order_number=order_number, customer__user=user)
+            order = Order.objects.select_related('payment').prefetch_related('items').get(
+                order_number=order_number, customer__user=user,
+            )
         except Order.DoesNotExist:
             return {'success': False, 'error': 'Order not found.'}
+
+        items = [
+            {
+                'product_name': it.product_name,
+                'quantity': it.quantity,
+                'price': float(it.price),
+                'total_price': float(it.total_price),
+            }
+            for it in order.items.all()
+        ]
+
+        subtotal = float(order.total_amount) + (float(order.discount_amount) if order.discount_amount else 0.0)
 
         return {
             'success': True,
@@ -209,6 +324,11 @@ def get_cart_order_tools(session_key: str, user=None):
             'status': order.status,
             'tracking_number': order.tracking_number,
             'updated_at': str(order.updated_at),
+            'subtotal': subtotal,
+            'discount_amount': float(order.discount_amount) if order.discount_amount else 0.0,
+            'total_amount': float(order.total_amount),
+            'payment_status': order.payment.status if hasattr(order, 'payment') else None,
+            'items': items,
         }
 
     @tool
@@ -245,4 +365,4 @@ def get_cart_order_tools(session_key: str, user=None):
 
         return {'success': True, 'order_number': order.order_number, 'status': order.status}
 
-    return [add_to_cart, create_order, track_order, cancel_order]
+    return [add_to_cart, get_cart, get_wishlist, create_order, list_my_orders, track_order, cancel_order]
