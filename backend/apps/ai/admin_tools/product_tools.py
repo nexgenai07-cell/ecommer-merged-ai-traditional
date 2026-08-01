@@ -179,6 +179,16 @@ def get_product_details(user, product_id: int) -> dict:
     category = p.get('category')
     category_id = category.get('id') if isinstance(category, dict) else category
 
+    # FIX — ProductDetailSerializer (jo GET /products/{id}/ use karta
+    # hai) 'primary_image' ya 'image' key deta hi nahi — ye sirf
+    # ProductListSerializer mein hai. Detail endpoint 'images' (list of
+    # {id, image_url, is_primary}) deta hai. Pehle 'primary_image'/'image'
+    # dhoondte the jo hamesha None milta tha, isi liye admin ko image
+    # hamesha "not set" dikhti thi chahe DB mein maujood ho.
+    images = p.get('images') or []
+    primary = next((img for img in images if img.get('is_primary')), None) or (images[0] if images else None)
+    image_url = primary.get('image_url') if primary else None
+
     return {
         'success': True,
         'product': {
@@ -191,7 +201,7 @@ def get_product_details(user, product_id: int) -> dict:
             'sku': p.get('sku'),
             'description': p.get('description'),
             'low_stock_threshold': p.get('low_stock_threshold'),
-            'image': p.get('primary_image') or p.get('image'),
+            'image': image_url,
             'is_active': p.get('is_active'),
         },
     }
