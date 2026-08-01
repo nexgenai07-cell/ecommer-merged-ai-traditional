@@ -306,4 +306,5 @@ else:
 # ============================================
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
-INTERNAL_API_URL = os.getenv('INTERNAL_API_URL', 'http://localhost:8000')
+PORT = os.environ.get('PORT', '8000')
+INTERNAL_API_URL = os.getenv('INTERNAL_API_URL', f'http://127.0.0.1:{PORT}')
