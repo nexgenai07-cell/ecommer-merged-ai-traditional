@@ -5,48 +5,17 @@
 # FARQ: tools apps/ai/admin_tools/registry.py se aate hain (product +
 # category + inventory + order + analytics — sab ek sath).
 
-import re                                                            # NEW — leaked function-call text sanitize karne ke liye
-import logging                                                       # NEW — sanitizer trigger hone par server-side log ke liye
-
 from django.conf import settings
-from langchain_google_genai import ChatGoogleGenerativeAI
+import logging   # NEW — diagnostic logging: konsa model jawab de raha hai, tool call hua ya nahi
+from langchain_openai import ChatOpenAI   # CHANGED — primary model ab NVIDIA (OpenAI-compatible) hai
 from langchain_groq import ChatGroq
 from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from apps.ai.admin_tools.registry import get_admin_agent_tools      # FLOW → apps/ai/admin_tools/registry.py
-from apps.ai.gemini_utils import gemini_keys, call_with_fallback    # FLOW → apps/ai/gemini_utils.py
+from apps.ai.gemini_utils import call_with_fallback    # FLOW → apps/ai/gemini_utils.py (ab sirf retry/fallback wrapper ke liye)
 
-logger = logging.getLogger(__name__)
-
-# NEW — FIX (internal info leak): kabhi kabhi chhote fallback models
-# (khaas taur par Groq ka "llama-3.1-8b-instant") LangChain ke asal
-# structured tool-calling mechanism se tool invoke karne ke bajaye,
-# apna function-call intent seedha PLAIN TEXT mein likh dete hain, jaise:
-#   (function=update_product>{"product_id": 123, "fields": {}}</function>)
-# Ye asal mein koi real tool call NAHI hoti (aise cases mein
-# intermediate_steps khali reh jate hain) — ye sirf model ka text
-# hallucination hai jo humare internal tool/function names, parameters,
-# aur action_id admin ko dikha deta tha. Neeche wala regex is tarah ki
-# har leaked pattern ko (chahe woh '(function=' se shuru ho ya
-# '<function=' se, andar json ho ya na ho) response text se hamesha
-# nikaal deta hai — ye ek guaranteed safety net hai, prompt instruction
-# (neeche SYSTEM_PROMPT mein) ke bawajood agar model phir bhi aisa kare.
-_LEAKED_FUNCTION_CALL_PATTERN = re.compile(
-    r'[\(<]\s*function\s*=\s*[a-zA-Z_][a-zA-Z0-9_]*\s*>.*?</function>\s*\)?',
-    re.DOTALL | re.IGNORECASE,
-)
-
-
-def _strip_leaked_tool_syntax(text: str) -> str:
-    if not text:
-        return text
-    cleaned = _LEAKED_FUNCTION_CALL_PATTERN.sub('', text)
-    if cleaned != text:
-        logger.warning("Stripped leaked function-call syntax from admin agent output")
-    # Extra blank lines jo pattern hatane se reh jaati hain unhe saaf karna
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-    return cleaned
+logger = logging.getLogger("ai.admin_agent")   # NEW
 
 
 SYSTEM_PROMPT = """You are the Admin Assistant for an e-commerce platform's dashboard. You help
@@ -121,6 +90,16 @@ read-only — no confirmation needed. Always base your numbers strictly on what 
 return — never estimate or make up figures. If a date range isn't specified, default to
 'last_30_days' and mention that assumption. Present numbers clearly (use Rs. for currency,
 and percentages where relevant).
+
+ORDER COUNT / "KITNE ORDERS HUE" QUERIES — CRITICAL: When the admin asks how many orders
+happened (aaj/kal/is hafte/is mahine/koi bhi date range), ALWAYS call sales_report with the
+matching date_range ('today', 'yesterday', 'last_7_days', 'this_month', etc.) and read
+totals.total_orders from its response. NEVER call get_order_details or track_order with a
+guessed/made-up order number to try to "count" orders — order numbers are NOT sequential by
+date and cannot be guessed. If sales_report returns 0 orders for that range, tell the admin
+exactly that (e.g. "Aaj koi order nahi hua") — do not report a different number from memory
+or estimation.
+
 CUSTOMER DETAIL QUERIES: If the admin asks about customers in a way that needs individual
 identity or per-customer detail (e.g. "customer details dikhao", "kis customer ne kitne orders
 kiye", "customer ki spending batao", or follow-up questions after customer_growth like "unki
@@ -129,22 +108,12 @@ gives aggregate daily counts with no identity; list_customers gives real custome
 phone, total_orders, and total_spent for each customer. Always show the customer_id when
 listing customers — the admin needs it to reference a specific customer later.
 
-=== NEVER EXPOSE INTERNAL MECHANICS ===
-
-You have tools available, but the admin must NEVER see how you use them. Concretely:
-- NEVER write out raw function/tool-call syntax as visible text in your answer — no
-  "(function=...)", no "<function=...>...</function>", no JSON tool arguments, no action_id,
-  no tool names (e.g. "update_product", "confirm_pending_action"). Those are internal
-  mechanics, not something to describe or preview to the admin.
-- To actually perform an action, ALWAYS use the real tool-calling mechanism provided to you —
-  never simulate, describe, or narrate a tool call in plain text instead of calling it.
-- If you need more information before you can call a tool (e.g. which field to update), just
-  ask the admin a normal, natural question — do not mention the tool, its parameters, or what
-  you "would" call once you have the answer.
-- When a mutating action needs confirmation, describe it in plain business language (what
-  will change, old value -> new value) — never mention "action_id" or internal tool names.
-
 === GENERAL ===
+
+NEVER invent, guess, or pattern-generate an ID (order number, product ID, customer ID) to
+call a tool with — only use IDs that the admin gave you or that a previous tool call actually
+returned. If you don't have a real ID and need one, ask the admin or use a listing/report tool
+instead (list_products, list_customers, sales_report, etc.).
 
 Be precise and professional. Always show exact numbers (prices, quantities, IDs). If a
 request is ambiguous, ask a clarifying question instead of guessing."""
@@ -173,33 +142,54 @@ def _build_executor(llm, session_key, user):
 def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
     chat_history = chat_history or []
 
-    def gemini_attempt():
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-3.5-flash",
-            google_api_key=gemini_keys.current_key,
-            temperature=0.2,
-            max_retries=1,
-        )
-        executor = _build_executor(llm, session_key, user)
+    # NVIDIA model chain — (model_id, extra llm kwargs).
+    # Order = priority: [0] primary, baaki fallback (upar wala fail ho
+    # tabhi neeche wala try hota hai). Sab slugs docs.api.nvidia.com ke
+    # OFFICIAL reference se verify kiye hain (pehli list mein 3 models
+    # galat naam ki wajah se 404 de rahe thay, aur ek retire ho chuka tha
+    # -> 410). gpt-oss-120b aur deepseek-v4-flash tumhare apne pehle
+    # successful test mein bhi chal chuke hain, is liye unhi ko top pe
+    # rakha hai. Sab alag providers hain taake ek ka outage doosre ko
+    # affect na kare.
+    NVIDIA_MODEL_CHAIN = [
+        ("openai/gpt-oss-120b", {}),                        # PRIMARY — tumhare pehle test mein already kaam kar chuka
+        ("deepseek-ai/deepseek-v4-flash", {}),              # tumhare pehle test mein bhi kaam kar chuka, fast
+        ("deepseek-ai/deepseek-v4-pro", {}),                # strong reasoning, same family jo already chal chuki
+        ("nvidia/nemotron-3-super-120b-a12b", {}),          # NVIDIA's own agentic model — sahi slug (-a12b zaroori tha)
+        ("meta/llama-3.3-70b-instruct", {}),                # well-established, stable, reliable tool-calling
+    ]
 
-        result = executor.invoke({"input": user_input, "chat_history": chat_history})
-        
-        # Metadata and Suggestions extraction
-        from apps.ai.admin_response_metadata import extract_admin_metadata
-        from apps.ai.suggestions import get_admin_followup_suggestions
-        
-        intermediate_steps = result.get("intermediate_steps", [])
-        metadata = extract_admin_metadata(intermediate_steps)
-        # UPDATED — analytics-related follow-up suggestions ke liye intermediate_steps
-        # bhi pass karte hain (pehle sirf pending_action dekha jata tha)
-        suggestions = get_admin_followup_suggestions(metadata.get('pending_action'), intermediate_steps)
+    def make_nvidia_attempt(model_id, extra_kwargs):
+        def attempt():
+            llm = ChatOpenAI(
+                model=model_id,
+                api_key=settings.NVIDIA_API_KEY,
+                base_url="https://integrate.api.nvidia.com/v1",
+                temperature=0.2,
+                max_retries=1,
+                **extra_kwargs,
+            )
+            executor = _build_executor(llm, session_key, user)
 
-        # FIX (internal info leak) — kabhi kabhi model (khaas taur par Groq
-        # fallback) tool-call syntax seedha text mein likh deta hai; ye
-        # hamesha final admin-facing text se nikaal dete hain.
-        output = _strip_leaked_tool_syntax(result["output"])
+            logger.warning(f"[admin_agent] TRYING model={model_id}")   # NEW — diagnostic
 
-        return output, metadata, suggestions
+            result = executor.invoke({"input": user_input, "chat_history": chat_history})
+
+            steps = result.get("intermediate_steps", [])
+            tool_names = [step[0].tool for step in steps] if steps else []
+            logger.warning(   # NEW — diagnostic: ye line saaf batayegi tool call hua ya nahi
+                f"[admin_agent] model={model_id} SUCCEEDED — tools_called={tool_names or 'NONE (model answered directly)'}"
+            )
+
+            # Metadata and Suggestions extraction
+            from apps.ai.admin_response_metadata import extract_admin_metadata
+            from apps.ai.suggestions import get_admin_followup_suggestions
+
+            metadata = extract_admin_metadata(result.get("intermediate_steps", []))
+            suggestions = get_admin_followup_suggestions(metadata.get('pending_action'))
+
+            return result["output"], metadata, suggestions
+        return attempt
 
     def make_groq_attempt(model_name):
         def attempt():
@@ -212,19 +202,25 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
             from apps.ai.admin_response_metadata import extract_admin_metadata
             from apps.ai.suggestions import get_admin_followup_suggestions
             
-            intermediate_steps = result.get("intermediate_steps", [])
-            metadata = extract_admin_metadata(intermediate_steps)
-            suggestions = get_admin_followup_suggestions(metadata.get('pending_action'), intermediate_steps)
-
-            output = _strip_leaked_tool_syntax(result["output"])
-
-            return output, metadata, suggestions
+            metadata = extract_admin_metadata(result.get("intermediate_steps", []))
+            suggestions = get_admin_followup_suggestions(metadata.get('pending_action'))
+            
+            return result["output"], metadata, suggestions
         return attempt
 
-    fallback_fns = []
+    primary_model_id, primary_kwargs = NVIDIA_MODEL_CHAIN[0]
+    nvidia_attempt = make_nvidia_attempt(primary_model_id, primary_kwargs)
+
+    fallback_fns = [
+        make_nvidia_attempt(model_id, extra_kwargs)
+        for model_id, extra_kwargs in NVIDIA_MODEL_CHAIN[1:]
+    ]
+
     if settings.GROQ_API_KEY:
+        # Last-resort fallback — sirf tab try hota hai jab SAARE NVIDIA models
+        # (upar wali chain) fail/quota-exhaust ho chuke hon.
         fallback_fns.append(make_groq_attempt("llama-3.3-70b-versatile"))
         fallback_fns.append(make_groq_attempt("llama-3.1-8b-instant"))
 
     # Return 3 values (output, metadata, suggestions)
-    return call_with_fallback(gemini_attempt, fallback_fns=fallback_fns)
+    return call_with_fallback(nvidia_attempt, fallback_fns=fallback_fns)

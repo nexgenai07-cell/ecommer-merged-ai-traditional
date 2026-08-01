@@ -56,16 +56,20 @@ TRANSIENT_RETRY_DELAY_SECONDS = 3  # har retry se pehle kitni dair rukein
 def call_with_fallback(attempt_fn, fallback_fns=None):
     """
     Args:
-        attempt_fn:    Gemini ke sath ek koshish (rotate/retry logic pehle jaisi)
+        attempt_fn:    Primary model ke sath ek koshish (Gemini-style key
+                       rotate/retry logic — ye ab sirf embeddings calls ke
+                       liye asli maayne rakhta hai, jo ek hi provider Gemini
+                       use karte hain).
         fallback_fns:  OPTIONAL — list of zero-arg functions, TARTEEB (order)
-                       se ek-ek karke try hoti hain jab sari Gemini keys
-                       exhaust ho jayen. Har fallback apna alag provider/model
-                       istemal kare (taake har ek ki apni alag quota bucket ho).
+                       se ek-ek karke try hoti hain jab primary fail ho jaye —
+                       chahe wo quota ho, 410/invalid-model ho, timeout ho,
+                       ya koi bhi aur error. Har fallback apna alag
+                       provider/model istemal kare.
     """
     last_error = None
 
     for key_attempt in range(gemini_keys.total_keys()):
-        moved_to_next_key = False
+        move_to_next_key = False
 
         for transient_attempt in range(TRANSIENT_RETRY_ATTEMPTS + 1):
             try:
@@ -75,30 +79,40 @@ def call_with_fallback(attempt_fn, fallback_fns=None):
 
                 if is_transient_error(e) and transient_attempt < TRANSIENT_RETRY_ATTEMPTS:
                     time.sleep(TRANSIENT_RETRY_DELAY_SECONDS)
-                    continue
+                    continue  # SAME key se dobara try
 
                 if is_quota_error(e) or is_transient_error(e):
-                    moved_to_next_key = True
-                    break
+                    move_to_next_key = True
+                    break  # is key ki koshish khatam — agli key try karo
 
-                raise
+                # FIX: quota/transient KOI NAHI (jaise NVIDIA ka 410 Gone,
+                # invalid model, bad request, timeout wagera) — key rotate
+                # karne ka koi fayda nahi hota, is liye ab seedha fallback
+                # chain try karte hain (pehle ye yahan se `raise` ho jata
+                # tha aur fallback_fns tak kabhi pohonchta hi nahi tha)
+                return _run_fallbacks(fallback_fns, last_error)
 
-        if moved_to_next_key:
+        if move_to_next_key:
             gemini_keys.rotate()
 
-    # Sari Gemini keys exhaust ho chuki hain — fallbacks ek-ek karke try karo
+    # Saari Gemini keys quota/transient error se exhaust ho chuki hain —
+    # fallbacks ek-ek karke try karo
+    return _run_fallbacks(fallback_fns, last_error)
+
+
+def _run_fallbacks(fallback_fns, last_error):
     fallback_errors = []
     for fallback_fn in (fallback_fns or []):
         try:
-            return fallback_fn()        # FLOW: Groq wale attempt yahan chalte hain
+            return fallback_fn()        # FLOW: chain ka agla model/provider yahan chalta hai
         except Exception as fallback_error:
             fallback_errors.append(str(fallback_error))
             continue  # agla fallback try karo
 
-    error_summary = f"Gemini error: {last_error}"
+    error_summary = f"Primary error: {last_error}"
     if fallback_errors:
         error_summary += " | " + " | ".join(f"Fallback error: {e}" for e in fallback_errors)
 
     raise Exception(
-        f"Sari Gemini keys aur fallback providers ki quota khatam ho chuki hai. {error_summary}"
+        f"Primary model aur saare fallback providers fail ho gaye. {error_summary}"
     )

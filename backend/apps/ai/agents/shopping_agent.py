@@ -5,7 +5,8 @@
 # customer ke message ka jawab dene ke liye kaunsa tool call karna hai.
 
 from django.conf import settings
-from langchain_google_genai import ChatGoogleGenerativeAI
+import logging   # NEW — diagnostic logging: konsa model jawab de raha hai, tool call hua ya nahi
+from langchain_openai import ChatOpenAI   # CHANGED — primary model ab NVIDIA (OpenAI-compatible) hai
 from langchain_groq import ChatGroq
 from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -13,7 +14,9 @@ from langchain_core.messages import HumanMessage  # NEW — FIX: image attachmen
 
 from apps.ai.tools.registry import SHOPPING_AGENT_TOOLS     # FLOW → apps/ai/tools/registry.py
 from apps.ai.tools.cart_order_tools import get_cart_order_tools      # FLOW → apps/ai/tools/cart_order_tools.py
-from apps.ai.gemini_utils import gemini_keys, call_with_fallback    # FLOW → apps/ai/gemini_utils.py
+from apps.ai.gemini_utils import call_with_fallback    # FLOW → apps/ai/gemini_utils.py (ab sirf retry/fallback wrapper ke liye, Gemini key rotation use nahi ho raha)
+
+logger = logging.getLogger("ai.shopping_agent")   # NEW
 
 
 SYSTEM_PROMPT = """You are a warm, proactive, and highly engaging shopping assistant
@@ -134,33 +137,62 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
 
     chat_history = chat_history or []
 
-    def gemini_attempt():
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-3.5-flash",
-            google_api_key=gemini_keys.current_key,
-            temperature=0.4,
-            max_retries=1,
-        )
-        executor = _build_executor(llm, session_key, user)
+    # NVIDIA model chain — (model_id, vision_capable, extra llm kwargs).
+    # Order = priority: [0] primary, baaki fallback (upar wala fail ho
+    # tabhi neeche wala try hota hai). Sab slugs docs.api.nvidia.com ke
+    # OFFICIAL reference se verify kiye hain (pehli list mein 3 models
+    # galat naam ki wajah se 404 de rahe thay, aur ek retire ho chuka tha
+    # -> 410). gpt-oss-120b aur deepseek-v4-flash tumhare apne pehle
+    # successful test mein bhi chal chuke hain, is liye unhi ko top pe
+    # rakha hai. Sab alag providers hain taake ek ka outage doosre ko
+    # affect na kare.
+    NVIDIA_MODEL_CHAIN = [
+        ("openai/gpt-oss-120b", False, {}),                        # PRIMARY — tumhare pehle test mein already kaam kar chuka
+        ("deepseek-ai/deepseek-v4-flash", False, {}),              # tumhare pehle test mein bhi kaam kar chuka, fast
+        ("meta/llama-3.2-90b-vision-instruct", True, {}),          # vision fallback (image search ke liye)
+        ("deepseek-ai/deepseek-v4-pro", False, {}),                # strong reasoning, same family jo already chal chuki
+        ("nvidia/nemotron-3-super-120b-a12b", False, {}),          # NVIDIA's own agentic model — sahi slug (-a12b zaroori tha)
+    ]
 
-        # FLOW: YAHAN LLM ASAL MEIN CALL HOTA HAI — Gemini decide karta
-        # hai kaunsa tool call karna hai (jaise search_products,
-        # add_to_cart, ya seedha jawab de dena bina tool ke)
+    def make_nvidia_attempt(model_id, vision_capable, extra_kwargs):
+        def attempt():
+            llm = ChatOpenAI(
+                model=model_id,
+                api_key=settings.NVIDIA_API_KEY,
+                base_url="https://integrate.api.nvidia.com/v1",
+                temperature=0.4,
+                max_retries=1,
+                **extra_kwargs,
+            )
+            executor = _build_executor(llm, session_key, user)
 
-        result = executor.invoke({
-            "input": user_input,
-            "chat_history": chat_history,
-            "customer_context": customer_context,
-            "image_message": _build_image_message(image, vision_capable=True),  # NEW — FIX
-        })
+            # FLOW: YAHAN LLM ASAL MEIN CALL HOTA HAI — is model_id ka model decide
+            # karta hai kaunsa tool call karna hai (jaise search_products,
+            # add_to_cart, ya seedha jawab de dena bina tool ke)
 
-        # FLOW: result["intermediate_steps"] mein har tool call ka record hai —
-        # ye extract_product_metadata() aur get_customer_followup_suggestions() dono ko diya jata hai
+            logger.warning(f"[shopping_agent] TRYING model={model_id}")   # NEW — diagnostic
 
-        from apps.ai.suggestions import get_customer_followup_suggestions   # NEW
-        steps = result.get("intermediate_steps", [])
+            result = executor.invoke({
+                "input": user_input,
+                "chat_history": chat_history,
+                "customer_context": customer_context,
+                "image_message": _build_image_message(image, vision_capable=vision_capable),
+            })
 
-        return result["output"], extract_product_metadata(steps), get_customer_followup_suggestions(steps)
+            steps = result.get("intermediate_steps", [])
+            tool_names = [step[0].tool for step in steps] if steps else []
+            logger.warning(   # NEW — diagnostic: ye line saaf batayegi tool call hua ya nahi
+                f"[shopping_agent] model={model_id} SUCCEEDED — tools_called={tool_names or 'NONE (model answered directly)'}"
+            )
+
+            # FLOW: result["intermediate_steps"] mein har tool call ka record hai —
+            # ye extract_product_metadata() aur get_customer_followup_suggestions() dono ko diya jata hai
+
+            from apps.ai.suggestions import get_customer_followup_suggestions   # NEW
+            steps = result.get("intermediate_steps", [])
+
+            return result["output"], extract_product_metadata(steps), get_customer_followup_suggestions(steps)
+        return attempt
 
     def make_groq_attempt(model_name):
         def attempt():
@@ -179,13 +211,21 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
             return result["output"], extract_product_metadata(steps), get_customer_followup_suggestions(steps)
         return attempt
 
-    fallback_fns = []
+    primary_model_id, primary_vision, primary_kwargs = NVIDIA_MODEL_CHAIN[0]
+    nvidia_attempt = make_nvidia_attempt(primary_model_id, primary_vision, primary_kwargs)
+
+    fallback_fns = [
+        make_nvidia_attempt(model_id, vision_capable, extra_kwargs)
+        for model_id, vision_capable, extra_kwargs in NVIDIA_MODEL_CHAIN[1:]
+    ]
+
     if settings.GROQ_API_KEY:
-        
+        # Last-resort fallback — sirf tab try hota hai jab SAARE NVIDIA models
+        # (upar wali chain) fail/quota-exhaust ho chuke hon.
         fallback_fns.append(make_groq_attempt("llama-3.3-70b-versatile"))
         fallback_fns.append(make_groq_attempt("llama-3.1-8b-instant"))
 
-        # FLOW → apps/ai/gemini_utils.py — key rotation/retry/fallback yahan hota hai,
-        # phir wapis (output, metadata) tuple deta hai — ye consumers.py mein jata hai
-
-    return call_with_fallback(gemini_attempt, fallback_fns=fallback_fns)
+    # FLOW → apps/ai/gemini_utils.py — retry/fallback yahan hota hai (chain mein
+    # order se ek-ek model try hota hai), phir wapis (output, metadata) tuple
+    # deta hai — ye consumers.py mein jata hai
+    return call_with_fallback(nvidia_attempt, fallback_fns=fallback_fns)
