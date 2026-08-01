@@ -1,7 +1,19 @@
 # PATH: apps/ai/admin_tools/registry.py
 
-from typing import Optional
+from typing import Optional, Literal
 from langchain_core.tools import tool
+
+# FIX: date_range pehle plain `Optional[str]` tha — LLM ke paas is baat
+# ka koi record nahi hota tha ke kaunse strings actually valid hain
+# (_resolve_date_range() sirf ek fixed set pehchanta hai), is liye model
+# "last year"/"last week" jaisi requests ke liye galat/random values
+# guess kar leta tha aur har baar same default range pe gir jata tha.
+# Ab Literal type tool schema mein hi enum ke tor pe LLM ko dikhta hai.
+DateRange = Literal[
+    'today', 'yesterday', 'last_7_days', 'last_30_days', 'last_90_days',
+    'this_week', 'last_week', 'this_month', 'last_month',
+    'this_year', 'last_year', 'all_time',
+]
 
 from apps.ai.admin_tools.pending_actions import (
     get_pending_action, is_expired, mark_resolved,
@@ -218,22 +230,42 @@ def get_admin_operations_tools(session_key: str, user):
 
 def get_analytics_tools(user=None):
     @tool
-    def sales_report(date_range: Optional[str] = "last_30_days") -> dict:
-        """Get a sales summary report. Read-only."""
+    def sales_report(date_range: Optional[DateRange] = "last_30_days") -> dict:
+        """Get a sales summary report. Read-only.
+
+        date_range: MUST be exactly one of: 'today', 'yesterday', 'last_7_days',
+        'last_30_days', 'last_90_days', 'this_week', 'last_week', 'this_month',
+        'last_month', 'this_year', 'last_year', 'all_time'. Map the admin's
+        phrasing to the closest one of these — e.g. "pichla hafta"/"last week" ->
+        'last_week', "pichla saal"/"last year" -> 'last_year'. NEVER invent a
+        value outside this list, and NEVER reuse a previous turn's date_range —
+        always re-map from what the admin just asked."""
         if date_range is None:
             date_range = "last_30_days"
         return _sales_report(user, date_range)
 
     @tool
-    def revenue_report(date_range: Optional[str] = "last_30_days") -> dict:
-        """Get a revenue breakdown report. Read-only."""
+    def revenue_report(date_range: Optional[DateRange] = "last_30_days") -> dict:
+        """Get a revenue breakdown report. Read-only.
+
+        date_range: MUST be exactly one of: 'today', 'yesterday', 'last_7_days',
+        'last_30_days', 'last_90_days', 'this_week', 'last_week', 'this_month',
+        'last_month', 'this_year', 'last_year', 'all_time'. Map the admin's
+        phrasing to the closest one of these. NEVER invent a value outside this
+        list, and NEVER reuse a previous turn's date_range."""
         if date_range is None:
             date_range = "last_30_days"
         return _revenue_report(user, date_range)
 
     @tool
-    def best_sellers(date_range: Optional[str] = "last_30_days", limit: Optional[int] = 5) -> dict:
-        """Get top-selling products. Read-only."""
+    def best_sellers(date_range: Optional[DateRange] = "last_30_days", limit: Optional[int] = 5) -> dict:
+        """Get top-selling products. Read-only.
+
+        date_range: MUST be exactly one of: 'today', 'yesterday', 'last_7_days',
+        'last_30_days', 'last_90_days', 'this_week', 'last_week', 'this_month',
+        'last_month', 'this_year', 'last_year', 'all_time'. Map the admin's
+        phrasing to the closest one of these. NEVER invent a value outside this
+        list, and NEVER reuse a previous turn's date_range."""
         if date_range is None:
             date_range = "last_30_days"
         if limit is None:
@@ -241,8 +273,14 @@ def get_analytics_tools(user=None):
         return _best_sellers(user, date_range, limit)
 
     @tool
-    def customer_growth(date_range: Optional[str] = "last_30_days") -> dict:
-        """Get new customer count. Read-only."""
+    def customer_growth(date_range: Optional[DateRange] = "last_30_days") -> dict:
+        """Get new customer count. Read-only.
+
+        date_range: MUST be exactly one of: 'today', 'yesterday', 'last_7_days',
+        'last_30_days', 'last_90_days', 'this_week', 'last_week', 'this_month',
+        'last_month', 'this_year', 'last_year', 'all_time'. Map the admin's
+        phrasing to the closest one of these. NEVER invent a value outside this
+        list, and NEVER reuse a previous turn's date_range."""
         if date_range is None:
             date_range = "last_30_days"
         return _customer_growth(user, date_range)

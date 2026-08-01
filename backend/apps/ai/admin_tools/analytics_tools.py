@@ -3,14 +3,55 @@
 # FLOW: registry.py ke get_analytics_tools() se yahan aata hai. Sab
 # READ-ONLY hain — koi confirmation-gating nahi (koi mutation nahi hoti).
 
+import re
 from datetime import date, timedelta
 
 from apps.ai.admin_tools.api_client import call_internal_api     # FLOW → api_client.py (yahan se apps/analytics/views.py tak jata hai)
 
 _SUPPORTED_RANGES = (
     'today', 'yesterday', 'last_7_days', 'last_30_days', 'last_90_days',
-    'this_month', 'last_month', 'this_year', 'all_time',
+    'this_week', 'last_week', 'this_month', 'last_month',
+    'this_year', 'last_year', 'all_time',
 )
+
+
+# FIX — Railway logs se confirm hua ke primary model (openai/gpt-oss-120b)
+# bhi date_range ko reliably map nahi kar pa raha tha — "last year" pucha
+# gaya aur model ne tool ko {'date_range': 'last_week'} bheja. Sirf
+# system-prompt instructions is model ke liye kaafi nahi thin. Isliye
+# ab CURRENT user message (chat_history NAHI) pe ek deterministic keyword
+# scan chalate hain — agar confident match milta hai, wo value seedha
+# admin_agent.py se prompt mein explicit hint ke tor par inject hoti hai,
+# taake model ko khud "figure out" na karna pade.
+_RANGE_PATTERNS = [
+    (re.compile(r'\btoday\b|\baaj\b', re.IGNORECASE), 'today'),
+    (re.compile(r'\byesterday\b', re.IGNORECASE), 'yesterday'),
+    (re.compile(r'\blast\s*7\s*days?\b|\bpast\s*7\s*days?\b|\bpichl[ae]\s*7\s*din\b', re.IGNORECASE), 'last_7_days'),
+    (re.compile(r'\blast\s*week\b|\bpichl[ae]\s*haft[ae]\b', re.IGNORECASE), 'last_week'),
+    (re.compile(r'\bthis\s*week\b|\bis\s*haft[ae]\b', re.IGNORECASE), 'this_week'),
+    (re.compile(r'\blast\s*90\s*days?\b|\bpichl[ae]\s*90\s*din\b', re.IGNORECASE), 'last_90_days'),
+    (re.compile(r'\blast\s*30\s*days?\b|\bpichl[ae]\s*30\s*din\b', re.IGNORECASE), 'last_30_days'),
+    (re.compile(r'\blast\s*month\b|\bpichl[ae]\s*mahin[ae]\b', re.IGNORECASE), 'last_month'),
+    (re.compile(r'\bthis\s*month\b|\bis\s*mahin[ae]\b', re.IGNORECASE), 'this_month'),
+    (re.compile(r'\blast\s*year\b|\bpichl[ae]\s*sa+l\b', re.IGNORECASE), 'last_year'),
+    (re.compile(r'\bthis\s*year\b|\bis\s*sa+l\b', re.IGNORECASE), 'this_year'),
+    (re.compile(r'\ball[\s-]*time\b|\bshuru\s*se\b|\boverall\b', re.IGNORECASE), 'all_time'),
+]
+
+
+def detect_date_range_hint(text: str) -> str | None:
+    """
+    Deterministic keyword scan (English + common Roman Urdu phrasing) of
+    the CURRENT admin message only. Returns one of _SUPPORTED_RANGES if a
+    confident match is found, else None (model falls back to its own
+    judgement / the prompt's 'last_30_days' default).
+    """
+    if not text:
+        return None
+    for pattern, value in _RANGE_PATTERNS:
+        if pattern.search(text):
+            return value
+    return None
 
 
 def _resolve_date_range(date_range: str):
@@ -22,6 +63,13 @@ def _resolve_date_range(date_range: str):
     convert karta hai. Na-pehchana-gaya keyword bhi silently
     'last_30_days' pe fallback ho jata hai (agent ko crash na kare).
     Returns (start_date_str_or_None, end_date_str_or_None).
+
+    NOTE: 'last_week' aur 'last_year' pehle yahan missing thay — model
+    inhe guess kar leta tha (e.g. jab admin "pichle saal" ya "pichle
+    hafte" ki sales poochta), lekin ye keywords yahan unrecognized the
+    aur silently 'last_30_days' (ya kabhi model ki apni ghalat guess se
+    'last_7_days') pe chale jaate thay — isi wajah se har period ka
+    jawab same aa raha tha.
     """
     today = date.today()
     key = (date_range or 'last_30_days').strip().lower()
@@ -34,6 +82,12 @@ def _resolve_date_range(date_range: str):
         start, end = today - timedelta(days=7), today
     elif key == 'last_90_days':
         start, end = today - timedelta(days=90), today
+    elif key == 'this_week':
+        start, end = today - timedelta(days=today.weekday()), today
+    elif key == 'last_week':
+        this_week_start = today - timedelta(days=today.weekday())
+        start = this_week_start - timedelta(days=7)
+        end = this_week_start - timedelta(days=1)
     elif key == 'this_month':
         start, end = today.replace(day=1), today
     elif key == 'last_month':
@@ -42,6 +96,9 @@ def _resolve_date_range(date_range: str):
         start, end = last_month_end.replace(day=1), last_month_end
     elif key == 'this_year':
         start, end = today.replace(month=1, day=1), today
+    elif key == 'last_year':
+        start = today.replace(year=today.year - 1, month=1, day=1)
+        end = today.replace(year=today.year - 1, month=12, day=31)
     elif key == 'all_time':
         return None, None
     else:

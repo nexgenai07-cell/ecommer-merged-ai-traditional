@@ -13,6 +13,7 @@ from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from apps.ai.admin_tools.registry import get_admin_agent_tools      # FLOW → apps/ai/admin_tools/registry.py
+from apps.ai.admin_tools.analytics_tools import detect_date_range_hint   # NEW — FIX: deterministic date_range detection
 from apps.ai.gemini_utils import call_with_fallback    # FLOW → apps/ai/gemini_utils.py (ab sirf retry/fallback wrapper ke liye)
 
 logger = logging.getLogger("ai.admin_agent")   # NEW
@@ -87,9 +88,18 @@ get_order_details, track_order) do NOT need confirmation.
 
 All analytics tools (sales_report, revenue_report, best_sellers, customer_growth) are
 read-only — no confirmation needed. Always base your numbers strictly on what the tools
-return — never estimate or make up figures. If a date range isn't specified, default to
-'last_30_days' and mention that assumption. Present numbers clearly (use Rs. for currency,
+return — never estimate or make up figures. Present numbers clearly (use Rs. for currency,
 and percentages where relevant).
+
+CURRENT-TURN DATE RANGE (system-detected, follow this exactly):
+{date_range_hint}
+
+NO CROSS-TURN MIXING — CRITICAL: chat_history is ONLY for understanding context (e.g.
+follow-up questions like "unki detail do" or "aur batao") — it is NEVER a source of report
+numbers for the CURRENT answer. Call an analytics tool AT MOST ONCE per report request
+(twice only if the admin's CURRENT message explicitly asks to compare two periods), and
+build your reply ONLY from that fresh tool result — never repeat, reprint, or reference a
+report/table from an earlier turn in chat_history.
 
 ORDER COUNT / "KITNE ORDERS HUE" QUERIES — CRITICAL: When the admin asks how many orders
 happened (aaj/kal/is hafte/is mahine/koi bhi date range), ALWAYS call sales_report with the
@@ -118,6 +128,33 @@ instead (list_products, list_customers, sales_report, etc.).
 Be precise and professional. Always show exact numbers (prices, quantities, IDs). If a
 request is ambiguous, ask a clarifying question instead of guessing."""
 
+def _format_date_range_hint(hint):
+    """
+    FLOW: run_admin_agent() detect_date_range_hint() se milne wale
+    result (ya None) ko is turn ke liye ek concrete, unambiguous
+    instruction mein badalta hai — taake model ko khud enum se
+    "guess"/"map" na karna pade, jo Railway logs ke mutabiq reliably
+    nahi ho pa raha tha (primary model ne "last year" ko galti se
+    'last_week' bhej diya tha).
+    """
+    if hint:
+        return (
+            f"The admin's CURRENT message was detected to be asking about the "
+            f"'{hint}' period. If you call any analytics tool this turn, you MUST "
+            f"pass date_range='{hint}' exactly — do not substitute any other value "
+            f"(not 'last_week', not a value from an earlier turn, nothing else), "
+            f"and don't call an analytics tool a second time with a different "
+            f"date_range unless the admin explicitly asked to compare two periods."
+        )
+    return (
+        "No specific period was detected in the admin's current message. If they "
+        "want a report, default to date_range='last_30_days' and say so explicitly. "
+        "Valid values (if you must pick one yourself): 'today', 'yesterday', "
+        "'last_7_days', 'last_30_days', 'last_90_days', 'this_week', 'last_week', "
+        "'this_month', 'last_month', 'this_year', 'last_year', 'all_time'."
+    )
+
+
 def _build_executor(llm, session_key, user):
 
     tools = get_admin_agent_tools(session_key, user)
@@ -141,6 +178,7 @@ def _build_executor(llm, session_key, user):
 
 def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
     chat_history = chat_history or []
+    date_range_hint = _format_date_range_hint(detect_date_range_hint(user_input))   # NEW — FIX
 
     # NVIDIA model chain — (model_id, extra llm kwargs).
     # Order = priority: [0] primary, baaki fallback (upar wala fail ho
@@ -173,7 +211,11 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
 
             logger.warning(f"[admin_agent] TRYING model={model_id}")   # NEW — diagnostic
 
-            result = executor.invoke({"input": user_input, "chat_history": chat_history})
+            result = executor.invoke({
+                "input": user_input,
+                "chat_history": chat_history,
+                "date_range_hint": date_range_hint,   # NEW — FIX
+            })
 
             steps = result.get("intermediate_steps", [])
             tool_names = [step[0].tool for step in steps] if steps else []
@@ -196,7 +238,11 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
             llm = ChatGroq(model=model_name, groq_api_key=settings.GROQ_API_KEY, temperature=0.2)
             executor = _build_executor(llm, session_key, user)
             
-            result = executor.invoke({"input": user_input, "chat_history": chat_history})
+            result = executor.invoke({
+                "input": user_input,
+                "chat_history": chat_history,
+                "date_range_hint": date_range_hint,   # NEW — FIX
+            })
             
             # Metadata and Suggestions extraction
             from apps.ai.admin_response_metadata import extract_admin_metadata
