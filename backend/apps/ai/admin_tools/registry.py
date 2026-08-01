@@ -113,6 +113,21 @@ def cancel_pending_action_by_id(action_id: str):
 
 def get_admin_operations_tools(session_key: str, user):
 
+    # NEW — FIX (critical): admin ko preview dikhaye bina hi action
+    # execute ho raha tha — kyunke agent apne hi ek turn ke andar
+    # propose_* call kar ke turant confirm_pending_action bhi khud call
+    # kar raha tha, bina kisi genuine admin confirmation ke beech mein
+    # aaye. Isi turn mein banaye gaye action_ids yahan track karte hain,
+    # aur confirm_pending_action ko unhe execute karne se explicitly
+    # mana karte hain — asal confirmation ke liye admin ka ALAG, naya
+    # message aana zaroori hai.
+    created_this_turn = set()
+
+    def _track(result):
+        if isinstance(result, dict) and result.get('action_id'):
+            created_this_turn.add(result['action_id'])
+        return result
+
     @tool
     def create_product(name: str, price: float, stock: int, category_id: Optional[int] = None,
                         description: Optional[str] = "", original_price: Optional[float] = None,
@@ -123,35 +138,35 @@ def get_admin_operations_tools(session_key: str, user):
         before it's actually created."""
         if description is None:
             description = ""
-        return propose_create_product(session_key, user.id, name, price, stock, category_id,
-                                       description, original_price, sku, low_stock_threshold)
+        return _track(propose_create_product(session_key, user.id, name, price, stock, category_id,
+                                       description, original_price, sku, low_stock_threshold))
 
     @tool
     def update_product(product_id: int, fields: dict) -> dict:
         """Update an existing product's fields. MUTATING — requires confirmation."""
-        return propose_update_product(session_key, user.id, product_id, fields)
+        return _track(propose_update_product(session_key, user.id, product_id, fields))
 
     @tool
     def delete_product(product_id: int) -> dict:
         """Delete (soft-delete) a product. MUTATING and destructive."""
-        return propose_delete_product(session_key, user.id, product_id)
+        return _track(propose_delete_product(session_key, user.id, product_id))
 
     @tool
     def create_category(name: str, description: Optional[str] = "") -> dict:
         """Create a new product category. MUTATING — requires confirmation."""
         if description is None:
             description = ""
-        return propose_create_category(session_key, user.id, name, description)
+        return _track(propose_create_category(session_key, user.id, name, description))
 
     @tool
     def update_category(category_id: int, fields: dict) -> dict:
         """Update a category's fields. MUTATING — requires confirmation."""
-        return propose_update_category(session_key, user.id, category_id, fields)
+        return _track(propose_update_category(session_key, user.id, category_id, fields))
 
     @tool
     def delete_category(category_id: int) -> dict:
         """Delete a category. MUTATING and destructive."""
-        return propose_delete_category(session_key, user.id, category_id)
+        return _track(propose_delete_category(session_key, user.id, category_id))
 
     @tool
     def get_categories() -> dict:
@@ -191,7 +206,7 @@ def get_admin_operations_tools(session_key: str, user):
     @tool
     def update_inventory(product_id: int, quantity: int) -> dict:
         """Set a product's stock quantity. MUTATING — requires confirmation."""
-        return propose_update_inventory(session_key, user.id, product_id, quantity)
+        return _track(propose_update_inventory(session_key, user.id, product_id, quantity))
 
     @tool
     def low_stock(threshold: Optional[int] = None) -> dict:
@@ -206,14 +221,14 @@ def get_admin_operations_tools(session_key: str, user):
     @tool
     def update_order(order_id: str, fields: dict) -> dict:
         """Update an order's status/tracking_number. MUTATING — requires confirmation."""
-        return propose_update_order(session_key, user.id, order_id, fields)
+        return _track(propose_update_order(session_key, user.id, order_id, fields))
 
     @tool
     def cancel_order(order_id: str, reason: Optional[str] = "") -> dict:
         """Cancel an order. MUTATING and semi-irreversible."""
         if reason is None:
             reason = ""
-        return propose_cancel_order(session_key, user.id, order_id, reason)
+        return _track(propose_cancel_order(session_key, user.id, order_id, reason))
 
     @tool
     def track_order(order_id: str) -> dict:
@@ -224,7 +239,26 @@ def get_admin_operations_tools(session_key: str, user):
     def confirm_pending_action(action_id: str) -> dict:
         """Execute a previously proposed mutating action after the admin has
         explicitly confirmed it via chat (text 'haan'/'confirm'). Only call
-        this AFTER a clear confirmation for that specific action_id."""
+        this AFTER a clear confirmation for that specific action_id, and
+        ONLY if that action_id was proposed in an EARLIER message — never
+        call this for an action_id you just created in this same reply."""
+        # FIX — critical guard: agar ye action_id isi turn ke andar
+        # (isi reply ke andar) propose_* se abhi bana hai, to ise execute
+        # nahi karte — chahe model ne khud hi confirm karne ki koshish
+        # ki ho. Real confirmation ke liye admin ka ek genuinely NAYA,
+        # alag message aana zaroori hai — warna preview kabhi dikhaye
+        # bina hi mutation ho jati thi (jaisa production mein hua: price
+        # 40,000 se 20,000 kar diya gaya bina admin se confirm karwaye).
+        if action_id in created_this_turn:
+            return {
+                'success': False,
+                'error': (
+                    'Is action ka abhi preview banaya gaya hai — ise isi reply '
+                    'mein confirm nahi kiya ja sakta. Preview clearly admin ko '
+                    'dikhao aur unke agle, ALAG message mein explicit "haan"/'
+                    '"confirm" ka intezar karo.'
+                ),
+            }
         status, result = execute_pending_action_by_id(action_id)
         if status == 'not_found':
             return {'success': False, 'error': 'This confirmation was not found or was already resolved.'}

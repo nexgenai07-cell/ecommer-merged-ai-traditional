@@ -79,7 +79,21 @@ def extract_admin_metadata(intermediate_steps):
 
     def _add_product(p):
         norm = _normalize_product(p)
-        if norm and norm['product_id'] not in seen_product_ids:
+        if not norm:
+            return
+        # FIX — pehle yahan duplicate product_id ko SKIP kar dete thay,
+        # is liye agar isi turn mein pehle get_product_details (purani
+        # value ke sath) chal chuka ho aur baad mein update ka asal
+        # result aaye (nayi value ke sath), to nayi value ignore ho
+        # jati thi aur admin ko metadata mein purani price/stock dikhti
+        # thi — chahe reply text mein sahi nayi value likhi ho. Ab hum
+        # hamesha SABSE AAKHRI (latest) data se overwrite karte hain.
+        if norm['product_id'] in seen_product_ids:
+            for i, existing in enumerate(products):
+                if existing['product_id'] == norm['product_id']:
+                    products[i] = norm
+                    break
+        else:
             seen_product_ids.add(norm['product_id'])
             products.append(norm)
 
@@ -91,9 +105,28 @@ def extract_admin_metadata(intermediate_steps):
             seen_category_ids.add(cid)
             categories.append({'category_id': cid, 'name': c.get('name')})
 
+    # NEW — FIX (double-confirmation bug): jab admin confirm karta hai,
+    # kabhi kabhi model ussi turn mein confirm_pending_action ke BAAD
+    # dobara wahi (ya related) propose_* tool bhi call kar deta tha —
+    # jis se ek naya, resolve-na-hone-wala pending_action frontend ko
+    # chala jata tha aur admin ko dobara "Confirm/Cancel" dikhta tha
+    # chahe update already ho chuka ho. System-prompt se rokna reliable
+    # nahi tha (LLM instruction miss kar sakta hai), is liye ab yahan
+    # deterministically enforce karte hain: is turn mein agar
+    # confirm_pending_action successfully chal chuka hai, us ke baad
+    # aane wali koi bhi propose_* pending_action IGNORE kar dete hain.
+    confirmed_this_turn = False
+
     for action, tool_output in intermediate_steps:
         if not isinstance(tool_output, dict):
             continue
+
+        tool_name = getattr(action, 'tool', None)
+
+        if tool_name == 'confirm_pending_action' and tool_output.get('success') and not tool_output.get('requires_confirmation'):
+            confirmed_this_turn = True
+            pending_action = None  # is turn ka koi bhi pehle wala pending_action ab resolve ho chuka hai — mat dikhao
+            # neeche is step se product/category bhi extract hone dete hain (normal flow), sirf pending_action logic yahan handle ho gayi
 
         if isinstance(tool_output.get('products'), list):
             for p in tool_output['products']:
@@ -117,6 +150,8 @@ def extract_admin_metadata(intermediate_steps):
                     customers.append(c)
 
         if tool_output.get('requires_confirmation'):
+            if confirmed_this_turn:
+                continue  # FIX — confirm ke baad aane wala redundant propose_* ignore karte hain
             pending_action = {
                 'action_id': tool_output.get('action_id'),
                 'action_type': tool_output.get('action_type'),
@@ -125,7 +160,6 @@ def extract_admin_metadata(intermediate_steps):
             }
 
         # NEW — Requirement 6
-        tool_name = getattr(action, 'tool', None)
         if tool_name in ('sales_report', 'revenue_report', 'best_sellers', 'customer_growth'):
             built = _build_analytics_envelope(tool_name, tool_output)
             if built:
