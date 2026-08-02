@@ -7,7 +7,8 @@ from datetime import timedelta
 import os
 import dj_database_url
 from dotenv import load_dotenv
-
+import ssl
+import certifi
 # -------------------------------------------------
 # BASE DIRECTORY + ENV
 # -------------------------------------------------
@@ -55,7 +56,6 @@ FRONTEND_URL = os.getenv(
     'FRONTEND_URL',
     'http://localhost:5173'
 )
-
 # -------------------------------------------------
 # APPS
 # -------------------------------------------------
