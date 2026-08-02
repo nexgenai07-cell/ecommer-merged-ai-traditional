@@ -8,6 +8,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 
 from apps.ai.models import ChatSession, ChatMessage
 from apps.ai.admin_agents.admin_agent import run_admin_agent
+from apps.ai.admin_tools.pending_actions import get_pending_action, is_expired   # NEW — FIX: pending_action_hint build karne ke liye
 from apps.ai.rate_limiting import check_all_rate_limits
 from apps.ai.message_sanitization import validate_message, escape_for_storage, unescape_for_context, MessageValidationError
 from apps.ai.ws_auth import extract_token_from_scope, is_token_expired_or_invalid
@@ -123,6 +124,37 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
         )
         previous_messages.reverse()
 
+        # NEW — CRITICAL FIX: run_admin_agent() ka `pending_action_hint` param
+        # pehle YAHAN SE KABHI PASS HI NAHI HOTA THA — is liye SYSTEM_PROMPT
+        # ko hamesha "koi pending action nahi" wala hint milta tha, chahe
+        # abhi-abhi ek propose_* tool ne pending_action bana kar diya ho.
+        # Isi wajah se "haan confirm kar do" bolne par bhi bot "filhal koi
+        # pending action nahi hai" keh deta tha aur asal update kabhi hoti
+        # hi nahi thi.
+        #
+        # Fix: is admin ke sabse recent AI ChatMessage ka stored metadata
+        # dekhte hain (jahan pending_action save hota hai — models.py mein
+        # ChatMessage.metadata JSONField), aur us action_id ko pending_actions
+        # cache (pending_actions.py) se dobara verify karte hain — taake
+        # agar wo already resolve ho chuka ho ya 5-minute expiry se guzar
+        # chuka ho to hint None hi rahe (aur model sahi keh sake "expire ho
+        # gaya, dobara try karein").
+        pending_action_hint = None
+        last_ai_message = (
+            ChatMessage.objects.filter(session=chat_session, sender='ai')
+            .order_by('-created_at')
+            .first()
+        )
+        if last_ai_message and last_ai_message.metadata:
+            pending = last_ai_message.metadata.get('pending_action')
+            if pending and pending.get('action_id'):
+                cached = get_pending_action(pending['action_id'])
+                if cached and not cached.get('resolved') and not is_expired(cached):
+                    pending_action_hint = {
+                        'action_id': pending['action_id'],
+                        'action_type': pending.get('action_type'),
+                    }
+
         chat_history = []
         for msg in previous_messages:
             text = unescape_for_context(msg.message)
@@ -151,7 +183,10 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
                         text += f"\n\n[internal: open pending_action_id = {pending['action_id']}]"
                 chat_history.append(AIMessage(content=text))
 
-        output, metadata, suggestions = run_admin_agent(user_message, session_key=self.session_key, user=user, chat_history=chat_history)
+        output, metadata, suggestions = run_admin_agent(
+            user_message, session_key=self.session_key, user=user,
+            chat_history=chat_history, pending_action_hint=pending_action_hint,   # NEW — FIX
+        )
 
         if isinstance(output, list):
             output = " ".join(block.get("text", "") if isinstance(block, dict) else str(block) for block in output).strip()
