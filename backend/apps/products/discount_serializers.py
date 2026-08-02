@@ -87,6 +87,7 @@ class DiscountValidateSerializer(serializers.Serializer):
             discount = Discount.objects.get(
                 code=data["code"],
                 is_active=True,
+                is_delete=False,
             )
         except Discount.DoesNotExist:
             raise serializers.ValidationError(

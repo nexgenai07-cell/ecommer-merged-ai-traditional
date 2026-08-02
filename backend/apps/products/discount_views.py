@@ -54,8 +54,14 @@ class DiscountViewSet(viewsets.ModelViewSet):
     # Returns all discounts (both active and inactive)
     # ordered by newest first for the admin panel.
     def get_queryset(self):
-        # Admin sees both active and inactive discounts
-        return Discount.objects.all().order_by("-created_at")
+     """
+    Only non-deleted discounts.
+    """
+     return Discount.objects.filter(
+        is_delete=False
+    ).order_by(
+        "-created_at"
+    )
 
     # Performs a soft delete by marking the discount inactive
     # instead of permanently removing it from the database.
@@ -69,7 +75,15 @@ class DiscountViewSet(viewsets.ModelViewSet):
         but never written to the database on delete/restore.
         """
         instance.is_active = False
-        instance.save(update_fields=["is_active", "updated_at"])
+        instance.is_delete = True
+ 
+        instance.save(
+    update_fields=[
+        "is_active",
+        "is_delete",
+        "updated_at",
+    ]
+)
 
 
 # Validates coupon codes submitted during checkout

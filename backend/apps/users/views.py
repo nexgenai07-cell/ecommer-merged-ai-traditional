@@ -142,6 +142,17 @@ class LoginView(APIView):
 
         user = serializer.validated_data["user"]
 
+        # Do not allow login if account is deactivated
+        if user.is_delete or not user.is_active:
+            return Response(
+                {
+                    "account_deactivated": True,
+                    "email": user.email,
+                    "message": "This account has been deleted. Would you like to reactivate it?",
+                },
+                status=status.HTTP_200_OK,
+            )
+
         # Do not allow login until email is verified
         if not user.email_verified:
             return Response(
@@ -189,6 +200,7 @@ class LoginView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
 # Logs out the current user by blacklisting
 # the provided refresh token.
 class LogoutView(APIView):
@@ -310,7 +322,7 @@ class MeView(generics.RetrieveUpdateAPIView):
 
     def get_object(self):
         return self.request.user
-    
+
 # Allows authenticated users to securely
 # change their password.
 class ChangePasswordView(APIView):
@@ -346,7 +358,8 @@ class DeleteAccountView(APIView):
 
         user = request.user
         user.is_active = False
-        user.save()
+        user.is_delete = True
+        user.save(update_fields=["is_active", "is_delete"])
 
         from rest_framework_simplejwt.token_blacklist.models import (
             OutstandingToken,
@@ -359,7 +372,7 @@ class DeleteAccountView(APIView):
             BlacklistedToken.objects.get_or_create(token=token)
 
         return Response(
-            {"message": "Account deleted successfully."},
+            {"message": "Your account has been deleted."},
             status=status.HTTP_200_OK,
         )
 
@@ -395,4 +408,90 @@ class RevokeAllSessionsView(APIView):
         return Response(
             {"message": "All sessions have been signed out."},
             status=status.HTTP_200_OK,
+        )
+
+# Sends a reactivation link to a deactivated account's email.
+class ReactivateRequestView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        email = request.data.get("email")
+
+        try:
+            user = User.objects.get(email=email)
+
+            if not user.is_delete:
+                return Response(
+                    {
+                        "error": "This account is already active."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            verification = EmailVerification.create_for_user(user)
+
+            link = (
+                f"{settings.FRONTEND_URL}/reactivate-account/"
+                f"{verification.token}/"
+            )
+
+            send_mail(
+                subject="Reactivate your account",
+                message=f"Click the link below:\n\n{link}",
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[user.email],
+                fail_silently=True,
+            )
+
+        except User.DoesNotExist:
+            pass
+
+        return Response(
+            {
+                "message": "If this account exists and is deactivated, a reactivation link has been sent to your email."
+            }
+        )
+
+# Confirms a reactivation token and restores the account.
+class ReactivateConfirmView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        token = request.data.get("token")
+
+        try:
+            verification = EmailVerification.objects.get(
+                token=token,
+                is_used=False,
+            )
+
+        except EmailVerification.DoesNotExist:
+            return Response(
+                {
+                    "error": "This reactivation link is invalid or has expired."
+                },
+                status=400,
+            )
+
+        if not verification.is_valid():
+            return Response(
+                {
+                    "error": "This reactivation link is invalid or has expired."
+                },
+                status=400,
+            )
+
+        user = verification.user
+
+        user.is_delete = False
+        user.is_active = True
+        user.save(update_fields=["is_delete", "is_active"])
+
+        verification.is_used = True
+        verification.save(update_fields=["is_used"])
+
+        return Response(
+            {
+                "message": "Your account has been reactivated. You can now log in."
+            }
         )

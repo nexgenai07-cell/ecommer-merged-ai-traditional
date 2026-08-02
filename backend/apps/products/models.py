@@ -38,6 +38,7 @@ class Product(models.Model):
     )
 
     is_active = models.BooleanField(default=True)
+    is_delete = models.BooleanField(default=False)
     publish_at = models.DateTimeField(null=True, blank=True)
     low_stock_threshold = models.PositiveIntegerField(default=5)
 
@@ -174,6 +175,7 @@ class Discount(models.Model):
     start_date       = models.DateTimeField()
     end_date         = models.DateTimeField()
     is_active        = models.BooleanField(default=True)
+    is_delete        = models.BooleanField(default=False)
     created_at       = models.DateTimeField(auto_now_add=True)
     updated_at       = models.DateTimeField(auto_now=True)
 
