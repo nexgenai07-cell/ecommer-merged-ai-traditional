@@ -1,21 +1,28 @@
 # PATH: apps/returns/complaint_serializers.py
 
 from rest_framework import serializers
+from apps.orders.models import Order
 from .models import Complaint
 
 
 class ComplaintSerializer(serializers.ModelSerializer):
-    customer_name = serializers.CharField(source="customer.name", read_only=True)
+    customer_name = serializers.CharField(
+        source="customer.name",
+        read_only=True,
+    )
+
     order_number = serializers.CharField(
         source="order.order_number",
         read_only=True,
         default=None,
     )
+
     resolved_by_name = serializers.CharField(
         source="resolved_by.name",
         read_only=True,
         default=None,
     )
+
     attachment = serializers.SerializerMethodField()
 
     class Meta:
@@ -35,6 +42,7 @@ class ComplaintSerializer(serializers.ModelSerializer):
             "resolved_by_name",
             "created_at",
         ]
+
         read_only_fields = [
             "id",
             "status",
@@ -47,6 +55,7 @@ class ComplaintSerializer(serializers.ModelSerializer):
             return None
 
         request = self.context.get("request")
+
         if request:
             return request.build_absolute_uri(obj.attachment.url)
 
@@ -54,6 +63,14 @@ class ComplaintSerializer(serializers.ModelSerializer):
 
 
 class CreateComplaintSerializer(serializers.ModelSerializer):
+    # Accept order_number instead of primary key
+    order = serializers.SlugRelatedField(
+        slug_field="order_number",
+        queryset=Order.objects.all(),
+        required=False,
+        allow_null=True,
+    )
+
     class Meta:
         model = Complaint
         fields = [
@@ -69,7 +86,9 @@ class CreateComplaintSerializer(serializers.ModelSerializer):
             return value
 
         if value.size > 10 * 1024 * 1024:
-            raise serializers.ValidationError("File too large.")
+            raise serializers.ValidationError(
+                "File too large."
+            )
 
         allowed_types = [
             "image/png",
@@ -78,14 +97,21 @@ class CreateComplaintSerializer(serializers.ModelSerializer):
         ]
 
         if value.content_type not in allowed_types:
-            raise serializers.ValidationError("Unsupported file type.")
+            raise serializers.ValidationError(
+                "Unsupported file type."
+            )
 
         return value
 
 
 class AdminComplaintStatusSerializer(serializers.Serializer):
     status = serializers.ChoiceField(
-        choices=["open", "in_progress", "resolved", "closed"]
+        choices=[
+            "open",
+            "in_progress",
+            "resolved",
+            "closed",
+        ]
     )
 
 
