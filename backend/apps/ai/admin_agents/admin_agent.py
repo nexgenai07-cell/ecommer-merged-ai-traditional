@@ -77,7 +77,10 @@ update_order, cancel_order) requires EXPLICIT ADMIN CONFIRMATION before it actua
    required fields are missing).
 2. The tool returns a preview + action_id — show it clearly and ask the admin to confirm
    (e.g. "Confirm karen? (haan/nahi)").
-3. ONLY when the admin clearly confirms, call confirm_pending_action with that exact action_id.
+3. ONLY when the admin clearly confirms, call confirm_pending_action with that exact
+   action_id. You do NOT need to find this action_id yourself by reading chat_history —
+   it is given to you deterministically below in "CURRENT-TURN PENDING ACTION". Never
+   invent or guess an action_id, and never ask the admin to type/repeat it themselves.
 4. If declined, do not call confirm_pending_action.
 5. NEVER call confirm_pending_action speculatively.
 6. CRITICAL — STOP AFTER SUCCESS: once confirm_pending_action returns a result WITHOUT a
@@ -89,6 +92,10 @@ update_order, cancel_order) requires EXPLICIT ADMIN CONFIRMATION before it actua
    NOT ask the admin to confirm again — the action already happened, asking again is
    confusing and wrong. Only start a NEW propose→confirm cycle if the admin explicitly asks
    for a DIFFERENT change afterwards.
+
+CURRENT-TURN PENDING ACTION (system-detected, follow this exactly — do NOT try to
+find the action_id yourself in chat_history, use only what's given here):
+{pending_action_hint}
 
 Read-only operations tools (list_products, get_product_details, get_categories,
 check_inventory, low_stock, get_order_details, track_order) do NOT need confirmation.
@@ -170,6 +177,41 @@ def _format_date_range_hint(hint):
     )
 
 
+def _format_pending_action_hint(hint):
+    """
+    FLOW: admin_consumers.py se milta hai. Wahan Python code deterministically
+    (LLM se nahi) check karta hai ke sabse recent AI turn ka pending_action
+    abhi tak resolve/expire to nahi hua (pending_actions cache se verify
+    karke). Ye function us result (dict ya None) ko is turn ke liye ek
+    concrete, unambiguous instruction mein badalta hai — same pattern jo
+    date_range ke liye upar (_format_date_range_hint) use ho raha hai,
+    kyunke LLM se free text (chat_history) mein se UUID "dhoondhna" ya
+    "yaad rakhna" reliable nahi tha, khaaskar fallback chain ke weaker
+    models ke sath (Groq llama-3.1-8b-instant wagera).
+    """
+    if hint and hint.get('action_id'):
+        return (
+            f"There IS an open pending action awaiting the admin's confirmation: "
+            f"action_id='{hint['action_id']}' (type: {hint.get('action_type')}). "
+            f"If the admin's CURRENT message clearly confirms it (e.g. 'haan', "
+            f"'yes', 'confirm', 'ok karo', 'kar do', 'theek hai'), call "
+            f"confirm_pending_action(action_id='{hint['action_id']}') using this "
+            f"EXACT action_id — never a different, older, or invented one. If the "
+            f"admin's current message clearly declines/cancels (e.g. 'nahi', "
+            f"'cancel', 'mat karo'), do NOT call confirm_pending_action — just "
+            f"acknowledge the cancellation in one short sentence. If their current "
+            f"message is about something else entirely (a new/different request), "
+            f"ignore this pending action completely and handle their new request "
+            f"normally — don't confirm/cancel it without a clear signal either way."
+        )
+    return (
+        "There is no open pending action right now. If the admin says something "
+        "like 'confirm'/'haan'/'yes' with nothing pending, tell them plainly "
+        "there's nothing to confirm currently and ask what they'd like to do — "
+        "do NOT call confirm_pending_action."
+    )
+
+
 def _build_executor(llm, session_key, user):
 
     tools = get_admin_agent_tools(session_key, user)
@@ -191,9 +233,10 @@ def _build_executor(llm, session_key, user):
     )
 
 
-def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
+def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, pending_action_hint=None):
     chat_history = chat_history or []
     date_range_hint = _format_date_range_hint(detect_date_range_hint(user_input))   # NEW — FIX
+    pending_action_hint_text = _format_pending_action_hint(pending_action_hint)     # NEW — FIX
 
     # NVIDIA model chain — (model_id, extra llm kwargs).
     # Order = priority: [0] primary, baaki fallback (upar wala fail ho
@@ -230,6 +273,7 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
                 "input": user_input,
                 "chat_history": chat_history,
                 "date_range_hint": date_range_hint,   # NEW — FIX
+                "pending_action_hint": pending_action_hint_text,   # NEW — FIX
             })
 
             steps = result.get("intermediate_steps", [])
@@ -257,6 +301,7 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None):
                 "input": user_input,
                 "chat_history": chat_history,
                 "date_range_hint": date_range_hint,   # NEW — FIX
+                "pending_action_hint": pending_action_hint_text,   # NEW — FIX
             })
             
             # Metadata and Suggestions extraction

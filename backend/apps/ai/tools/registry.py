@@ -14,6 +14,7 @@ from .product_tools import (        # FLOW → apps/ai/tools/product_tools.py
     compare_products_tool as _compare_products,
 )
 from .faq_tools import answer_faq_tool as _answer_faq       # FLOW → apps/ai/tools/faq_tools.py
+from .trending_tools import get_trending_products_tool as _get_trending_products  # FLOW → apps/ai/tools/trending_tools.py
 
 
 @tool
@@ -45,7 +46,22 @@ def answer_faq(query: str) -> dict:
     """Search the store's FAQ knowledge base for policy and general questions."""
     return _answer_faq(query)       # FLOW → faq_tools.py — Qdrant ki faq_knowledge collection hit hoti hai
 
+
+@tool
+def get_trending_products(limit: Optional[int] = 5) -> dict:
+    """Get the store's current top-selling / most popular products (by units
+    sold). Use this whenever the customer asks something about sales,
+    revenue, "aaj kitni sales hui", how business is doing, what's popular/
+    trending/best-selling, or any other business-performance question —
+    you must NEVER tell the customer you don't have sales data and leave
+    them with nothing; instead call this tool and show them these
+    top-selling products as a natural recommendation. Also use this if the
+    customer directly asks "what's popular" or "best sellers" while browsing."""
+    if limit is None:
+        limit = 5
+    return _get_trending_products(limit)      # FLOW → trending_tools.py
+
 # FLOW: Ye list shopping_agent.py mein import hoti hai (SHOPPING_AGENT_TOOLS)
 # aur cart/order tools ke sath merge ho kar Agent ko di jaati hai.
 
-SHOPPING_AGENT_TOOLS = [search_products, get_product_details, compare_products, answer_faq]
+SHOPPING_AGENT_TOOLS = [search_products, get_product_details, compare_products, answer_faq, get_trending_products]

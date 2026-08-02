@@ -44,8 +44,10 @@ def get_initial_suggestions(user) -> list:
     return suggestions[:4]
 
 
-def get_customer_followup_suggestions(intermediate_steps) -> list:
-    """Requirement 4 — customer side. Based ONLY on this turn's tool calls."""
+def get_customer_followup_suggestions(intermediate_steps, session_key: str = None) -> list:
+    """Requirement 4 — customer side. Based ONLY on this turn's tool calls,
+    PLUS (NEW) language-switch chips at the end so the customer can always
+    change what language the bot replies in."""
     tool_names_called = set()
     login_required = False
 
@@ -59,14 +61,31 @@ def get_customer_followup_suggestions(intermediate_steps) -> list:
                 login_required = True
 
     if login_required:
-        return ["Log In"]
-    if 'add_to_cart' in tool_names_called:
-        return ["Go to Cart", "Continue Shopping", "See Similar Products"]
-    if 'create_order' in tool_names_called:
-        return ["Track Order", "Continue Shopping"]
-    if 'search_products' in tool_names_called:
-        return ["Compare These", "Filter by Price", "Show More"]
-    return []
+        base = ["Log In"]
+    elif 'add_to_cart' in tool_names_called:
+        base = ["Go to Cart", "Continue Shopping", "See Similar Products"]
+    elif 'create_order' in tool_names_called:
+        base = ["Track Order", "Continue Shopping"]
+    elif 'search_products' in tool_names_called:
+        base = ["Compare These", "Filter by Price", "Show More"]
+    else:
+        base = []
+
+    return base + _get_language_chip_suggestions(session_key)
+
+
+def _get_language_chip_suggestions(session_key: str = None) -> list:
+    """
+    NEW — always-available language-switch chips. Agar customer ne pehle se
+    (kisi sticky preference se) ek language select ki hui hai, us ek ko
+    list se hata dete hain (khud ko dobara select karne ka option dikhana
+    unnecessary hai) — baaki do hamesha dikhte hain taake customer kabhi
+    bhi switch kar sake.
+    """
+    from apps.ai.language_preference import LANGUAGE_CHIPS, get_language_preference
+
+    active = get_language_preference(session_key) if session_key else None
+    return [label for code, label in LANGUAGE_CHIPS.items() if code != active]
 
 
 def get_admin_followup_suggestions(pending_action, intermediate_steps=None) -> list:
