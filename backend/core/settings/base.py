@@ -56,6 +56,9 @@ FRONTEND_URL = os.getenv(
     'FRONTEND_URL',
     'http://localhost:5173'
 )
+
+EMAIL_SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+EMAIL_TIMEOUT = 30
 # -------------------------------------------------
 # APPS
 # -------------------------------------------------
