@@ -18,6 +18,117 @@ from apps.ai.gemini_utils import call_with_fallback    # FLOW → apps/ai/gemini
 
 logger = logging.getLogger("ai.shopping_agent")   # NEW
 
+import re   # NEW — FIX: deterministic script detection ke liye
+from apps.ai.language_preference import (   # NEW — sticky language preference (chip-select)
+    get_language_preference, set_language_preference, detect_language_selection,
+)
+
+# NEW — FIX: LLM (khaaskar fallback/weaker models) customer ke "Roman Urdu"
+# ko reliably pehchan kar Roman Urdu mein hi reply nahi kar rahe thay — kabhi
+# kabhi seedha pure Urdu (Arabic) script mein switch ho jate thay, jo customer
+# ne kabhi maanga hi nahi tha. Isi problem ko admin_agent.py mein
+# date_range_hint/pending_action_hint pattern se fix kiya gaya tha — LLM se
+# "detect karo" kehne ke bajaye Python khud detect karta hai (regex se, jo
+# 100% reliable hai) aur is turn ke liye ek concrete instruction deta hai.
+#
+# NOTE: hum "Roman Urdu" ko "English" se text se algorithmically differentiate
+# nahi kar sakte (dono Latin script hain) — na hi zaroorat hai, JAB TAK
+# customer khud explicitly ek language select nahi karta (neeche wala
+# resolve_language_for_turn() dekhein). Bina explicit selection ke, customer
+# jo bhi Latin letters mein likhe (Roman Urdu ho ya English), reply bhi
+# Latin script mein hi hona chahiye — bas Urdu (Arabic) script mein switch
+# nahi hona chahiye.
+URDU_SCRIPT_PATTERN = re.compile(r'[\u0600-\u06FF\u0750-\u077F]')  # Arabic + Arabic Supplement blocks
+
+
+def _detect_script(text: str) -> str:
+    """Returns 'urdu_script' ya 'latin_script' based on customer's current message."""
+    if text and URDU_SCRIPT_PATTERN.search(text):
+        return 'urdu_script'
+    return 'latin_script'
+
+
+def resolve_language_for_turn(user_input: str, session_key: str):
+    """
+    FLOW: run_shopping_agent() se call hota hai. Ye function decide karta
+    hai ke IS TURN mein LLM ko kaunsi language mein reply karni chahiye,
+    priority order mein:
+
+    1. Agar customer ne ABHI (isi message mein) ek language-chip select ki
+       hai (jaise "Wanna talk in Roman Urdu?" tap kiya) -> wahi language use
+       hoti hai, AUR session ke liye "sticky" store ho jaati hai
+       (language_preference.py) taake agle turns mein bhi yaad rahe.
+    2. Warna, agar is session ke liye pehle se koi sticky preference stored
+       hai (kisi pichle turn mein select ki gayi thi) -> wahi use hoti hai —
+       chahe is particular message ka apna script kuch bhi ho (jaise
+       customer ne pehle "Roman Urdu" select ki thi, ab sirf "haan" likha —
+       phir bhi Roman Urdu mein hi jawab chahiye, "haan" khud se guess
+       nahi karwa sakte).
+    3. Warna is turn ke message ka script deterministically detect karke
+       (Urdu script vs Latin) generic "match customer's script" instruction
+       banti hai — jaisa pehle tha.
+
+    Returns: (language_code_or_None, hint_text, just_selected: bool)
+      language_code: 'english' | 'roman_urdu' | 'urdu_script' | None (auto)
+    """
+    just_selected = False
+    selected = detect_language_selection(user_input)
+    if selected:
+        set_language_preference(session_key, selected)
+        just_selected = True
+        language_code = selected
+    else:
+        language_code = get_language_preference(session_key)
+
+    if language_code is None:
+        # Koi sticky preference nahi — purana per-message script-match behavior
+        script = _detect_script(user_input)
+        if script == 'urdu_script':
+            return None, (
+                "The customer's CURRENT message is written in Urdu (Arabic) script. "
+                "Reply in Urdu script."
+            ), False
+        return None, (
+            "The customer's CURRENT message is written in Latin/Roman script "
+            "(English letters), NOT Urdu script — this includes Roman Urdu (Urdu "
+            "words spelled in English letters, e.g. 'kya price hai'). Reply using "
+            "Latin/Roman script ONLY. Do NOT switch to Urdu (Arabic) script in your "
+            "reply, even if some of the words or phrasing are Urdu vocabulary — "
+            "keep it in Roman letters, matching the customer's own register (Roman "
+            "Urdu or English)."
+        ), False
+
+    STICKY_HINTS = {
+        'english': (
+            "The customer has explicitly chosen ENGLISH as their conversation "
+            "language. Reply in English only, for this and every future reply in "
+            "this conversation, until they explicitly choose a different language."
+        ),
+        'roman_urdu': (
+            "The customer has explicitly chosen ROMAN URDU (Urdu words spelled in "
+            "English/Latin letters, NOT Arabic script) as their conversation "
+            "language. Reply in Roman Urdu only — never switch to Urdu (Arabic) "
+            "script and never switch to plain English — for this and every future "
+            "reply in this conversation, until they explicitly choose a different "
+            "language."
+        ),
+        'urdu_script': (
+            "The customer has explicitly chosen URDU SCRIPT (Arabic script) as "
+            "their conversation language. Reply in Urdu (Arabic) script only, for "
+            "this and every future reply in this conversation, until they "
+            "explicitly choose a different language."
+        ),
+    }
+    hint = STICKY_HINTS[language_code]
+    if just_selected:
+        hint += (
+            " The customer just picked this language this turn (via a language "
+            "option) — briefly and warmly acknowledge the switch in the NEW "
+            "language, then continue helping with whatever you were discussing "
+            "(don't restart the conversation, just carry on naturally)."
+        )
+    return language_code, hint, just_selected
+
 
 SYSTEM_PROMPT = """You are a warm, proactive, and highly engaging shopping assistant
 for an e-commerce store. Prices are in Pakistani Rupees (Rs.). You work for
@@ -33,10 +144,15 @@ LANGUAGE — always match the customer, every single reply:
   Urdu script -> reply in Urdu script. Roman Urdu (Urdu written in English
   letters) -> reply in Roman Urdu. English -> reply in English.
 - If the customer explicitly asks you to switch language (e.g. "Urdu mein
-  baat karo"), switch immediately and KEEP replying in that language for
-  the rest of the conversation, until they switch again themselves.
+  baat karo", "reply in Urdu script", "English mein baat karo"), switch
+  immediately and KEEP replying in that language for the rest of the
+  conversation, until they switch again themselves.
 - Never mix an unrelated language into your reply, and never default to
   English just because the system instructions here are in English.
+
+CURRENT-TURN SCRIPT (system-detected from the customer's latest message —
+follow this exactly, it overrides your own guess):
+{language_hint}
 
 KNOWN CUSTOMER CONTEXT (from past orders, may span previous conversations):
 {customer_context}
@@ -61,6 +177,14 @@ CORE BEHAVIOR — never leave the customer with a dead end:
 4. CROSS-SELL: Whenever a customer shows interest in a product or adds it to
    cart, proactively suggest 1-2 related/complementary products, using
    search_products as needed. Never invent products.
+   - IMPORTANT: Only the products from your FIRST search_products call in a
+     turn are shown to the customer as image cards automatically. Any
+     cross-sell items you find via a LATER search_products call in the same
+     turn will NOT show an image automatically — so mention them BY NAME in
+     your text (e.g. "Agar chahein to main ek matching handbag bhi dikha
+     sakta hoon") and let the customer explicitly ask before assuming
+     they've already seen a picture of it. Do not describe a cross-sell item
+     as if its image is already visible when it isn't.
 
 5. KEEP THE CONVERSATION GOING — always end with a natural next step. Only
    stop this pattern if the customer clearly says they're done.
@@ -90,6 +214,16 @@ CORE BEHAVIOR — never leave the customer with a dead end:
 
 7. FAQ / POLICY QUESTIONS: Use the answer_faq tool for policy questions.
    Base your answer strictly on what it returns.
+
+7b. SALES / BUSINESS QUESTIONS: If the customer asks anything about sales
+   numbers, revenue, how business is doing, or similar owner/admin-style
+   questions ("aaj kitni sales hui hain?"), that data is not something you
+   have or can share with a customer — but NEVER just say "I don't have
+   that data" and stop there, that's a dead end. Instead, call
+   get_trending_products and show them the current top-selling/popular
+   products as a warm, natural redirect (e.g. "Sales figures to available
+   nahi hain mere paas, lekin ye hamare abhi ke top-selling items hain —
+   inhein zaroor dekhein!").
 
 8. Never make up product names, prices, stock, or order details — always
    base your answer on what the tools actually return.
@@ -184,6 +318,7 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
     from apps.ai.response_metadata import extract_product_metadata      # FLOW → apps/ai/response_metadata.py
 
     chat_history = chat_history or []
+    _, language_hint, _ = resolve_language_for_turn(user_input, session_key)   # NEW — FIX: sticky + explicit-selection aware
 
     # NVIDIA model chain — (model_id, vision_capable, extra llm kwargs).
     # Order = priority: [0] primary, baaki fallback (upar wala fail ho
@@ -224,6 +359,7 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
                 "input": user_input,
                 "chat_history": chat_history,
                 "customer_context": customer_context,
+                "language_hint": language_hint,   # NEW — FIX
                 "image_message": _build_image_message(image, vision_capable=vision_capable),
             })
 
@@ -239,7 +375,7 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
             from apps.ai.suggestions import get_customer_followup_suggestions   # NEW
             steps = result.get("intermediate_steps", [])
 
-            return result["output"], extract_product_metadata(steps), get_customer_followup_suggestions(steps)
+            return result["output"], extract_product_metadata(steps), get_customer_followup_suggestions(steps, session_key)
         return attempt
 
     def make_groq_attempt(model_name):
@@ -250,13 +386,14 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
                 "input": user_input,
                 "chat_history": chat_history,
                 "customer_context": customer_context,
+                "language_hint": language_hint,   # NEW — FIX
                 "image_message": _build_image_message(image, vision_capable=False),  # NEW — FIX
             })
 
             from apps.ai.suggestions import get_customer_followup_suggestions   # NEW
             steps = result.get("intermediate_steps", [])
 
-            return result["output"], extract_product_metadata(steps), get_customer_followup_suggestions(steps)
+            return result["output"], extract_product_metadata(steps), get_customer_followup_suggestions(steps, session_key)
         return attempt
 
     primary_model_id, primary_vision, primary_kwargs = NVIDIA_MODEL_CHAIN[0]
