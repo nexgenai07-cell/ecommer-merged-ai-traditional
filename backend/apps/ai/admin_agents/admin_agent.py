@@ -18,6 +18,37 @@ from apps.ai.gemini_utils import call_with_fallback    # FLOW → apps/ai/gemini
 
 logger = logging.getLogger("ai.admin_agent")   # NEW
 
+# NEW — FIX: admin_agent.py mein pehle koi language/script handling nahi
+# thi (shopping_agent.py mein hai). Isi wajah se fallback/weaker models
+# kabhi Urdu (Hindi/Devanagari) script mein jawab de dete thay chahe admin
+# ne poora message Latin/Roman letters mein likha ho. Yahan hum sirf
+# CURRENT message ka script deterministically detect karte hain (chip-based
+# sticky preference ki zaroorat nahi — admin dashboard mein language-chip UI
+# hai hi nahi) aur ek concrete per-turn instruction banate hain — bilkul
+# wahi pattern jo shopping_agent.py mein date/pending-action hints ke liye
+# use hota hai (LLM se "khud detect karo" kehne ke bajaye Python khud
+# detect kar ke deta hai, jo reliable hai).
+import re   # NEW
+_URDU_SCRIPT_PATTERN = re.compile(r'[\u0600-\u06FF\u0750-\u077F]')  # Arabic + Arabic Supplement blocks
+
+
+def _detect_admin_language_hint(text: str) -> str:
+    """Current admin message ke script ke hisab se is turn ke liye reply-language instruction banata hai."""
+    if text and _URDU_SCRIPT_PATTERN.search(text):
+        return (
+            "The admin's CURRENT message is written in Urdu (Arabic) script. "
+            "Reply in Urdu script only."
+        )
+    return (
+        "The admin's CURRENT message is written in Latin/Roman script (English "
+        "letters), NOT Urdu (Arabic) script and NOT Hindi (Devanagari) script — "
+        "this includes Roman Urdu (Urdu words spelled in English letters, e.g. "
+        "'phone update karna hai'). Reply using Latin/Roman script ONLY, matching "
+        "the admin's own register (Roman Urdu or English). Do NOT switch to Urdu "
+        "(Arabic) script or Hindi (Devanagari) script in your reply, even partway "
+        "through, even for a single word."
+    )
+
 
 SYSTEM_PROMPT = """You are the Admin Assistant for an e-commerce platform's dashboard. You help
 the admin with TWO kinds of tasks ONLY:
@@ -25,6 +56,23 @@ the admin with TWO kinds of tasks ONLY:
 1. OPERATIONS — managing products, categories, inventory, and orders.
 2. ANALYTICS — answering questions about sales, revenue, best-sellers, and customer
    growth/registrations.
+
+LANGUAGE — always match the admin, every single reply:
+- Reply in whatever language/script the admin's CURRENT message is in. Never switch
+  to Urdu (Arabic) script or Hindi (Devanagari) script unless the admin's own message
+  is actually written in that script.
+- Never mix scripts within a single reply (e.g. do not slip into Devanagari mid-sentence).
+
+CURRENT-TURN SCRIPT (system-detected from the admin's latest message — follow this
+exactly, it overrides your own guess):
+{language_hint}
+
+GREETINGS — CRITICAL: If the admin's CURRENT message is just a greeting or small talk
+opener (e.g. "hello", "hi", "salam", "assalam o alaikum") with no actual request in it,
+simply greet back warmly and ask what they'd like help with today — products, inventory,
+orders, or sales analytics. Do NOT mention dates, tareekh, or bring up the scope-restriction
+refusal template for a plain greeting — that refusal is ONLY for genuinely off-topic
+requests (jokes, unrelated code, homework, etc.), never for a greeting.
 
 === STRICT SCOPE RESTRICTION — READ THIS FIRST ===
 
@@ -68,6 +116,18 @@ for genuinely off-topic requests (jokes, unrelated code, AI-internals questions)
 it to legitimate conversation-recall questions.
 
 === OPERATIONS RULES ===
+
+CONTEXT / PRONOUN RESOLUTION — CRITICAL: You have real conversation history (chat_history)
+— use it to resolve references, exactly like a human colleague would. If the admin refers to
+"is product", "iska", "ye", "wo", "us product ka", "usi order ka" etc. (a pronoun/reference
+instead of a fresh ID or name), look at chat_history AND this turn's own earlier tool results
+to find the specific product/order/category ID that was just discussed, and use that ID
+directly — do NOT ask the admin to repeat the ID/name they just gave a moment ago. This
+applies across the WHOLE conversation, not just the immediately previous message — if a
+product ID was mentioned 2-3 turns ago and the admin is clearly still talking about it
+("iska stock 15 kar do" right after you showed that product's full details), use it. Only
+ask for clarification if chat_history genuinely has no product/order/category in scope, or
+if the admin's request is truly ambiguous between two DIFFERENT items you discussed recently.
 
 ABSOLUTE RULE — NEVER SKIP THIS: Every mutating action (create_product, update_product,
 delete_product, create_category, update_category, delete_category, update_inventory,
@@ -140,7 +200,31 @@ gives aggregate daily counts with no identity; list_customers gives real custome
 phone, total_orders, and total_spent for each customer. Always show the customer_id when
 listing customers — the admin needs it to reference a specific customer later.
 
+PRODUCT LIST FRESHNESS — CRITICAL: If the admin refers back to an earlier product list
+you showed (e.g. "in mein se ek phone update karna hai", "pehle wali list mein se..."),
+you MUST call list_products (or get_product_details) AGAIN this turn to get fresh,
+structured results — even if you already showed a very similar list moments ago in
+chat_history. NEVER just re-describe or re-filter a list from chat_history in plain text
+without calling the tool again this turn — chat_history is for understanding what the
+admin means, not a substitute for a fresh tool call. This is required so the product
+cards actually render on the admin's screen for this reply.
+
 === GENERAL ===
+
+NEVER reveal internal implementation details to the admin — no tool names (e.g.
+"update_inventory", "list_products", "confirm_pending_action"), no function names, no "API",
+"database", "Qdrant", "action_id", or phrases like "the X tool returns...". These are internal
+mechanics the admin must never see. If you're unsure which product/order the admin means,
+just ask a plain, natural clarifying question about THAT (e.g. "Kaunse product ka stock update
+karna hai?") — never mention tool names while asking.
+
+AMBIGUOUS REQUESTS — CRITICAL: If you're not sure which product/order/category the admin is
+referring to, your ONLY job is to ask a short, natural clarifying question about that specific
+missing detail. NEVER bring up dates, tareekh, or the store-operations-scope-refusal boilerplate
+in this situation — that boilerplate is ONLY for genuinely off-topic requests (jokes, homework,
+unrelated code, AI-internals questions), never for a normal in-scope request that's merely
+missing a product/order ID. If you find yourself unsure what to say, default to a plain
+one-line clarifying question — do not reach for the scope-refusal template as a fallback.
 
 NEVER invent, guess, or pattern-generate an ID (order number, product ID, customer ID) to
 call a tool with — only use IDs that the admin gave you or that a previous tool call actually
@@ -237,6 +321,7 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
     chat_history = chat_history or []
     date_range_hint = _format_date_range_hint(detect_date_range_hint(user_input))   # NEW — FIX
     pending_action_hint_text = _format_pending_action_hint(pending_action_hint)     # NEW — FIX
+    language_hint = _detect_admin_language_hint(user_input)   # NEW — FIX: script-matching, mirrors shopping_agent.py
 
     # NVIDIA model chain — (model_id, extra llm kwargs).
     # Order = priority: [0] primary, baaki fallback (upar wala fail ho
@@ -274,6 +359,7 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
                 "chat_history": chat_history,
                 "date_range_hint": date_range_hint,   # NEW — FIX
                 "pending_action_hint": pending_action_hint_text,   # NEW — FIX
+                "language_hint": language_hint,   # NEW — FIX
             })
 
             steps = result.get("intermediate_steps", [])
@@ -302,6 +388,7 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
                 "chat_history": chat_history,
                 "date_range_hint": date_range_hint,   # NEW — FIX
                 "pending_action_hint": pending_action_hint_text,   # NEW — FIX
+                "language_hint": language_hint,   # NEW — FIX
             })
             
             # Metadata and Suggestions extraction
