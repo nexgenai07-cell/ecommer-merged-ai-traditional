@@ -232,12 +232,14 @@ class ChatConsumer(AsyncWebsocketConsumer):
             message=escape_for_storage(user_message), metadata=user_msg_metadata,
         )
 
-        if user is not None:
-            messages_qs = ChatMessage.objects.filter(
-                session__user=user, session__channel='customer'
-            ).select_related('session').order_by('-created_at')
-        else:
-            messages_qs = chat_session.messages.order_by('-created_at')
+        # CRITICAL FIX: logged-in customers ke liye pehle `session__user=user,
+        # session__channel='customer'` se query hoti thi — jo us customer ke
+        # SAARE sessions (alag devices/tabs/purani sessions) ka history mila
+        # deta tha, is CURRENT conversation tak scoped nahi tha (guest
+        # customers ke liye niche wala `else` branch already sahi tha — sirf
+        # ek session_key). Ab dono cases mein sirf ISI session ka history
+        # milta hai.
+        messages_qs = chat_session.messages.order_by('-created_at')
 
         previous_messages = list(messages_qs[1:MAX_HISTORY_MESSAGES + 1])
         previous_messages.reverse()

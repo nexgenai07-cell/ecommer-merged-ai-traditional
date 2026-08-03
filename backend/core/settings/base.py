@@ -213,6 +213,9 @@ SIMPLE_JWT = {
 # CORS & CSRF
 # -------------------------------------------------
 
+# 1. CORS: Sab origins allow karne ke liye
+CORS_ALLOW_ALL_ORIGINS = True
+
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:3000",
@@ -220,13 +223,16 @@ CORS_ALLOWED_ORIGINS = [
 if os.getenv('CORS_ALLOWED_ORIGINS'):
     CORS_ALLOWED_ORIGINS.extend([o.strip() for o in os.getenv('CORS_ALLOWED_ORIGINS').split(',') if o.strip()])
 
+# 2. CSRF: Wildcard HTTP/HTTPS domains allow karne ke liye
 CSRF_TRUSTED_ORIGINS = [
+    "http://*",
+    "https://*",
     "http://localhost:5173",
     "http://localhost:3000",
 ]
+
 if os.getenv('CSRF_TRUSTED_ORIGINS'):
     CSRF_TRUSTED_ORIGINS.extend([o.strip() for o in os.getenv('CSRF_TRUSTED_ORIGINS').split(',') if o.strip()])
-
 # -------------------------------------------------
 # CHANNELS
 # -------------------------------------------------
