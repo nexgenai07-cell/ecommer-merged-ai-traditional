@@ -10,6 +10,7 @@
 
 import os
 from django.core.asgi import get_asgi_application
+from apps.ai.debug_middleware import WebSocketDebugMiddleware
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings.development')
 
@@ -22,10 +23,12 @@ from apps.ai.admin_routing import admin_websocket_urlpatterns   # FLOW → apps/
 
 application = ProtocolTypeRouter({
     'http': django_asgi_app,
-    'websocket': AuthMiddlewareStack(
-        # FLOW: yahan URL ka pattern match hota hai —
-        #   ws/chat/<session_key>/       → apps/ai/routing.py → ChatConsumer
-        #   ws/admin-chat/<session_key>/ → apps/ai/admin_routing.py → AdminChatConsumer
-        URLRouter(websocket_urlpatterns + admin_websocket_urlpatterns)
-    ),
+
+    "websocket": WebSocketDebugMiddleware(
+    AuthMiddlewareStack(
+        URLRouter(
+            websocket_urlpatterns + admin_websocket_urlpatterns
+        )
+    )
+),
 })

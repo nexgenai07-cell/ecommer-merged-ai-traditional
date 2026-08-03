@@ -5,6 +5,7 @@ Django base settings — shared across development and production.
 from pathlib import Path
 from datetime import timedelta
 import os
+import warnings
 import dj_database_url
 from dotenv import load_dotenv
 import ssl
@@ -33,6 +34,18 @@ SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
+
+# -------------------------------------------------
+# REDIS
+# -------------------------------------------------
+# NEW — FIX: moved up from the bottom of the file (was only declared right
+# before CACHES) so the SAME value can also be used by CHANNEL_LAYERS below.
+# Both the cache (rate limiting + admin pending-actions store) and the
+# channel layer (WebSocket group broadcasts, e.g. the admin confirm/cancel
+# push) need Redis to work correctly in production — see the comments in
+# both blocks below for what silently breaks without it.
+
+REDIS_URL = os.getenv("REDIS_URL", "")
 
 # -------------------------------------------------
 # EMAIL
@@ -239,12 +252,70 @@ if os.getenv('CSRF_TRUSTED_ORIGINS'):
 # -------------------------------------------------
 # CHANNELS
 # -------------------------------------------------
+# FIX: was hardcoded to InMemoryChannelLayer, which only delivers
+# channel_layer.group_send() messages to consumers running in the SAME
+# process. apps/ai/admin_action_views.py (ConfirmAdminActionView /
+# CancelAdminActionView — plain synchronous DRF requests, NOT WebSocket
+# consumers) now pushes the admin confirm/cancel result to the open
+# "admin_chat_<session_key>" WebSocket group via group_send(). If Railway
+# ever runs more than one worker/process — or the HTTP request and the
+# WebSocket connection simply land on different processes — those pushed
+# messages would silently vanish (no error, the admin's chat would just
+# never update). Redis-backed channel layer fixes this by sharing group
+# membership/messages across processes, using the same REDIS_URL already
+# configured for CACHES below.
+#
+# Requires the `channels_redis` package (pip install channels_redis /
+# add to requirements.txt) — falls back to InMemoryChannelLayer only when
+# REDIS_URL isn't set (e.g. local dev without Redis running).
+#
+# UPDATE — FIX for "TimeoutError: Timeout reading from ...upstash.io:6379":
+# Upstash (a serverless Redis) silently drops idle TCP connections after a
+# short period. channels_redis keeps a small pool of long-lived connections
+# open for pub/sub, so once Upstash kills one from its side, the next read
+# on that dead socket just hangs until Python's own timeout fires — which
+# is exactly the crash-on-every-connection behaviour reported. Passing
+# these extra per-host options makes the underlying redis-py client detect
+# dead sockets and reconnect instead of hanging:
+#   - socket_keepalive: keeps the OS-level TCP connection alive so idle
+#     sockets aren't silently dropped without either side noticing.
+#   - socket_connect_timeout / socket_timeout: bound how long a single
+#     operation can hang before redis-py raises promptly instead of the
+#     connection hanging indefinitely.
+#   - retry_on_timeout: on a timeout, redis-py retries the operation on a
+#     fresh connection instead of just propagating the crash upward.
+#   - health_check_interval: periodically pings idle connections in the
+#     pool so a dead one is caught and replaced before a real message needs
+#     to go through it.
 
-CHANNEL_LAYERS = {
-    "default": {
-        "BACKEND": "channels.layers.InMemoryChannelLayer",
-    },
-}
+if REDIS_URL:
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {
+                "hosts": [{
+                    "address": REDIS_URL,
+                    "socket_keepalive": True,
+                    "socket_connect_timeout": 25,
+                    "socket_timeout": 25,
+                    "retry_on_timeout": True,
+                    "health_check_interval": 30,
+                }],
+            },
+        },
+    }
+else:
+    warnings.warn(
+        "REDIS_URL not set — falling back to InMemoryChannelLayer. "
+        "WebSocket group broadcasts (e.g. admin confirm/cancel push) will "
+        "only work within a single process. Set REDIS_URL in production.",
+        RuntimeWarning,
+    )
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels.layers.InMemoryChannelLayer",
+        },
+    }
 
 # -------------------------------------------------
 # INTERNATIONALIZATION
@@ -273,8 +344,24 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # -------------------------------------------------
 # CACHE
 # -------------------------------------------------
-
-REDIS_URL = os.getenv("REDIS_URL", "")
+# FIX: previously fell back to DummyCache when REDIS_URL wasn't set.
+# DummyCache's get() ALWAYS returns None and set() is a silent no-op — no
+# exception is ever raised. That silently disables two security-relevant
+# features with zero warning:
+#   1. apps/ai/rate_limiting.py — check_rate_limit() reads
+#      `cache.get(cache_key) or []`, which is always `[]` with DummyCache,
+#      so the sliding-window history never accumulates and the limit can
+#      NEVER trip, no matter how large a burst is sent. This matches
+#      exactly what was reported: 11 rapid messages, zero rejections.
+#   2. apps/ai/admin_tools/pending_actions.py — the admin confirm/cancel
+#      preview (action_id) is stored via this same cache; with DummyCache
+#      it would never actually persist between requests.
+# The rate_limiting.py fail-closed `except Exception` guard doesn't help
+# here either, since DummyCache doesn't raise — it just quietly does
+# nothing. LocMemCache actually stores data (in-process), so both features
+# work correctly for a single-process deployment; Redis is still required
+# for correctness across multiple worker processes/replicas — set
+# REDIS_URL on Railway for production.
 
 if REDIS_URL:
     CACHES = {
@@ -284,9 +371,16 @@ if REDIS_URL:
         }
     }
 else:
+    warnings.warn(
+        "REDIS_URL not set — falling back to LocMemCache. WS rate "
+        "limiting and admin action confirmations will only work correctly "
+        "within a single process (data is not shared across workers/"
+        "replicas). Set REDIS_URL in production.",
+        RuntimeWarning,
+    )
     CACHES = {
         "default": {
-            "BACKEND": "django.core.cache.backends.dummy.DummyCache",
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
         }
     }
 

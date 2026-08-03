@@ -26,6 +26,7 @@ from datetime import timedelta
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 from django.db import transaction
+from requests import options
 
 from apps.users.models import User
 from apps.stores.models import Store
@@ -236,16 +237,41 @@ class Command(BaseCommand):
     @transaction.atomic
     def handle(self, *args, **options):
 
-        if options['clear']:
-            self.stdout.write(self.style.WARNING('Clearing existing data...'))
-            OrderItem.objects.all().delete()
-            Order.objects.all().delete()
-            Customer.objects.all().delete()
-            Product.objects.all().delete()
-            Category.objects.all().delete()
-            Discount.objects.all().delete()
-            User.objects.filter(is_superuser=False).delete()
-            self.stdout.write(self.style.SUCCESS('Data cleared.'))
+      if options['clear']:
+        self.stdout.write(self.style.WARNING('Clearing existing data...'))
+
+        # Order data (can still be hard deleted because it has no soft delete)
+        OrderItem.objects.all().delete()
+        Order.objects.all().delete()
+        Customer.objects.all().delete()
+
+        # Soft delete Products
+        Product.objects.update(
+            is_delete=True,
+            is_active=False,
+        )
+
+        # Soft delete Categories
+        Category.objects.update(
+            is_delete=True,
+            is_active=False,
+        )
+
+        # Soft delete Discounts
+        Discount.objects.update(
+            is_delete=True,
+            is_active=False,
+        )
+
+        # Soft delete Users (except superuser)
+        User.objects.filter(
+            is_superuser=False
+        ).update(
+            is_delete=True,
+            is_active=False,
+        )
+
+        self.stdout.write(self.style.SUCCESS('Data cleared.'))
 
         # ── 1. Store ──────────────────────────────────────────────────────────
         store = Store.objects.first()
