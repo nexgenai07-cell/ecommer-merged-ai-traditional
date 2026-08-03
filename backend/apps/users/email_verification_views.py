@@ -4,6 +4,8 @@
 # validating verification tokens, and marking the user's
 # email as verified after successful confirmation.
 
+from unittest import result
+
 from rest_framework import status, permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -39,14 +41,27 @@ class SendVerificationEmailView(APIView):
         verify_link = f'{settings.FRONTEND_URL}/verify-email/{verification.token}/'
         # Sends the verification email containing the verification link
         # to the user's registered email address.
-        send_mail(
-            subject='Verify your email address',
-            message=f'Click the link to verify your email: {verify_link}\n\nThis link is valid for 24 hours.',
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[user.email],
-            fail_silently=True,
-        )
+        #send_mail(
+          #  subject='Verify your email address',
+           # message=f'Click the link to verify your email: {verify_link}\n\nThis link is valid for 24 hours.',
+            #from_email=settings.DEFAULT_FROM_EMAIL,
+            #recipient_list=[user.email],
+            #fail_silently=True,
+        #)
+        
+        result = send_mail(
+    subject="Verify your email address",
+    message=(
+        f"Click the link to verify your email:\n\n"
+        f"{verify_link}\n\n"
+        "This link is valid for 24 hours."
+    ),
+    from_email=settings.DEFAULT_FROM_EMAIL,
+    recipient_list=[user.email],
+    fail_silently=False,
+)
 
+        print("Verification email result:", result)
         return Response(
             {'message': 'Verification email has been sent.'},
             status=status.HTTP_200_OK
