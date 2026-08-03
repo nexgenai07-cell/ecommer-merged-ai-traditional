@@ -94,10 +94,10 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
             return
 
         try:
-            response_text, metadata, suggestions = await self.get_agent_response(user_message)
+            response_text, metadata, suggestions, ai_message_id = await self.get_agent_response(user_message)
         except Exception:
             logger.exception("AdminChatConsumer.get_agent_response failed for session_key=%s", self.session_key)
-            response_text, metadata, suggestions = FRIENDLY_ERROR_MESSAGE, None, []
+            response_text, metadata, suggestions, ai_message_id = FRIENDLY_ERROR_MESSAGE, None, [], None
 
         requires_confirmation = bool(metadata and metadata.get('pending_action'))
 
@@ -106,6 +106,13 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
             "requires_confirmation": requires_confirmation,
             "metadata": metadata,
             "suggestions": suggestions,
+            # NEW — FIX: pehle frontend ke paas is AI message ka koi real
+            # numeric ID nahi hota tha, is liye feedback (thumbs up/down)
+            # bhejte waqt session_key (UUID) jaisi galat cheez
+            # /api/v1/chat/message/<int:message_id>/feedback/ mein daal
+            # deta tha — jo URL pattern se match hi nahi karti (404 aata
+            # tha). Ab asal ChatMessage.id yahan diya ja raha hai.
+            "message_id": ai_message_id,
         }))
 
     @sync_to_async
@@ -306,6 +313,6 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
         if isinstance(output, list):
             output = " ".join(block.get("text", "") if isinstance(block, dict) else str(block) for block in output).strip()
 
-        ChatMessage.objects.create(session=chat_session, sender='ai', message=output, metadata=metadata)
+        ai_message = ChatMessage.objects.create(session=chat_session, sender='ai', message=output, metadata=metadata)
 
-        return output, metadata, suggestions
+        return output, metadata, suggestions, ai_message.id
