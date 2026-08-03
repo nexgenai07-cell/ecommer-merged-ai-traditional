@@ -1,5 +1,3 @@
-from email.mime import image
-
 from rest_framework import serializers
 from .models import Product, ProductImage, ProductHistory, StockMovement
 
@@ -47,7 +45,7 @@ class ProductListSerializer(serializers.ModelSerializer):
             "is_active",
         ]
 
-# Returns category details instead of only the category ID.
+    # Returns category details instead of only the category ID.
     def get_category(self, obj):
         if not obj.category:
             return None
@@ -57,22 +55,22 @@ class ProductListSerializer(serializers.ModelSerializer):
             "name": obj.category.name,
         }
 
-# Returns the primary product image URL.
+    # Returns the primary product image URL.
     def get_primary_image(self, obj):
-       img = obj.images.filter(is_primary=True).first() or obj.images.first()
+        img = obj.images.filter(is_primary=True).first() or obj.images.first()
 
-       if not img:
-          return None
-
-       image = img.image
-  
-       if not image:
+        if not img:
             return None
 
-       if hasattr(image, "url"):
-           return image.url.replace("http://", "https://")
+        image = img.image
 
-       return str(image)
+        if not image:
+            return None
+
+        if hasattr(image, "url"):
+            return image.url.replace("http://", "https://")
+
+        return str(image)
 
 # Used for the Low Stock API to display products that need restocking.
 class LowStockProductSerializer(serializers.ModelSerializer):
@@ -112,7 +110,7 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
-# Returns category details for the product detail page.
+    # Returns category details for the product detail page.
     def get_category(self, obj):
         if not obj.category:
             return None
@@ -125,6 +123,7 @@ class ProductDetailSerializer(serializers.ModelSerializer):
 # Handles product creation and update requests.
 class ProductCreateUpdateSerializer(serializers.ModelSerializer):
     sku = serializers.CharField(required=False, allow_blank=True)
+    category_id = serializers.IntegerField(write_only=True, required=False)
     stock_to_add = serializers.IntegerField(
         write_only=True,
         required=False,
@@ -144,13 +143,14 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
             "stock_to_add",
             "sku",
             "category",
+            "category_id",
             "is_active",
             "low_stock_threshold",
             "publish_at",
         ]
         read_only_fields = ["id"]
 
-# Validates that every SKU remains unique.
+    # Validates that every SKU remains unique.
     def validate_sku(self, value):
         if not value:
             return value
@@ -167,31 +167,34 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
 
         return value
 
-# Creates a new product and assigns it to the logged-in user's store.
+    # Creates a new product and assigns it to the logged-in user's store.
     def create(self, validated_data):
         request = self.context["request"]
         validated_data["store"] = request.user.stores.first()
 
-        stock_to_add = validated_data.pop("stock_to_add", 0)
-        validated_data["stock"] = stock_to_add
+        category_id = validated_data.pop("category_id", None)
+        if category_id:
+            validated_data["category_id"] = category_id
+
+        validated_data.pop("stock_to_add", None)
 
         return super().create(validated_data)
-    
-# Prevents duplicate product names.
+
+    # Prevents duplicate product names.
     def validate_name(self, value):
-      qs = Product.objects.filter(name=value)
+        qs = Product.objects.filter(name=value)
 
-      if self.instance:
-        qs = qs.exclude(pk=self.instance.pk)
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
 
-      if qs.exists():
-        raise serializers.ValidationError(
-            "A product with this name already exists."
-        )
+        if qs.exists():
+            raise serializers.ValidationError(
+                "A product with this name already exists."
+            )
 
-      return value
-# Updates existing product information.
-def update(self, instance, validated_data):
+        return value
+
+    # Updates existing product information.
     def update(self, instance, validated_data):
         # NOTE (stock race-condition fix): 'stock_to_add' on this endpoint
         # is kept working for backward compatibility, but the frontend
@@ -210,7 +213,7 @@ def update(self, instance, validated_data):
         instance.save()
 
         return instance
-    
+
 # Returns product price and stock change history.
 class ProductHistorySerializer(serializers.ModelSerializer):
     changed_by_name = serializers.CharField(
@@ -252,8 +255,8 @@ class StockAdjustSerializer(serializers.Serializer):
     delta = serializers.IntegerField()
     reason = serializers.ChoiceField(choices=MANUAL_REASON_CHOICES)
     note = serializers.CharField(required=False, allow_blank=True, max_length=255)
-    
-# Prevents stock adjustment requests with zero quantity.
+
+    # Prevents stock adjustment requests with zero quantity.
     def validate_delta(self, value):
         if value == 0:
             raise serializers.ValidationError("delta cannot be 0.")

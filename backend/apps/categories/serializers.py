@@ -1,11 +1,10 @@
-# PATH: apps/categories/serializers.py
-
 from rest_framework import serializers
 from .models import Category
 
 
 class CategorySerializer(serializers.ModelSerializer):
-    image_url = serializers.SerializerMethodField()
+    image = serializers.ImageField(write_only=True, required=False)
+    image_url = serializers.SerializerMethodField(read_only=True)
     product_count = serializers.SerializerMethodField()
 
     class Meta:
@@ -14,7 +13,8 @@ class CategorySerializer(serializers.ModelSerializer):
             "id",
             "name",
             "description",
-            "image_url",
+            "image",          # <-- upload
+            "image_url",      # <-- response
             "is_active",
             "product_count",
             "created_at",
@@ -35,7 +35,6 @@ class CategorySerializer(serializers.ModelSerializer):
         return obj.products.filter(is_active=True).count()
 
     def create(self, validated_data):
-        # Store is injected from the view (request.user's store)
         request = self.context["request"]
         validated_data["store"] = request.user.stores.first()
         return super().create(validated_data)

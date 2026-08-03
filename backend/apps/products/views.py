@@ -1,17 +1,12 @@
 # PATH: apps/products/views.py
-from unittest import result
-from urllib import request
-
-from urllib import request
-from .services import adjust_stock as adjust_stock_service
-from django.db import transaction
 from rest_framework import viewsets, permissions, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.db.models import Q
 
-from .models import Product, ProductImage, ProductHistory, StockMovement
+from .services import adjust_stock as adjust_stock_service
+from .models import Product, ProductImage, ProductHistory
 from .serializers import (
     ProductListSerializer,
     ProductDetailSerializer,
@@ -53,22 +48,22 @@ class ProductViewSet(viewsets.ModelViewSet):
     pagination_class = StandardResultsPagination
 
     def get_queryset(self):
-     qs = Product.objects.filter(
-        is_delete=False
-    ).select_related(
-        'category'
-    ).prefetch_related(
-        'images'
-    )
+        qs = Product.objects.filter(
+            is_delete=False
+        ).select_related(
+            'category'
+        ).prefetch_related(
+            'images'
+        )
 
-     if self.action in ['list', 'retrieve', 'search']:
-        if not (
-            self.request.user.is_authenticated
-            and self.request.user.role == 'admin'
-        ):
-            qs = qs.filter(is_active=True)
+        if self.action in ['list', 'retrieve', 'search']:
+            if not (
+                self.request.user.is_authenticated
+                and self.request.user.role == 'admin'
+            ):
+                qs = qs.filter(is_active=True)
 
-     return qs
+        return qs
 
     def get_serializer_class(self):
         if self.action == 'list' or self.action == 'search':
@@ -85,17 +80,42 @@ class ProductViewSet(viewsets.ModelViewSet):
         return [permissions.IsAuthenticated(), IsAdmin()]
 
     def perform_destroy(self, instance):
-     """
-    Soft delete product.
-    """
-     instance.is_active = False
-     instance.is_delete = True
-     instance.save(
-        update_fields=[
-            "is_active",
-            "is_delete",
-        ]
-    )
+        """
+        Soft delete product.
+        """
+        instance.is_active = False
+        instance.is_delete = True
+        instance.save(
+            update_fields=[
+                "is_active",
+                "is_delete",
+            ]
+        )
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        product = serializer.save()
+
+        image = request.FILES.get("image")
+
+        if image:
+            ProductImage.objects.create(
+                product=product,
+                image=image,
+                is_primary=True,
+            )
+
+        response_serializer = ProductDetailSerializer(
+            product,
+            context={"request": request},
+        )
+
+        return Response(
+            response_serializer.data,
+            status=status.HTTP_201_CREATED,
+        )
 
     def update(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -213,9 +233,9 @@ class ProductViewSet(viewsets.ModelViewSet):
         jo sirf doc-required fields return karta hai.
         """
         qs = Product.objects.filter(
-    is_active=True,
-    is_delete=False,
-)
+            is_active=True,
+            is_delete=False,
+        )
 
         # Compare stock vs threshold in Python (clear and simple for small catalogs)
         low_stock_products = [p for p in qs if p.stock <= p.low_stock_threshold]
@@ -267,7 +287,6 @@ class ProductViewSet(viewsets.ModelViewSet):
                 next_image.save()
 
         return Response(status=status.HTTP_204_NO_CONTENT)
-    
 
     @action(
         detail=True,
@@ -290,7 +309,6 @@ class ProductViewSet(viewsets.ModelViewSet):
         )
 
         return Response(result)
-
 
     @action(
         detail=True,

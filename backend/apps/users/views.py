@@ -415,20 +415,27 @@ class ReactivateRequestView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
+        print("=== Reactivate Request ===")
+        print(request.data)
+
         email = request.data.get("email")
+        print("Email:", email)
 
         try:
             user = User.objects.get(email=email)
 
+            print("Found user:", user.email)
+            print("is_active:", user.is_active)
+            print("is_delete:", user.is_delete)
+
             if not user.is_delete:
                 return Response(
-                    {
-                        "error": "This account is already active."
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
+                    {"error": "This account is already active."},
+                    status=400,
                 )
 
             verification = EmailVerification.create_for_user(user)
+            print("Token:", verification.token)
 
             link = (
                 f"{settings.FRONTEND_URL}/reactivate-account/"
@@ -440,18 +447,19 @@ class ReactivateRequestView(APIView):
                 message=f"Click the link below:\n\n{link}",
                 from_email=settings.DEFAULT_FROM_EMAIL,
                 recipient_list=[user.email],
-                fail_silently=True,
+                fail_silently=False,
             )
 
+            print("Email sent successfully.")
+
         except User.DoesNotExist:
-            pass
+            print("User not found.")
 
         return Response(
             {
                 "message": "If this account exists and is deactivated, a reactivation link has been sent to your email."
             }
         )
-
 # Confirms a reactivation token and restores the account.
 class ReactivateConfirmView(APIView):
     permission_classes = [permissions.AllowAny]
