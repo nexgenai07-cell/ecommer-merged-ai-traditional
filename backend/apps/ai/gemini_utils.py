@@ -116,3 +116,52 @@ def _run_fallbacks(fallback_fns, last_error):
     raise Exception(
         f"Primary model aur saare fallback providers fail ho gaye. {error_summary}"
     )
+
+
+# NEW — CRITICAL PERFORMANCE FIX.
+#
+# ROOT CAUSE OF 5-6 MINUTE DELAYS: shopping_agent.py aur admin_agent.py
+# apna poora LLM-provider fallback chain (NVIDIA model -> NVIDIA model ->
+# ... -> Groq model) purane `call_with_fallback()` ke through chalate
+# thay. Lekin us function ka outer loop — `for key_attempt in
+# range(gemini_keys.total_keys())` — sirf EMBEDDING calls (Gemini) ke
+# liye design hua tha, jahan har iteration mein ek ALAG Gemini API key
+# try hoti hai.
+#
+# Agent LLM chain (NVIDIA/Groq) ka Gemini keys se koi lena dena nahi —
+# is liye jab NVIDIA ka primary model kabhi overloaded/503 (is_transient_
+# error) return karta, ye poora outer loop us EXACT SAME primary model
+# ko baar baar dobara try karta rehta — (TRANSIENT_RETRY_ATTEMPTS + 1)
+# baar HAR "key" ke liye — matlab agar settings mein 3-5 GEMINI_API_KEYS
+# configured hain, to same slow/overloaded model 9-15 dafa try hota,
+# har koshish ke beech 3-second sleep, is se pehle ke asal fallback
+# chain (deepseek, llama, Groq) tak pohonche. Yahi 5-6 minute ki delay
+# ki asal wajah thi.
+#
+# Fix: agent LLM chain ke liye ye alag, seedha function use karo — Gemini
+# key count se koi matlab nahi, sirf EK chhota transient-retry, phir
+# seedha fallback chain.
+MODEL_TRANSIENT_RETRY_ATTEMPTS = 1        # LLM chain ke liye — embeddings wale se kam, taake jaldi fallback pe jump ho
+MODEL_TRANSIENT_RETRY_DELAY_SECONDS = 2
+
+
+def call_with_model_fallback(attempt_fn, fallback_fns=None):
+    """
+    LLM agent chain (NVIDIA model -> ... -> Groq model) ke liye. Har
+    model ko sirf EK chhoti transient-retry deta hai, phir turant agle
+    fallback model pe chala jata hai — Gemini key-count se bilkul
+    independent (embeddings ke `call_with_fallback` se ye is liye alag
+    hai).
+    """
+    last_error = None
+    for attempt_num in range(MODEL_TRANSIENT_RETRY_ATTEMPTS + 1):
+        try:
+            return attempt_fn()
+        except Exception as e:
+            last_error = e
+            if is_transient_error(e) and attempt_num < MODEL_TRANSIENT_RETRY_ATTEMPTS:
+                time.sleep(MODEL_TRANSIENT_RETRY_DELAY_SECONDS)
+                continue
+            break  # transient ho ya na ho, ek retry ke baad seedha fallback chain
+
+    return _run_fallbacks(fallback_fns, last_error)

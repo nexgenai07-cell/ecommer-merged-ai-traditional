@@ -14,7 +14,7 @@ from langchain_core.messages import HumanMessage  # NEW — FIX: image attachmen
 
 from apps.ai.tools.registry import SHOPPING_AGENT_TOOLS     # FLOW → apps/ai/tools/registry.py
 from apps.ai.tools.cart_order_tools import get_cart_order_tools      # FLOW → apps/ai/tools/cart_order_tools.py
-from apps.ai.gemini_utils import call_with_fallback    # FLOW → apps/ai/gemini_utils.py (ab sirf retry/fallback wrapper ke liye, Gemini key rotation use nahi ho raha)
+from apps.ai.gemini_utils import call_with_model_fallback    # FLOW → apps/ai/gemini_utils.py (LLM chain ke liye — Gemini key rotation wala call_with_fallback NAHI, wo sirf embeddings ke liye hai)
 
 logger = logging.getLogger("ai.shopping_agent")   # NEW
 
@@ -322,19 +322,19 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
 
     # NVIDIA model chain — (model_id, vision_capable, extra llm kwargs).
     # Order = priority: [0] primary, baaki fallback (upar wala fail ho
-    # tabhi neeche wala try hota hai). Sab slugs docs.api.nvidia.com ke
-    # OFFICIAL reference se verify kiye hain (pehli list mein 3 models
-    # galat naam ki wajah se 404 de rahe thay, aur ek retire ho chuka tha
-    # -> 410). gpt-oss-120b aur deepseek-v4-flash tumhare apne pehle
-    # successful test mein bhi chal chuke hain, is liye unhi ko top pe
-    # rakha hai. Sab alag providers hain taake ek ka outage doosre ko
-    # affect na kare.
+    # tabhi neeche wala try hota hai).
+    #
+    # UPDATED — FIX: production logs (2026-08-03, admin side, same NVIDIA
+    # provider/account) se saaf pata chala ke "openai/gpt-oss-120b" is
+    # waqt consistently slow/failing hai (~21s har baar fail hone mein),
+    # jab ke "deepseek-ai/deepseek-v4-flash" turant (1-2s) succeed hota
+    # hai. Isay top se hata kar deepseek-v4-flash ko primary bana diya.
     NVIDIA_MODEL_CHAIN = [
-        ("openai/gpt-oss-120b", False, {}),                        # PRIMARY — tumhare pehle test mein already kaam kar chuka
-        ("deepseek-ai/deepseek-v4-flash", False, {}),              # tumhare pehle test mein bhi kaam kar chuka, fast
+        ("deepseek-ai/deepseek-v4-flash", False, {}),              # PRIMARY — logs mein consistently fast/reliable
         ("meta/llama-3.2-90b-vision-instruct", True, {}),          # vision fallback (image search ke liye)
-        ("deepseek-ai/deepseek-v4-pro", False, {}),                # strong reasoning, same family jo already chal chuki
+        ("deepseek-ai/deepseek-v4-pro", False, {}),                # strong reasoning, same family, bhi reliable dikha logs mein
         ("nvidia/nemotron-3-super-120b-a12b", False, {}),          # NVIDIA's own agentic model — sahi slug (-a12b zaroori tha)
+        ("openai/gpt-oss-120b", False, {}),                        # MOVED TO LAST — abhi NVIDIA ki taraf se slow/unreliable dikh raha hai
     ]
 
     def make_nvidia_attempt(model_id, vision_capable, extra_kwargs):
@@ -344,7 +344,8 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
                 api_key=settings.NVIDIA_API_KEY,
                 base_url="https://integrate.api.nvidia.com/v1",
                 temperature=0.4,
-                max_retries=1,
+                max_retries=0,   # NEW — FIX: pehle 1 tha — client apni taraf se chhupi hui retry karta tha jo `timeout` ke UPAR extra wait jorti thi. Retry ab sirf call_with_model_fallback level pe.
+                timeout=8,   # NEW — FIX: 10s se 8s kiya
                 **extra_kwargs,
             )
             executor = _build_executor(llm, session_key, user)
@@ -380,7 +381,7 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
 
     def make_groq_attempt(model_name):
         def attempt():
-            llm = ChatGroq(model=model_name, groq_api_key=settings.GROQ_API_KEY, temperature=0.4)
+            llm = ChatGroq(model=model_name, groq_api_key=settings.GROQ_API_KEY, temperature=0.4, timeout=8)   # NEW — FIX: timeout 8s
             executor = _build_executor(llm, session_key, user)
             result = executor.invoke({
                 "input": user_input,
@@ -413,4 +414,4 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
     # FLOW → apps/ai/gemini_utils.py — retry/fallback yahan hota hai (chain mein
     # order se ek-ek model try hota hai), phir wapis (output, metadata) tuple
     # deta hai — ye consumers.py mein jata hai
-    return call_with_fallback(nvidia_attempt, fallback_fns=fallback_fns)
+    return call_with_model_fallback(nvidia_attempt, fallback_fns=fallback_fns)   # FIX — ab needlessly gemini-key-count baar repeat nahi hoga

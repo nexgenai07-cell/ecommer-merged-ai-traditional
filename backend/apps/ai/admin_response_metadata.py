@@ -1,5 +1,31 @@
 # PATH: apps/ai/admin_response_metadata.py
 
+def _extract_image_url(p):
+    """
+    FIX — image apne 2 alag shapes mein aati hai:
+    1. list_products/get_product_details ki apni custom formatting: seedha
+       'image' key (already resolved URL string).
+    2. Raw Django API pass-through (execute_update_product,
+       execute_create_product — ye seedha `result['data']` return karte
+       hain jo ProductDetailSerializer se aata hai): 'images' — list of
+       {id, image_url, is_primary} — koi seedha 'image'/'primary_image'
+       key hoti hi nahi.
+    Pehle sirf shape (1) handle hoti thi — is liye confirm_pending_action
+    ke baad wapis aane wale product mein image hamesha null dikhti thi,
+    chahe DB mein maujood ho (bilkul wahi bug jo get_product_details mein
+    pehle already fix ho chuka tha, yahan reh gaya tha).
+    """
+    direct = p.get('image') or p.get('primary_image')
+    if direct:
+        return direct
+    images = p.get('images')
+    if isinstance(images, list) and images:
+        primary = next((img for img in images if isinstance(img, dict) and img.get('is_primary')), None) or images[0]
+        if isinstance(primary, dict):
+            return primary.get('image_url')
+    return None
+
+
 def _normalize_product(p):
     if not isinstance(p, dict):
         return None
@@ -9,11 +35,25 @@ def _normalize_product(p):
     category_id = p.get('category_id')
     if category_id is None and isinstance(p.get('category'), dict):
         category_id = p['category'].get('id')
-    return {
+    elif category_id is None and isinstance(p.get('category'), int):
+        category_id = p['category']   # NEW — FIX: raw API pass-through mein 'category' seedha FK id (int) bhi ho sakti hai, dict nahi
+    result = {
         'product_id': product_id, 'category_id': category_id,
         'name': p.get('name'), 'price': p.get('price'),
-        'image': p.get('image', p.get('primary_image')),
+        'image': _extract_image_url(p),   # NEW — FIX
     }
+    # NEW — FIX: pehle sirf 5 compact fields deta tha, chahe source
+    # (get_product_details / execute_update_product / execute_create_product)
+    # mein poori details maujood hon. Ab jo bhi extra fields source mein
+    # mil jayein wo bhi pass-through kar dete hain — taake frontend ko
+    # SKU/description/original_price/stock/low_stock_threshold/is_active
+    # bhi metadata mein milein jab bhi ye asal tool response se aayein
+    # (list_products jaisi compact response mein ye keys hoti hi nahi,
+    # to wahan None reh jayenge — jo sahi behavior hai).
+    for extra_field in ('original_price', 'stock', 'sku', 'description', 'low_stock_threshold', 'is_active'):
+        if extra_field in p:
+            result[extra_field] = p[extra_field]
+    return result
 
 
 def _extract_label(row):

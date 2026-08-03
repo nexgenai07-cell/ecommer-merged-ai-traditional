@@ -160,7 +160,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
             return
 
         try:
-            response_text, products_metadata, suggestions = await self.get_agent_response(user_message, attachment_file_id)
+            response_text, products_metadata, suggestions, ai_message_id = await self.get_agent_response(user_message, attachment_file_id)
         except Exception:
             # FIX — pehle yahan "f'Sorry, something went wrong: {str(e)}'"
             # bheja jata tha, jo raw Python error (jaise TypeError ka
@@ -185,6 +185,13 @@ class ChatConsumer(AsyncWebsocketConsumer):
             if is_last:
                 payload["metadata"] = {"products": products_metadata} if products_metadata else None
                 payload["suggestions"] = suggestions
+                # NEW — FIX: frontend ke paas is se pehle is AI message ka
+                # koi real numeric ID nahi hota tha, is liye feedback
+                # (thumbs up/down) bhejte waqt wo session_key (UUID) jaisi
+                # galat cheez /api/v1/chat/message/<int:message_id>/feedback/
+                # mein daal deta tha — jo URL pattern se match hi nahi karti
+                # (404). Ab asal ChatMessage.id yahan diya ja raha hai.
+                payload["message_id"] = ai_message_id
             await self.send(text_data=json.dumps(payload, ensure_ascii=False))
 
     @sync_to_async
@@ -232,12 +239,14 @@ class ChatConsumer(AsyncWebsocketConsumer):
             message=escape_for_storage(user_message), metadata=user_msg_metadata,
         )
 
-        if user is not None:
-            messages_qs = ChatMessage.objects.filter(
-                session__user=user, session__channel='customer'
-            ).select_related('session').order_by('-created_at')
-        else:
-            messages_qs = chat_session.messages.order_by('-created_at')
+        # CRITICAL FIX: logged-in customers ke liye pehle `session__user=user,
+        # session__channel='customer'` se query hoti thi — jo us customer ke
+        # SAARE sessions (alag devices/tabs/purani sessions) ka history mila
+        # deta tha, is CURRENT conversation tak scoped nahi tha (guest
+        # customers ke liye niche wala `else` branch already sahi tha — sirf
+        # ek session_key). Ab dono cases mein sirf ISI session ka history
+        # milta hai.
+        messages_qs = chat_session.messages.order_by('-created_at')
 
         previous_messages = list(messages_qs[1:MAX_HISTORY_MESSAGES + 1])
         previous_messages.reverse()
@@ -267,9 +276,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 for block in output
             ).strip()
 
-        ChatMessage.objects.create(
+        ai_message = ChatMessage.objects.create(
             session=chat_session, sender='ai', message=output,
             metadata={"products": products_metadata} if products_metadata else None,
         )
 
-        return output, products_metadata, suggestions
+        return output, products_metadata, suggestions, ai_message.id

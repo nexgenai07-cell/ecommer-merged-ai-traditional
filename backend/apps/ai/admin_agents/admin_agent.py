@@ -14,7 +14,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 from apps.ai.admin_tools.registry import get_admin_agent_tools      # FLOW → apps/ai/admin_tools/registry.py
 from apps.ai.admin_tools.analytics_tools import detect_date_range_hint   # NEW — FIX: deterministic date_range detection
-from apps.ai.gemini_utils import call_with_fallback    # FLOW → apps/ai/gemini_utils.py (ab sirf retry/fallback wrapper ke liye)
+from apps.ai.gemini_utils import call_with_model_fallback    # FLOW → apps/ai/gemini_utils.py (LLM chain ke liye — Gemini key rotation wala call_with_fallback NAHI, wo sirf embeddings ke liye hai)
 
 logger = logging.getLogger("ai.admin_agent")   # NEW
 
@@ -117,17 +117,12 @@ it to legitimate conversation-recall questions.
 
 === OPERATIONS RULES ===
 
-CONTEXT / PRONOUN RESOLUTION — CRITICAL: You have real conversation history (chat_history)
-— use it to resolve references, exactly like a human colleague would. If the admin refers to
-"is product", "iska", "ye", "wo", "us product ka", "usi order ka" etc. (a pronoun/reference
-instead of a fresh ID or name), look at chat_history AND this turn's own earlier tool results
-to find the specific product/order/category ID that was just discussed, and use that ID
-directly — do NOT ask the admin to repeat the ID/name they just gave a moment ago. This
-applies across the WHOLE conversation, not just the immediately previous message — if a
-product ID was mentioned 2-3 turns ago and the admin is clearly still talking about it
-("iska stock 15 kar do" right after you showed that product's full details), use it. Only
-ask for clarification if chat_history genuinely has no product/order/category in scope, or
-if the admin's request is truly ambiguous between two DIFFERENT items you discussed recently.
+CONTEXT / PRONOUN RESOLUTION — pronouns like "is product", "iska", "ye", "wo" referring
+to a product are handled deterministically via the "CURRENT-TURN ACTIVE PRODUCT" hint
+above — always check that first. For anything else that isn't covered by that hint (e.g.
+an order or category referred to by pronoun), use chat_history to find what was
+discussed 1-3 turns ago rather than asking the admin to repeat themselves, and only ask
+for clarification if chat_history genuinely has no such item in scope.
 
 ABSOLUTE RULE — NEVER SKIP THIS: Every mutating action (create_product, update_product,
 delete_product, create_category, update_category, delete_category, update_inventory,
@@ -156,6 +151,17 @@ update_order, cancel_order) requires EXPLICIT ADMIN CONFIRMATION before it actua
 CURRENT-TURN PENDING ACTION (system-detected, follow this exactly — do NOT try to
 find the action_id yourself in chat_history, use only what's given here):
 {pending_action_hint}
+
+CURRENT-TURN ACTIVE PRODUCT (system-detected, follow this exactly — do NOT try to
+resolve pronouns yourself by reading chat_history, use only what's given here):
+{active_product_hint}
+
+If the admin's message uses a pronoun/reference ("is product", "iska", "ye", "wo",
+"isko", "isi ka") instead of a fresh product ID/name, and the hint above gives you an
+active product ID, use that ID directly (e.g. call get_product_details or propose the
+update with it) — do NOT ask the admin which product they mean. Only ask if the hint
+above says there is no active product, or if the admin's wording is ambiguous between
+two clearly different products you both just discussed.
 
 Read-only operations tools (list_products, get_product_details, get_categories,
 check_inventory, low_stock, get_order_details, track_order) do NOT need confirmation.
@@ -208,6 +214,19 @@ chat_history. NEVER just re-describe or re-filter a list from chat_history in pl
 without calling the tool again this turn — chat_history is for understanding what the
 admin means, not a substitute for a fresh tool call. This is required so the product
 cards actually render on the admin's screen for this reply.
+
+NEVER FABRICATE A RESPONSE WITHOUT CALLING THE TOOL — CRITICAL: If your reply is about
+to contain a product's specific field values (price, stock, SKU, description,
+original_price, low_stock_threshold) OR looks like an update/create/delete "preview"
+("X → Y", "Confirm karen?"), you MUST have actually called the corresponding tool
+(get_product_details, or a propose_*/update_*/create_*/delete_* tool) in THIS turn first
+and be reporting its REAL return value — never write out plausible-looking values from
+memory/guessing, and never write preview-style text ("Confirm karen? haan/nahi") unless
+you just actually called the mutating tool and got back requires_confirmation=True with a
+real action_id. Writing a fake preview without calling the tool is a serious bug — it
+creates a preview the admin can "confirm" that doesn't actually exist, leading to a
+second, confusing confirmation round-trip later. If you're not sure of a value, call the
+tool — don't guess it.
 
 === GENERAL ===
 
@@ -296,6 +315,35 @@ def _format_pending_action_hint(hint):
     )
 
 
+def _format_active_product_hint(hint):
+    """
+    FLOW: admin_consumers.py se milta hai. Wahan Python code deterministically
+    (LLM se nahi) sabse recent AI turn ka metadata['products'] dekh kar
+    decide karta hai "abhi kaunsa product zeri-e-baat hai" (agar us turn
+    mein exactly 1 product diya gaya tha). Ye same pattern hai jo
+    _format_pending_action_hint upar use karta hai — LLM se chat_history
+    mein se product ID "yaad rakhna"/"dhoondhna" reliable nahi nikla
+    (khaaskar weaker fallback models ke sath), is liye Python khud track
+    kar ke deterministic hint deta hai.
+    """
+    if hint and hint.get('product_id'):
+        name_part = f" ({hint['name']})" if hint.get('name') else ""
+        return (
+            f"The admin was just discussing product_id={hint['product_id']}{name_part}. "
+            f"If their CURRENT message uses a pronoun/reference for a product (e.g. 'is "
+            f"product', 'iska', 'ye', 'wo', 'isko') instead of naming a product explicitly, "
+            f"assume they mean product_id={hint['product_id']} and act on it directly (e.g. "
+            f"call get_product_details or propose the update) — do NOT ask them to repeat "
+            f"the product ID. If their current message clearly names a DIFFERENT product, "
+            f"use that one instead."
+        )
+    return (
+        "There is no specific active product from recent conversation. If the "
+        "admin uses a pronoun for a product (e.g. 'is product', 'iska') without "
+        "naming one, ask them which product they mean — do not guess an ID."
+    )
+
+
 def _build_executor(llm, session_key, user):
 
     tools = get_admin_agent_tools(session_key, user)
@@ -317,27 +365,30 @@ def _build_executor(llm, session_key, user):
     )
 
 
-def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, pending_action_hint=None):
+def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, pending_action_hint=None, active_product_hint=None):
     chat_history = chat_history or []
     date_range_hint = _format_date_range_hint(detect_date_range_hint(user_input))   # NEW — FIX
     pending_action_hint_text = _format_pending_action_hint(pending_action_hint)     # NEW — FIX
+    active_product_hint_text = _format_active_product_hint(active_product_hint)     # NEW — FIX
     language_hint = _detect_admin_language_hint(user_input)   # NEW — FIX: script-matching, mirrors shopping_agent.py
 
     # NVIDIA model chain — (model_id, extra llm kwargs).
     # Order = priority: [0] primary, baaki fallback (upar wala fail ho
-    # tabhi neeche wala try hota hai). Sab slugs docs.api.nvidia.com ke
-    # OFFICIAL reference se verify kiye hain (pehli list mein 3 models
-    # galat naam ki wajah se 404 de rahe thay, aur ek retire ho chuka tha
-    # -> 410). gpt-oss-120b aur deepseek-v4-flash tumhare apne pehle
-    # successful test mein bhi chal chuke hain, is liye unhi ko top pe
-    # rakha hai. Sab alag providers hain taake ek ka outage doosre ko
-    # affect na kare.
+    # tabhi neeche wala try hota hai).
+    #
+    # UPDATED — FIX: production logs (2026-08-03) se saaf pata chala ke
+    # "openai/gpt-oss-120b" is waqt NVIDIA ki taraf se consistently slow/
+    # failing hai — dono test turns mein ye ~21 second lagata raha fail
+    # hone mein, tab jaake "deepseek-ai/deepseek-v4-flash" turant (1-2s)
+    # mein succeed hota tha. Isay top se hata kar "deepseek-ai/deepseek-
+    # v4-flash" ko primary bana diya — isi se average response time bohot
+    # kam ho jayega jab tak gpt-oss-120b dobara reliable na ho.
     NVIDIA_MODEL_CHAIN = [
-        ("openai/gpt-oss-120b", {}),                        # PRIMARY — tumhare pehle test mein already kaam kar chuka
-        ("deepseek-ai/deepseek-v4-flash", {}),              # tumhare pehle test mein bhi kaam kar chuka, fast
-        ("deepseek-ai/deepseek-v4-pro", {}),                # strong reasoning, same family jo already chal chuki
+        ("deepseek-ai/deepseek-v4-flash", {}),              # PRIMARY — logs mein consistently fast/reliable
+        ("deepseek-ai/deepseek-v4-pro", {}),                # strong reasoning, same family, bhi reliable dikha logs mein
         ("nvidia/nemotron-3-super-120b-a12b", {}),          # NVIDIA's own agentic model — sahi slug (-a12b zaroori tha)
         ("meta/llama-3.3-70b-instruct", {}),                # well-established, stable, reliable tool-calling
+        ("openai/gpt-oss-120b", {}),                        # MOVED TO LAST — abhi NVIDIA ki taraf se slow/unreliable dikh raha hai
     ]
 
     def make_nvidia_attempt(model_id, extra_kwargs):
@@ -347,7 +398,8 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
                 api_key=settings.NVIDIA_API_KEY,
                 base_url="https://integrate.api.nvidia.com/v1",
                 temperature=0.2,
-                max_retries=1,
+                max_retries=0,   # NEW — FIX: pehle 1 tha — client apni taraf se ek chhupi hui retry karta tha jo hamare `timeout` ke UPAR extra wait jorti thi (isi wajah se ek failing model ka wait ~2x ho raha tha). Retry ab sirf hamare apne call_with_model_fallback level pe hoga.
+                timeout=8,   # NEW — FIX: 10s se 8s kiya
                 **extra_kwargs,
             )
             executor = _build_executor(llm, session_key, user)
@@ -359,6 +411,7 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
                 "chat_history": chat_history,
                 "date_range_hint": date_range_hint,   # NEW — FIX
                 "pending_action_hint": pending_action_hint_text,   # NEW — FIX
+                "active_product_hint": active_product_hint_text,   # NEW — FIX
                 "language_hint": language_hint,   # NEW — FIX
             })
 
@@ -380,7 +433,7 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
 
     def make_groq_attempt(model_name):
         def attempt():
-            llm = ChatGroq(model=model_name, groq_api_key=settings.GROQ_API_KEY, temperature=0.2)
+            llm = ChatGroq(model=model_name, groq_api_key=settings.GROQ_API_KEY, temperature=0.2, timeout=8)   # NEW — FIX: timeout 8s
             executor = _build_executor(llm, session_key, user)
             
             result = executor.invoke({
@@ -388,6 +441,7 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
                 "chat_history": chat_history,
                 "date_range_hint": date_range_hint,   # NEW — FIX
                 "pending_action_hint": pending_action_hint_text,   # NEW — FIX
+                "active_product_hint": active_product_hint_text,   # NEW — FIX
                 "language_hint": language_hint,   # NEW — FIX
             })
             
@@ -417,4 +471,4 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
         fallback_fns.append(make_groq_attempt("llama-3.1-8b-instant"))
 
     # Return 3 values (output, metadata, suggestions)
-    return call_with_fallback(nvidia_attempt, fallback_fns=fallback_fns)
+    return call_with_model_fallback(nvidia_attempt, fallback_fns=fallback_fns)   # FIX — ab needlessly gemini-key-count baar repeat nahi hoga

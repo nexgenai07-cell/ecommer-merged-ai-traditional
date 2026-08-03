@@ -2,6 +2,7 @@
 
 import json
 import logging  # NEW — server-side error logging ke liye
+import re   # NEW — FIX: fabricated-preview detection ke liye
 from channels.generic.websocket import AsyncWebsocketConsumer
 from asgiref.sync import sync_to_async
 from langchain_core.messages import HumanMessage, AIMessage
@@ -9,6 +10,8 @@ from langchain_core.messages import HumanMessage, AIMessage
 from apps.ai.models import ChatSession, ChatMessage
 from apps.ai.admin_agents.admin_agent import run_admin_agent
 from apps.ai.admin_tools.pending_actions import get_pending_action, is_expired   # NEW — FIX: pending_action_hint build karne ke liye
+from apps.ai.admin_tools.product_tools import get_product_details as _fetch_product_details   # NEW — FIX: metadata safety-net ke liye
+from apps.ai.admin_response_metadata import _normalize_product   # NEW — FIX: safety-net mein bhi wahi consistent shape use karne ke liye
 from apps.ai.rate_limiting import check_all_rate_limits
 from apps.ai.message_sanitization import validate_message, escape_for_storage, unescape_for_context, MessageValidationError
 from apps.ai.ws_auth import extract_token_from_scope, is_token_expired_or_invalid
@@ -91,10 +94,10 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
             return
 
         try:
-            response_text, metadata, suggestions = await self.get_agent_response(user_message)
+            response_text, metadata, suggestions, ai_message_id = await self.get_agent_response(user_message)
         except Exception:
             logger.exception("AdminChatConsumer.get_agent_response failed for session_key=%s", self.session_key)
-            response_text, metadata, suggestions = FRIENDLY_ERROR_MESSAGE, None, []
+            response_text, metadata, suggestions, ai_message_id = FRIENDLY_ERROR_MESSAGE, None, [], None
 
         requires_confirmation = bool(metadata and metadata.get('pending_action'))
 
@@ -103,6 +106,13 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
             "requires_confirmation": requires_confirmation,
             "metadata": metadata,
             "suggestions": suggestions,
+            # NEW — FIX: pehle frontend ke paas is AI message ka koi real
+            # numeric ID nahi hota tha, is liye feedback (thumbs up/down)
+            # bhejte waqt session_key (UUID) jaisi galat cheez
+            # /api/v1/chat/message/<int:message_id>/feedback/ mein daal
+            # deta tha — jo URL pattern se match hi nahi karti (404 aata
+            # tha). Ab asal ChatMessage.id yahan diya ja raha hai.
+            "message_id": ai_message_id,
         }))
 
     @sync_to_async
@@ -117,9 +127,17 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
 
         ChatMessage.objects.create(session=chat_session, sender='user', message=escape_for_storage(user_message))
 
+        # CRITICAL FIX: pehle ye `session__user=user, session__channel='admin'`
+        # se query hota tha — jo is USER ke SAARE admin sessions (alag browser
+        # tabs, purani testing sessions, etc.) ka history ek sath mila deta
+        # tha, is CURRENT conversation tak scoped nahi tha. Isi wajah se model
+        # ko kabhi-kabhi bilkul unrelated purani conversations ka context mil
+        # jata tha (jaise ek purani test session mein poocha gaya "what is
+        # date today", ya kisi aur session mein discuss huay products) aur wo
+        # unhe current turn ke sath confuse kar deta tha. Ab sirf ISI session
+        # (`chat_session`) ka history milta hai — bilkul isolated.
         previous_messages = list(
-            ChatMessage.objects.filter(session__user=user, session__channel='admin')
-            .select_related('session')
+            ChatMessage.objects.filter(session=chat_session)
             .order_by('-created_at')[1:MAX_HISTORY_MESSAGES + 1]
         )
         previous_messages.reverse()
@@ -155,6 +173,25 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
                         'action_type': pending.get('action_type'),
                     }
 
+        # NEW — CRITICAL FIX: "is product ka stock update karo" jaisi
+        # pronoun-based follow-ups pehle bar-bar "kaunsa product?" poochti
+        # thin, chahe abhi-abhi ussi product ki poori details dikhayi gayi
+        # ho. Model ko chat_history se khud pronoun resolve karne ka
+        # instruction dena reliable nahi nikla (khaaskar weaker fallback
+        # models ke sath) — is liye ab bilkul pending_action_hint jaisa
+        # deterministic tareeka: is admin ke sabse recent AI message ka
+        # metadata['products'] dekhte hain — agar us turn mein EXACTLY 1
+        # product diya gaya tha, wahi "active product" maan lete hain aur
+        # is turn ke liye hint bana kar model ko dete hain.
+        active_product_hint = None
+        if last_ai_message and last_ai_message.metadata:
+            products = last_ai_message.metadata.get('products') or []
+            if len(products) == 1:
+                active_product_hint = {
+                    'product_id': products[0].get('product_id'),
+                    'name': products[0].get('name'),
+                }
+
         chat_history = []
         for msg in previous_messages:
             text = unescape_for_context(msg.message)
@@ -186,11 +223,96 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
         output, metadata, suggestions = run_admin_agent(
             user_message, session_key=self.session_key, user=user,
             chat_history=chat_history, pending_action_hint=pending_action_hint,   # NEW — FIX
+            active_product_hint=active_product_hint,   # NEW — FIX
         )
+
+        # NEW — CRITICAL SAFETY NET: kabhi kabhi model product ki poori
+        # details (SKU, description, original_price, low_stock_threshold)
+        # apne jawab mein likh deta hai lekin us turn mein get_product_details
+        # tool actually call nahi karta (chahe SYSTEM_PROMPT mein saaf mana
+        # hai) — is se metadata['products'] khali reh jata tha, chahe
+        # response text mein poori details dikh rahi hon. Ab agar metadata
+        # khali hai lekin humein pata hai ke ek "active product" is
+        # conversation mein zeri-e-baat hai, hum khud (Python se,
+        # deterministically) uski REAL details fetch kar ke metadata
+        # bhar dete hain — is se frontend ko hamesha sahi, real data
+        # milega chahe model ne tool call kiya ho ya nahi.
+        #
+        # FIX — CRITICAL BUG: pehle yahan hamesha `active_product_hint`
+        # (pichle AI turn mein dikhaya gaya product) use hota tha — chahe
+        # is CURRENT turn ka pending_action (delete_product/update_product/
+        # update_inventory) ek BILKUL ALAG product_id ke liye ho. Isi
+        # wajah se "product 108 delete karo" jaisi request pe metadata
+        # mein purani/stale product (jaise 86) ki details aa rahi thin,
+        # 108 ki nahi. Ab pehle IS TURN ke pending_action preview se
+        # target product_id nikalte hain (delete/update/inventory teeno
+        # ke preview mein 'product_id' hota hai) — active_product_hint
+        # sirf tab fallback ke tor pe use hota hai jab is turn ka
+        # pending_action product-related na ho (jaise category/order).
+        target_product_id = None
+        pending = (metadata or {}).get('pending_action')
+        if pending and pending.get('action_type') in ('delete_product', 'update_product', 'update_inventory'):
+            preview_product_id = (pending.get('preview') or {}).get('product_id')
+            if preview_product_id is not None:
+                target_product_id = preview_product_id
+        if target_product_id is None and active_product_hint:
+            target_product_id = active_product_hint.get('product_id')
+
+        if target_product_id is not None and not (metadata or {}).get('products'):
+            try:
+                fetched = _fetch_product_details(user, target_product_id)
+                if fetched.get('success') and fetched.get('product'):
+                    if metadata is None:
+                        metadata = {'products': [], 'categories': [], 'customers': [], 'analytics': None}
+                    normalized = _normalize_product(fetched['product'])
+                    if normalized:
+                        metadata['products'] = [normalized]
+            except Exception:
+                logger.exception(
+                    "Metadata safety-net fetch failed for product_id=%s session_key=%s",
+                    target_product_id, self.session_key,
+                )
+
+        # NEW — CRITICAL FIX: "FABRICATED PREVIEW" guard.
+        #
+        # Production logs (2026-08-03) se confirm hua: kabhi kabhi model
+        # ("Confirm karen? haan/nahi" jaisa preview-shaped text) likh deta
+        # hai OB bina asal mutating tool (update_product/create_product/
+        # etc.) actually call kiye — is turn ka tools_called literally
+        # NONE hota hai. Ye ek FAKE preview hai jise admin "confirm" nahi
+        # kar sakta (koi real action_id/pending_action hai hi nahi) — is
+        # se admin ko lagta hai system ne update accept kar liya, phir
+        # "haan confirm karo" bolne pe kuch nahi hota, confusing multi-
+        # round-trip banta hai.
+        #
+        # SYSTEM_PROMPT mein isay explicitly mana kiya gaya hai, lekin
+        # weaker/overloaded-fallback models kabhi ye instruction miss kar
+        # dete hain — is liye ab yahan deterministically catch karte hain:
+        # agar response text preview jaisa dikhta hai ("Confirm karen")
+        # LEKIN metadata mein koi real pending_action nahi hai, to is
+        # misleading response ko ek honest, clear message se replace kar
+        # dete hain — taake admin confuse na ho ke kya asal mein hua.
+        looks_like_fake_preview = (
+            re.search(r'confirm\s*karen\?\s*\(?\s*haan', output, re.IGNORECASE)
+            and ('preview' in output.lower() or '→' in output or '->' in output)
+            and not (metadata or {}).get('pending_action')
+        )
+        if looks_like_fake_preview:
+            logger.warning(
+                "Fabricated preview detected (no real pending_action) for session_key=%s — overriding response",
+                self.session_key,
+            )
+            output = (
+                "Sorry, ye update abhi properly propose nahi ho paya (system thoda "
+                "busy tha) — koi pending action banaya nahi gaya, is liye upar wala "
+                "preview asal nahi tha. Apna update request dobara bhejein, main "
+                "turant ek asal preview bana kar confirm karwaunga."
+            )
+            suggestions = []
 
         if isinstance(output, list):
             output = " ".join(block.get("text", "") if isinstance(block, dict) else str(block) for block in output).strip()
 
-        ChatMessage.objects.create(session=chat_session, sender='ai', message=output, metadata=metadata)
+        ai_message = ChatMessage.objects.create(session=chat_session, sender='ai', message=output, metadata=metadata)
 
-        return output, metadata, suggestions
+        return output, metadata, suggestions, ai_message.id
