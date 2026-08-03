@@ -135,10 +135,51 @@ def execute_update_product(user, payload: dict) -> dict:
 
 
 def propose_delete_product(session_key: str, user_id: int, product_id: int) -> dict:
-    """Product delete (soft delete — is_active=False) ka preview."""
-    preview = {'action': 'delete_product', 'product_id': product_id}
-    # FIX — yehi wo exact bug tha jo "test 2 aur test 3 delete karo" wale
-    # request pe error de raha tha. Pehle 'user_id' argument missing tha.
+    """Product delete (soft delete — sets is_delete=True, hidden from BOTH
+    admin and customer) ka preview. NOTE: this is different from
+    deactivating a product (is_active=False), which only hides it from
+    customers while admin can still see/manage it — a real delete goes
+    further and hides it from admin too."""
+
+    # FIX — CRITICAL BUG: pehle ye function bina kisi existence-check ke
+    # seedha ek "Confirm karen?" preview + real action_id bana deta tha,
+    # chahe wo product_id already deleted ho chuka ho ya kabhi exist hi na
+    # kiya ho. Isi wajah se admin ko ek FAKE-looking preview dikhta tha
+    # jo confirm karne pe 404 ("No Product matches the given query.") de
+    # kar fail ho jata — confusing round-trip, aur metadata bhi khali
+    # rehta tha (kyunke fetch karne ke liye product hi maujood nahi tha).
+    # Ab pehle product live fetch karte hain — nahi milta to seedha,
+    # turant bata dete hain ke ye exist nahi karta, koi fake preview
+    # banaye bina.
+    User = get_user_model()
+    try:
+        acting_user = User.objects.get(id=user_id)
+        current_result = call_internal_api(acting_user, 'GET', f'/api/v1/products/{product_id}/')
+    except Exception:
+        current_result = {'success': False, 'error': 'Could not verify product.'}
+
+    if not current_result.get('success'):
+        return {
+            'success': False,
+            'error': (
+                f'Product ID {product_id} system mein exist nahi karta (shayad pehle hi '
+                'delete ho chuka hai, ya ye ID kabhi valid nahi thi). Koi preview nahi banaya '
+                'gaya — sahi product ID confirm karein ya list_products se dekh lein.'
+            ),
+        }
+
+    current_data = current_result.get('data') or {}
+
+    # NEW — FIX: preview mein ab asal product ka naam/price bhi dikhta hai
+    # (pehle sirf {'action', 'product_id'} hota tha) — taake admin ko
+    # confirm karne se pehle pata ho wo BILKUL SAHI product delete kar
+    # raha hai, aur metadata ke liye bhi ek real data source mile.
+    preview = {
+        'action': 'delete_product',
+        'product_id': product_id,
+        'name': current_data.get('name'),
+        'price': current_data.get('price'),
+    }
     result = create_pending_action(session_key, user_id, 'delete_product', {'product_id': product_id}, preview)
     return {
         'requires_confirmation': True,
@@ -150,12 +191,17 @@ def propose_delete_product(session_key: str, user_id: int, product_id: int) -> d
 
 
 def execute_delete_product(user, payload: dict) -> dict:
-    """Confirm hone ke baad DELETE /api/v1/products/{id}/ call karta hai (soft delete)."""
+    """Confirm hone ke baad DELETE /api/v1/products/{id}/ call karta hai —
+    backend (ProductViewSet.perform_destroy) is_delete=True SET karta hai
+    (saath mein is_active=False bhi), is liye ye product admin panel aur
+    customer store DONO se hamesha ke liye ghayab ho jata hai. (Ye
+    is_active=False-only deactivation se alag hai — wo sirf customer se
+    chhupata, admin ko dikhta rehta.)"""
     product_id = payload['product_id']
     result = call_internal_api(user, 'DELETE', f'/api/v1/products/{product_id}/')
     if not result['success']:
         return {'success': False, 'error': result['error']}
-    return {'success': True, 'message': f'Product {product_id} deleted (soft delete — is_active=False).'}
+    return {'success': True, 'message': f'Product {product_id} delete ho gaya hai — ab admin panel aur store dono mein nahi dikhega.'}
 
 # NEW — FIX: list_products/search sirf limited fields deta hai
 # (product_id, name, price, stock, image, category_id) — description,

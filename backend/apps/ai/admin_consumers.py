@@ -230,9 +230,30 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
         # deterministically) uski REAL details fetch kar ke metadata
         # bhar dete hain — is se frontend ko hamesha sahi, real data
         # milega chahe model ne tool call kiya ho ya nahi.
-        if active_product_hint and not (metadata or {}).get('products'):
+        #
+        # FIX — CRITICAL BUG: pehle yahan hamesha `active_product_hint`
+        # (pichle AI turn mein dikhaya gaya product) use hota tha — chahe
+        # is CURRENT turn ka pending_action (delete_product/update_product/
+        # update_inventory) ek BILKUL ALAG product_id ke liye ho. Isi
+        # wajah se "product 108 delete karo" jaisi request pe metadata
+        # mein purani/stale product (jaise 86) ki details aa rahi thin,
+        # 108 ki nahi. Ab pehle IS TURN ke pending_action preview se
+        # target product_id nikalte hain (delete/update/inventory teeno
+        # ke preview mein 'product_id' hota hai) — active_product_hint
+        # sirf tab fallback ke tor pe use hota hai jab is turn ka
+        # pending_action product-related na ho (jaise category/order).
+        target_product_id = None
+        pending = (metadata or {}).get('pending_action')
+        if pending and pending.get('action_type') in ('delete_product', 'update_product', 'update_inventory'):
+            preview_product_id = (pending.get('preview') or {}).get('product_id')
+            if preview_product_id is not None:
+                target_product_id = preview_product_id
+        if target_product_id is None and active_product_hint:
+            target_product_id = active_product_hint.get('product_id')
+
+        if target_product_id is not None and not (metadata or {}).get('products'):
             try:
-                fetched = _fetch_product_details(user, active_product_hint['product_id'])
+                fetched = _fetch_product_details(user, target_product_id)
                 if fetched.get('success') and fetched.get('product'):
                     if metadata is None:
                         metadata = {'products': [], 'categories': [], 'customers': [], 'analytics': None}
@@ -242,7 +263,7 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
             except Exception:
                 logger.exception(
                     "Metadata safety-net fetch failed for product_id=%s session_key=%s",
-                    active_product_hint.get('product_id'), self.session_key,
+                    target_product_id, self.session_key,
                 )
 
         # NEW — CRITICAL FIX: "FABRICATED PREVIEW" guard.
