@@ -65,15 +65,61 @@ def execute_create_product(user, payload: dict) -> dict:
     return {'success': True, 'product': result['data']}
 
 
+# FIX — CRITICAL BUG: LLM kabhi kabhi user ki phrasing se seedha field
+# naam guess kar leta tha — jaise "active status false kar do" ke liye
+# fields={'active': False} bhej deta, jabke asal model/serializer field
+# 'is_active' hai. 'active' Django REST ke liye ek unknown key hoti hai
+# to PATCH silently us key ko ignore kar deta (400 nahi deta), is liye
+# admin ko "ho gaya" wala success message mil jata tha lekin DB mein
+# is_active kabhi change hi nahi hota tha. Ab yahan chand common galat
+# naam deterministically 'is_active' mein remap karte hain — bhale hi
+# LLM docstring miss kar jaye, ye safety-net hamesha sahi field ko hit
+# karega.
+_PRODUCT_FIELD_ALIASES = {
+    'active': 'is_active',
+    'status': 'is_active',
+    'enabled': 'is_active',
+    'is_enabled': 'is_active',
+    'available': 'is_active',
+}
+
+
+def _normalize_update_fields(fields: dict) -> dict:
+    fields = dict(fields)  # copy — original mutate na karein
+    if 'category_id' in fields:
+        fields['category'] = fields.pop('category_id')
+
+    for alias, real_key in _PRODUCT_FIELD_ALIASES.items():
+        if alias in fields and alias != real_key:
+            value = fields.pop(alias)
+            # Agar dono keys ek sath aa jayein (rare), real_key ko priority
+            # dete hain aur alias wali value sirf tab use karte hain jab
+            # real_key abhi tak set nahi hui.
+            fields.setdefault(real_key, value)
+
+    # NEW — FIX: value kabhi kabhi bool ki jagah string ("false"/"active"/
+    # "inactive"/"0") ya int (0/1) ke roop mein aati hai — API ko asal
+    # Python bool chahiye, warna ye bhi silently ignore/misinterpret ho
+    # sakti hai. is_active hamesha strict bool mein coerce karte hain.
+    if 'is_active' in fields and not isinstance(fields['is_active'], bool):
+        raw = fields['is_active']
+        if isinstance(raw, str):
+            fields['is_active'] = raw.strip().lower() not in ('false', '0', 'inactive', 'no', 'off')
+        else:
+            fields['is_active'] = bool(raw)
+
+    return fields
+
+
 def propose_update_product(session_key: str, user_id: int, product_id: int, fields: dict) -> dict:
     """
     Product update ka preview. 'fields' dict mein jo bhi keys hain wahi
     update hongi (jaise {'price': 5000} ya {'stock': 20, 'name': 'New Name'}).
     Agar 'category_id' diya ho to 'category' mein translate karte hain.
+    Common galat field-naam aliases (active/status/enabled/available) bhi
+    'is_active' mein normalize kiye jate hain — see _normalize_update_fields.
     """
-    fields = dict(fields)  # copy — original mutate na karein
-    if 'category_id' in fields:
-        fields['category'] = fields.pop('category_id')
+    fields = _normalize_update_fields(fields)
 
     # NEW — FIX: pehle preview mein sirf NAYI values hoti thin, "purani
     # value" AI khud (apni memory se, kabhi galat) bana kar bolta tha —

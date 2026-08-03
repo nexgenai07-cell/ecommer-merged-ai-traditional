@@ -143,7 +143,16 @@ def get_admin_operations_tools(session_key: str, user):
 
     @tool
     def update_product(product_id: int, fields: dict) -> dict:
-        """Update an existing product's fields. MUTATING — requires confirmation."""
+        """Update an existing product's fields. MUTATING — requires confirmation.
+
+        `fields` keys MUST be exactly one (or more) of: 'name', 'price',
+        'original_price', 'stock', 'sku', 'description', 'category_id',
+        'low_stock_threshold', 'is_active'. Do NOT invent other key names.
+        In particular, for turning a product on/off (active/inactive,
+        enable/disable, "active status", "chalu/bandh") ALWAYS use the key
+        'is_active' with a boolean value (true/false) — NEVER 'active',
+        'status', or 'enabled'; those are not real fields and will silently
+        fail to update anything."""
         return _track(propose_update_product(session_key, user.id, product_id, fields))
 
     @tool
