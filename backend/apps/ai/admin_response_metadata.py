@@ -110,6 +110,146 @@ def _build_analytics_envelope(tool_name, tool_output):
     return envelope
 
 
+def _first_dict(*candidates):
+    for c in candidates:
+        if isinstance(c, dict):
+            return c
+    return None
+
+
+def _extract_executed_product(result):
+    """
+    Handles the shapes an executed product action's result can come in:
+      - {'success': True, 'product': {...}}
+      - {'success': True, 'products': [{...}, ...]}
+      - {'success': True, 'data': {...ProductDetailSerializer fields...}}
+        (execute_create_product / execute_update_product — see the
+        comment in _extract_image_url above, same pass-through shape)
+      - flat: {'success': True, 'product_id': .., 'name': .., ...}
+    Returns a list of normalized products (usually 0 or 1 item).
+    """
+    products = []
+
+    if isinstance(result.get('products'), list):
+        for p in result['products']:
+            norm = _normalize_product(p)
+            if norm:
+                products.append(norm)
+        if products:
+            return products
+
+    source = _first_dict(result.get('product'), result.get('data'))
+    if source:
+        norm = _normalize_product(source)
+        if norm:
+            products.append(norm)
+            return products
+
+    if 'product_id' in result or 'id' in result:
+        norm = _normalize_product(result)
+        if norm:
+            products.append(norm)
+
+    return products
+
+
+def _extract_executed_category(result):
+    """Mirrors _extract_executed_product but for category actions."""
+    categories = []
+
+    if isinstance(result.get('categories'), list):
+        for c in result['categories']:
+            if isinstance(c, dict):
+                cid = c.get('id') or c.get('category_id')
+                if cid is not None:
+                    categories.append({'category_id': cid, 'name': c.get('name')})
+        if categories:
+            return categories
+
+    source = _first_dict(result.get('category'), result.get('data'))
+    if source:
+        cid = source.get('id') or source.get('category_id')
+        if cid is not None:
+            categories.append({'category_id': cid, 'name': source.get('name')})
+
+    return categories
+
+
+def build_executed_admin_metadata(tool_name, result):
+    """
+    Builds the same {'products', 'categories', 'customers', 'analytics'}
+    shape that extract_admin_metadata() produces during a normal agent
+    turn, but for the single, already-executed result returned by
+    execute_pending_action_by_id() in the confirm/cancel REST flow.
+
+    NOTE: since this runs OUTSIDE the agent loop, there is no
+    intermediate_steps list to walk — just one executor result — so this
+    intentionally does not touch pending_action / analytics envelope
+    logic (those don't apply to a single executed action).
+
+    ASSUMPTION FLAG: the exact keys execute_create_product /
+    execute_update_product / execute_delete_product / category+stock
+    equivalents put on `result` weren't available when this was written
+    (apps/ai/admin_tools/registry.py). This checks 'product'/'products'/
+    'data' (product side) and 'category'/'categories'/'data' (category
+    side) defensively. If metadata comes out empty for some action after
+    testing, share registry.py so the key names can be tightened.
+    """
+    if not isinstance(result, dict) or not result.get('success'):
+        return {'products': [], 'categories': [], 'customers': [], 'analytics': None}
+
+    products = []
+    categories = []
+
+    if 'product' in tool_name or tool_name in ('adjust_stock',):
+        products = _extract_executed_product(result)
+    elif 'category' in tool_name:
+        categories = _extract_executed_category(result)
+    else:
+        # Unknown tool_name — try both defensively rather than returning
+        # nothing, since a wrong guess here just means an empty list.
+        products = _extract_executed_product(result)
+        categories = _extract_executed_category(result)
+
+    return {
+        'products': products,
+        'categories': categories,
+        'customers': [],
+        'analytics': None,
+    }
+
+
+def describe_executed_admin_action(tool_name, result):
+    """
+    Builds the human-readable chat message shown after an admin confirms
+    a pending action via the REST confirm button (mirrors the tone the
+    text 'haan' flow already uses elsewhere in this app).
+    """
+    if not isinstance(result, dict) or not result.get('success'):
+        error_msg = None
+        if isinstance(result, dict):
+            error_msg = result.get('error') or result.get('message')
+        if error_msg:
+            return f"Maaf kijiye, ye action complete nahi ho saka: {error_msg}"
+        return "Maaf kijiye, ye action complete nahi ho saka. Dobara try karein."
+
+    subject = _first_dict(result.get('product'), result.get('category'), result.get('data'))
+    name = subject.get('name') if subject else None
+    label = f' "{name}"' if name else ''
+
+    messages = {
+        'create_product': f'Product{label} successfully create ho gaya hai.',
+        'update_product': f'Product{label} successfully update ho gaya hai.',
+        'delete_product': f'Product{label} successfully delete ho gaya hai.',
+        'create_category': f'Category{label} successfully create ho gayi hai.',
+        'update_category': f'Category{label} successfully update ho gayi hai.',
+        'delete_category': f'Category{label} successfully delete ho gayi hai.',
+        'adjust_stock': f'Stock{label} successfully adjust ho gaya hai.',
+    }
+
+    return messages.get(tool_name, f'Ye action successfully complete ho gaya hai{label}.')
+
+
 def extract_admin_metadata(intermediate_steps):
     products, seen_product_ids = [], set()
     categories, seen_category_ids = [], set()
