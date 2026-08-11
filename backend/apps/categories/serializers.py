@@ -3,7 +3,7 @@ from .models import Category
 
 
 class CategorySerializer(serializers.ModelSerializer):
-    image = serializers.ImageField(write_only=True, required=False)
+    image = serializers.ImageField(required=False)
     image_url = serializers.SerializerMethodField(read_only=True)
     product_count = serializers.SerializerMethodField()
 
@@ -13,8 +13,8 @@ class CategorySerializer(serializers.ModelSerializer):
             "id",
             "name",
             "description",
-            "image",          # <-- upload
-            "image_url",      # <-- response
+            "image",
+            "image_url",
             "is_active",
             "product_count",
             "created_at",
@@ -41,9 +41,9 @@ class CategorySerializer(serializers.ModelSerializer):
 
     def validate_name(self, value):
         qs = Category.objects.filter(
-    name=value,
-    is_delete=False,
-)
+            name=value,
+            is_delete=False,
+        )
 
         if self.instance:
             qs = qs.exclude(pk=self.instance.pk)
