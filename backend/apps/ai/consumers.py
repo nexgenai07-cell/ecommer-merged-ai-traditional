@@ -80,6 +80,18 @@ class ChatConsumer(AsyncWebsocketConsumer):
         # persist karte hain — taake ye poori chat session mein SIRF EK
         # BAAR aaye, chahe WebSocket beech mein kitni bhi baar reconnect ho.
         self.idle_already_sent = bool(await sync_to_async(cache.get)(_idle_nudge_cache_key(self.session_key)))
+        # NEW — DIAGNOSTIC: agar idle-nudge phir se baar-baar aa raha hai,
+        # ye log line 2 cheezein confirm karegi: (1) session_key har
+        # reconnect pe SAME rehta hai ya HAR BAAR NAYA banta hai (agar naya
+        # banta hai, to masla frontend mein hai — wo session_key persist
+        # nahi kar raha, is liye backend ka cache-based fix bhi kaam nahi
+        # kar sakta), (2) idle_already_sent connect() ke waqt already True
+        # mil raha hai ya nahi (agar True milta hai lekin phir bhi nudge
+        # dobara chala jaye, to bug _send_proactive_message() ke aage hai).
+        logger.warning(
+            "[ChatConsumer.connect] session_key=%s idle_already_sent_from_cache=%s",
+            self.session_key, self.idle_already_sent,
+        )
         self.page_context = None  # frontend agar "page_context" bheje to yahan store hoga
         self.idle_task = asyncio.create_task(self._idle_watcher())
 

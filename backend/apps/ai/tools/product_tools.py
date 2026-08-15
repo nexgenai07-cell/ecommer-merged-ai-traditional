@@ -10,6 +10,7 @@ from django.conf import settings
 from qdrant_client import QdrantClient
 
 from apps.ai.gemini_utils import gemini_keys, call_with_fallback   # FLOW → gemini_utils.py (embedding call ke liye bhi fallback)
+from apps.products.models import Product   # NEW — FIX: staleness-check ab EK single DB query se hoti hai, N alag-alag HTTP calls se nahi (neeche dekhein)
 
 
 def get_qdrant_client():
@@ -91,6 +92,23 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
         search_results = search_response.points
 
         products = []
+
+        # NEW — FIX (v2): Pichli baar har Qdrant candidate ko apni hi API
+        # par ek ALAG HTTP call se verify kiya ja raha tha (limit*3 tak =
+        # 15 sequential network round-trips PER SEARCH) — isse response
+        # itna slow ho gaya ke poora search_products call hi timeout/fail
+        # hone laga, aur customer ko koi bhi metadata/product cards milna
+        # bilkul band ho gaya tha (sirf text reply aata tha). Ab isi
+        # staleness-check ko EK SINGLE, fast DB query se karte hain (hum
+        # khud Django process ke andar hain, HTTP round-trip ki zaroorat
+        # nahi) — field names cart_order_tools.py se confirmed hain
+        # (id/is_active/stock/price/category/name/original_price/in_stock).
+        candidate_ids = [r.payload.get('product_id') for r in search_results if r.payload.get('product_id') is not None]
+        live_map = {
+            p.id: p
+            for p in Product.objects.select_related('category').filter(id__in=candidate_ids, is_active=True)
+        }
+
         for result in search_results:
             payload = result.payload
             pid = payload.get('product_id')
@@ -103,58 +121,43 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
             # index_products command dobara na chale) — isi wajah se
             # purana/ghost data (jo ab DB mein exist hi nahi karta)
             # customer ko dikh jata tha, aur us par "Add to Cart" hamesha
-            # fail hota tha (product_id DB mein milta hi nahi tha, ya
-            # stock/price purana hota tha). Ab har Qdrant candidate ko
-            # REAL-TIME Django API se verify + refresh karte hain
-            # (get_product_details_tool — neeche isi file mein hai, wahi
-            # function jo compare_products bhi use karta hai) — Qdrant
-            # payload par blindly trust nahi karte. Deleted/inactive
-            # product yahan khud-ba-khud skip ho jayega, aur price/stock/
-            # image hamesha DB se live/fresh milega.
-            live = get_product_details_tool(pid)
-            if not live.get('success'):
+            # fail hota tha. Agar ye product live_map mein nahi hai, matlab
+            # DB mein exist hi nahi karta (ya inactive hai) — skip karo.
+            live = live_map.get(pid)
+            if live is None:
                 continue
 
-            p = live['product']
-            if p.get('is_active') is False:
-                continue
-
-            stock = p.get('stock', 0) or 0
+            stock = live.stock or 0
             if stock <= 0:
                 continue
 
-            price = p.get('price')
+            price = float(live.price)
 
-            # Price filter
-            if max_price and price and float(price) > max_price:
+            # Price filter — REAL/live DB price se, Qdrant payload se nahi
+            if max_price and price > max_price:
                 continue
 
-            cat = p.get('category')
-            category_name = cat.get('name') if isinstance(cat, dict) else None
-            category_id = cat.get('id') if isinstance(cat, dict) else cat
+            category_name = live.category.name if live.category else None
 
             # Category filter (case-insensitive)
             if category and (not category_name or category_name.lower() != category.lower()):
                 continue
 
-            # NEW — image bhi live product se nikalte hain — ProductDetailSerializer
-            # 'images' list deta hai (id/image_url/is_primary), 'image'/'primary_image'
-            # seedha nahi (bilkul admin side get_product_details() jaisa pattern)
-            images = p.get('images') or []
-            primary = next((img for img in images if isinstance(img, dict) and img.get('is_primary')), None) or (images[0] if images else None)
-            image_url = (primary.get('image_url') if isinstance(primary, dict) else None) or p.get('image') or p.get('primary_image')
-
             products.append({
-                'product_id':      p.get('id'),
-                'name':             p.get('name'),
+                'product_id':      live.id,
+                'name':             live.name,
                 'category':         category_name,
-                'category_id':      category_id,
+                'category_id':      live.category_id,
                 'price':            price,
-                'original_price':   p.get('original_price'),
-                'in_stock':         stock > 0,
+                'original_price':   float(live.original_price) if getattr(live, 'original_price', None) else None,
+                'in_stock':         getattr(live, 'in_stock', stock > 0),
                 'stock':            stock,
-                'description':      p.get('description', ''),
-                'image':            image_url,
+                'description':      getattr(live, 'description', '') or '',
+                # NEW — image abhi bhi Qdrant payload se (DB field ka naam
+                # yahan confirm nahi tha) — kabhi image kabhi thodi purani
+                # ho sakti hai, lekin ye poore product ke stale/ghost hone
+                # (jo asal bug tha) se bohot chhota risk hai.
+                'image':            payload.get('image'),
                 'relevance_score':  round(result.score, 3),
             })
 

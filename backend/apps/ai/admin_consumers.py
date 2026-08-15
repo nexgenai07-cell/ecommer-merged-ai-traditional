@@ -238,25 +238,36 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
         # bhar dete hain — is se frontend ko hamesha sahi, real data
         # milega chahe model ne tool call kiya ho ya nahi.
         #
-        # FIX — CRITICAL BUG: pehle yahan hamesha `active_product_hint`
-        # (pichle AI turn mein dikhaya gaya product) use hota tha — chahe
-        # is CURRENT turn ka pending_action (delete_product/update_product/
-        # update_inventory) ek BILKUL ALAG product_id ke liye ho. Isi
-        # wajah se "product 108 delete karo" jaisi request pe metadata
-        # mein purani/stale product (jaise 86) ki details aa rahi thin,
-        # 108 ki nahi. Ab pehle IS TURN ke pending_action preview se
-        # target product_id nikalte hain (delete/update/inventory teeno
-        # ke preview mein 'product_id' hota hai) — active_product_hint
-        # sirf tab fallback ke tor pe use hota hai jab is turn ka
-        # pending_action product-related na ho (jaise category/order).
+        # target_product_id: pehle IS TURN ke pending_action preview se
+        # nikalte hain (delete/update/inventory teeno ke preview mein
+        # 'product_id' hota hai) — active_product_hint sirf tab fallback
+        # ke tor pe use hota hai jab is turn ka pending_action product-
+        # related na ho (jaise category/order), aur neeche wala naam-match
+        # check bhi pass ho.
         target_product_id = None
         pending = (metadata or {}).get('pending_action')
         if pending and pending.get('action_type') in ('delete_product', 'update_product', 'update_inventory'):
             preview_product_id = (pending.get('preview') or {}).get('product_id')
             if preview_product_id is not None:
                 target_product_id = preview_product_id
+
+        # FIX — CRITICAL BUG: pehle yahan active_product_hint HAMESHA use
+        # hota tha jab bhi current turn ka pending_action product-related
+        # na ho — chahe is turn ka jawab us product se koi taluq hi na
+        # rakhta ho (jaise "aaj kitne orders aaye", "sales report dikhao").
+        # Isi wajah se product update/confirm ke baad, HAR AGLI bilkul
+        # unrelated chat (analytics/orders) pe bhi purani product image
+        # metadata mein chipki reh jati thi. Ab sirf tab fallback karte
+        # hain jab is TURN ka response text genuinely usi product ka naam
+        # mention karta hai — matlab AI khud us product ke baare mein baat
+        # kar raha hai (details de raha hai) bina tool call kiye. Agar
+        # jawab kisi aur topic (sales/orders/inventory list) ke baare mein
+        # hai, product ka naam usme nahi aayega, is liye ye fallback
+        # correctly skip ho jayega aur metadata khali/relevant rahega.
         if target_product_id is None and active_product_hint:
-            target_product_id = active_product_hint.get('product_id')
+            hint_name = (active_product_hint.get('name') or '').strip()
+            if hint_name and hint_name.lower() in (output or '').lower():
+                target_product_id = active_product_hint.get('product_id')
 
         if target_product_id is not None and not (metadata or {}).get('products'):
             try:
