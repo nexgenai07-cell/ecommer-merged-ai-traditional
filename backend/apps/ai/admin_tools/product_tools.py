@@ -208,6 +208,16 @@ def execute_update_product(user, payload: dict) -> dict:
 
     fresh = get_product_details(user, product_id)
     if fresh.get('success'):
+        # NEW — DIAGNOSTIC: agar deploy ke baad bhi confirm ke baad
+        # image/price ghayab dikhe, ye Railway log line confirm karegi
+        # ke ye function khud sahi data bhej raha hai ya nahi — agar log
+        # mein sahi image/price dikhe lekin frontend pe phir bhi na
+        # aaye, to bug is function ke AAGE (metadata extraction ya
+        # frontend) mein hai, is function mein nahi.
+        logger.warning(
+            "[execute_update_product] product_id=%s fresh data after confirm: price=%s image=%s",
+            product_id, fresh['product'].get('price'), fresh['product'].get('image'),
+        )
         return {'success': True, 'product': fresh['product']}
 
     # fallback — agar fresh fetch fail ho (rare), purana PATCH response hi de dein

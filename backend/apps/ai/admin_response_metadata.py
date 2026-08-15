@@ -1,5 +1,10 @@
 # PATH: apps/ai/admin_response_metadata.py
 
+import logging   # NEW — DIAGNOSTIC: confirm-stage image/price bug isolate karne ke liye
+
+logger = logging.getLogger("ai.admin_response_metadata")   # NEW
+
+
 def _extract_image_url(p):
     """
     FIX — image apne 2 alag shapes mein aati hai:
@@ -307,6 +312,13 @@ def extract_admin_metadata(intermediate_steps):
             confirmed_this_turn = True
             pending_action = None  # is turn ka koi bhi pehle wala pending_action ab resolve ho chuka hai — mat dikhao
             # neeche is step se product/category bhi extract hone dete hain (normal flow), sirf pending_action logic yahan handle ho gayi
+            # NEW — DIAGNOSTIC: agar confirm ke baad bhi frontend pe image/
+            # price ghayab dikhe, ye log line batayegi ke execute_update_product
+            # se yahan tak data sahi pahuncha ya nahi.
+            logger.warning(
+                "[extract_admin_metadata] confirm_pending_action raw tool_output: %s",
+                tool_output,
+            )
 
         if isinstance(tool_output.get('products'), list):
             for p in tool_output['products']:

@@ -324,17 +324,21 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
     # Order = priority: [0] primary, baaki fallback (upar wala fail ho
     # tabhi neeche wala try hota hai).
     #
-    # UPDATED — FIX: production logs (2026-08-03, admin side, same NVIDIA
-    # provider/account) se saaf pata chala ke "openai/gpt-oss-120b" is
-    # waqt consistently slow/failing hai (~21s har baar fail hone mein),
-    # jab ke "deepseek-ai/deepseek-v4-flash" turant (1-2s) succeed hota
-    # hai. Isay top se hata kar deepseek-v4-flash ko primary bana diya.
+    # UPDATED — admin ki request pe (data-accuracy/tool-calling reliability
+    # behtar karne ki umeed mein) "openai/gpt-oss-120b" ko wapis PRIMARY
+    # bana diya. NOTE: production logs (2026-08-03) mein isay consistently
+    # slow/unreliable paya gaya tha (~21s fail hone mein) — lekin us waqt
+    # ka slow-fallback bug (gemini-key-count-based retry loop) alag se fix
+    # ho chuka hai, is liye ab worst-case sirf ~8s (single timeout) lagega
+    # is model ke fail hone tak, phir turant deepseek-v4-flash pe fallback
+    # ho jayega. Agar response time phir bhi kharab lage, is list ka order
+    # wapis palat dena (deepseek-v4-flash ko index 0 pe le aana).
     NVIDIA_MODEL_CHAIN = [
-        ("deepseek-ai/deepseek-v4-flash", False, {}),              # PRIMARY — logs mein consistently fast/reliable
-        ("meta/llama-3.2-90b-vision-instruct", True, {}),          # vision fallback (image search ke liye)
-        ("deepseek-ai/deepseek-v4-pro", False, {}),                # strong reasoning, same family, bhi reliable dikha logs mein
-        ("nvidia/nemotron-3-super-120b-a12b", False, {}),          # NVIDIA's own agentic model — sahi slug (-a12b zaroori tha)
-        ("openai/gpt-oss-120b", False, {}),                        # MOVED TO LAST — abhi NVIDIA ki taraf se slow/unreliable dikh raha hai
+        ("openai/gpt-oss-120b", False, {}),                         # NEW PRIMARY — admin ki request pe try kiya ja raha
+        ("deepseek-ai/deepseek-v4-flash", False, {}),               # fast fallback — pehle primary tha
+        ("meta/llama-3.2-90b-vision-instruct", True, {}),           # vision fallback (image search ke liye)
+        ("deepseek-ai/deepseek-v4-pro", False, {}),                 # strong reasoning, same family
+        ("nvidia/nemotron-3-super-120b-a12b", False, {}),           # NVIDIA's own agentic model — sahi slug (-a12b zaroori tha)
     ]
 
     def make_nvidia_attempt(model_id, vision_capable, extra_kwargs):

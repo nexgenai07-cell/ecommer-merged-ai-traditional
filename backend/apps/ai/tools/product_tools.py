@@ -93,35 +93,69 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
         products = []
         for result in search_results:
             payload = result.payload
-
-            # NEW — FIX: out-of-stock products customer ko dikhana band —
-            # ye khareed hi nahi sakta, aur "Add to Cart" tap karne pe
-            # silently fail ho kar confusing recovery-message trigger
-            # karta tha ("product available nahi, ye related dekhein").
-            stock = payload.get('stock', 0) or 0
-            if not payload.get('in_stock', True) or stock <= 0:
+            pid = payload.get('product_id')
+            if pid is None:
                 continue
+
+            # NEW — CRITICAL FIX: Qdrant index kabhi STALE ho jata hai —
+            # product delete/deactivate/update ho chuka hota hai asal
+            # database mein, lekin Qdrant re-index nahi hota (jab tak
+            # index_products command dobara na chale) — isi wajah se
+            # purana/ghost data (jo ab DB mein exist hi nahi karta)
+            # customer ko dikh jata tha, aur us par "Add to Cart" hamesha
+            # fail hota tha (product_id DB mein milta hi nahi tha, ya
+            # stock/price purana hota tha). Ab har Qdrant candidate ko
+            # REAL-TIME Django API se verify + refresh karte hain
+            # (get_product_details_tool — neeche isi file mein hai, wahi
+            # function jo compare_products bhi use karta hai) — Qdrant
+            # payload par blindly trust nahi karte. Deleted/inactive
+            # product yahan khud-ba-khud skip ho jayega, aur price/stock/
+            # image hamesha DB se live/fresh milega.
+            live = get_product_details_tool(pid)
+            if not live.get('success'):
+                continue
+
+            p = live['product']
+            if p.get('is_active') is False:
+                continue
+
+            stock = p.get('stock', 0) or 0
+            if stock <= 0:
+                continue
+
+            price = p.get('price')
 
             # Price filter
-            if max_price and payload.get('price', 0) > max_price:
+            if max_price and price and float(price) > max_price:
                 continue
+
+            cat = p.get('category')
+            category_name = cat.get('name') if isinstance(cat, dict) else None
+            category_id = cat.get('id') if isinstance(cat, dict) else cat
 
             # Category filter (case-insensitive)
-            if category and payload.get('category', '').lower() != category.lower():
+            if category and (not category_name or category_name.lower() != category.lower()):
                 continue
 
+            # NEW — image bhi live product se nikalte hain — ProductDetailSerializer
+            # 'images' list deta hai (id/image_url/is_primary), 'image'/'primary_image'
+            # seedha nahi (bilkul admin side get_product_details() jaisa pattern)
+            images = p.get('images') or []
+            primary = next((img for img in images if isinstance(img, dict) and img.get('is_primary')), None) or (images[0] if images else None)
+            image_url = (primary.get('image_url') if isinstance(primary, dict) else None) or p.get('image') or p.get('primary_image')
+
             products.append({
-                'product_id':     payload['product_id'],
-                'name':           payload['name'],
-                'category':       payload.get('category'),
-                'category_id':    payload.get('category_id'),
-                'price':          payload['price'],
-                'original_price': payload.get('original_price'),
-                'in_stock':       payload.get('in_stock', True),
-                'stock':          payload.get('stock', 0),
-                'description':    payload.get('description', ''),
-                'image':          payload.get('image'),
-                'relevance_score': round(result.score, 3),
+                'product_id':      p.get('id'),
+                'name':             p.get('name'),
+                'category':         category_name,
+                'category_id':      category_id,
+                'price':            price,
+                'original_price':   p.get('original_price'),
+                'in_stock':         stock > 0,
+                'stock':            stock,
+                'description':      p.get('description', ''),
+                'image':            image_url,
+                'relevance_score':  round(result.score, 3),
             })
 
             if len(products) >= limit:

@@ -376,19 +376,21 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
     # Order = priority: [0] primary, baaki fallback (upar wala fail ho
     # tabhi neeche wala try hota hai).
     #
-    # UPDATED — FIX: production logs (2026-08-03) se saaf pata chala ke
-    # "openai/gpt-oss-120b" is waqt NVIDIA ki taraf se consistently slow/
-    # failing hai — dono test turns mein ye ~21 second lagata raha fail
-    # hone mein, tab jaake "deepseek-ai/deepseek-v4-flash" turant (1-2s)
-    # mein succeed hota tha. Isay top se hata kar "deepseek-ai/deepseek-
-    # v4-flash" ko primary bana diya — isi se average response time bohot
-    # kam ho jayega jab tak gpt-oss-120b dobara reliable na ho.
+    # UPDATED — admin ki request pe (data-accuracy/tool-calling reliability
+    # behtar karne ki umeed mein) "openai/gpt-oss-120b" ko wapis PRIMARY
+    # bana diya. NOTE: production logs (2026-08-03) mein isay consistently
+    # slow/unreliable paya gaya tha (~21s fail hone mein) — lekin us waqt
+    # ka slow-fallback bug (gemini-key-count-based retry loop) alag se fix
+    # ho chuka hai, is liye ab worst-case sirf ~8s (single timeout) lagega
+    # is model ke fail hone tak, phir turant deepseek-v4-flash pe fallback
+    # ho jayega. Agar response time phir bhi kharab lage, is list ka order
+    # wapis palat dena (deepseek-v4-flash ko index 0 pe le aana).
     NVIDIA_MODEL_CHAIN = [
-        ("deepseek-ai/deepseek-v4-flash", {}),              # PRIMARY — logs mein consistently fast/reliable
-        ("deepseek-ai/deepseek-v4-pro", {}),                # strong reasoning, same family, bhi reliable dikha logs mein
+        ("openai/gpt-oss-120b", {}),                        # NEW PRIMARY — admin ki request pe try kiya ja raha
+        ("deepseek-ai/deepseek-v4-flash", {}),              # fast fallback — pehle primary tha
+        ("deepseek-ai/deepseek-v4-pro", {}),                # strong reasoning, same family
         ("nvidia/nemotron-3-super-120b-a12b", {}),          # NVIDIA's own agentic model — sahi slug (-a12b zaroori tha)
         ("meta/llama-3.3-70b-instruct", {}),                # well-established, stable, reliable tool-calling
-        ("openai/gpt-oss-120b", {}),                        # MOVED TO LAST — abhi NVIDIA ki taraf se slow/unreliable dikh raha hai
     ]
 
     def make_nvidia_attempt(model_id, extra_kwargs):
