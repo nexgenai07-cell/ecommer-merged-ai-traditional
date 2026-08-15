@@ -5,12 +5,15 @@
 # Ye file DB nahi, Qdrant (vector database) aur Gemini embedding API
 # use karti hai — semantic search ke liye.
 
+import logging   # NEW — DIAGNOSTIC: bar-bar "product available nahi" ki asal wajah pinpoint karne ke liye
 import requests
 from django.conf import settings
 from qdrant_client import QdrantClient
 
 from apps.ai.gemini_utils import gemini_keys, call_with_fallback   # FLOW → gemini_utils.py (embedding call ke liye bhi fallback)
 from apps.products.models import Product   # NEW — FIX: staleness-check ab EK single DB query se hoti hai, N alag-alag HTTP calls se nahi (neeche dekhein)
+
+logger = logging.getLogger("ai.tools.product_tools")   # NEW
 
 
 def get_qdrant_client():
@@ -91,6 +94,17 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
         )
         search_results = search_response.points
 
+        # NEW — DIAGNOSTIC: agar "product available nahi" wala masla phir
+        # se aaye, ye log lines Railway pe exact wajah dikha dengi —
+        # (a) Qdrant ne is query ke liye kitne hits diye (0 ho sakte hain
+        # agar Qdrant index is product ke liye stale/outdated hai — jaise
+        # product baad mein add hua ho aur index_products dobara na chala
+        # ho), (b) un hits mein se kitne DB mein live/active mile.
+        logger.warning(
+            "[search_products_tool] query=%r category=%r max_price=%r qdrant_hits=%d",
+            query, category, max_price, len(search_results),
+        )
+
         products = []
 
         # NEW — FIX (v2): Pichli baar har Qdrant candidate ko apni hi API
@@ -108,6 +122,12 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
             p.id: p
             for p in Product.objects.select_related('category').filter(id__in=candidate_ids, is_active=True)
         }
+
+        # NEW — DIAGNOSTIC
+        logger.warning(
+            "[search_products_tool] candidate_ids=%s matched_in_db=%s",
+            candidate_ids, list(live_map.keys()),
+        )
 
         for result in search_results:
             payload = result.payload
@@ -139,9 +159,19 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
 
             category_name = live.category.name if live.category else None
 
-            # Category filter (case-insensitive)
-            if category and (not category_name or category_name.lower() != category.lower()):
-                continue
+            # NEW — FIX: pehle EXACT string match tha (category_name.lower()
+            # != category.lower()) — agar LLM ne "Kitchen" bheja lekin DB
+            # mein category ka asal naam "Kitchen & Dining" ya "Home &
+            # Kitchen" hai, to ye EXACT match fail ho jata aur sab results
+            # (jo Qdrant ki semantic search ke hisab se already relevant
+            # thay) silently ud jate thay — is se genuinely available
+            # product bhi "not available" dikhta tha. Ab substring-based
+            # (dono taraf) match karte hain — zyada forgiving, kam false-negatives.
+            if category:
+                cat_l = category.lower().strip()
+                name_l = (category_name or '').lower().strip()
+                if not name_l or (cat_l not in name_l and name_l not in cat_l):
+                    continue
 
             products.append({
                 'product_id':      live.id,
@@ -167,6 +197,9 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
         # FLOW: ye poora dict wapis registry.py ke tool function ko jata
         # hai, phir LangChain Agent ko, jo isay dekh kar natural jawab likhta hai
 
+        # NEW — DIAGNOSTIC
+        logger.warning("[search_products_tool] final products_returned=%d", len(products))
+
         return {
             'success': True,
             'products': products,
@@ -175,6 +208,12 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
         }
 
     except Exception as e:
+        # NEW — DIAGNOSTIC: pehle exception silently swallow ho kar sirf
+        # str(e) agent ko chali jati thi (jo aksar samajh nahi aata) — ab
+        # poori traceback Railway logs mein bhi jayegi, taake exact wajah
+        # (jaise field-name mismatch, Qdrant connection error, etc.) turant
+        # dikh jaye.
+        logger.exception("[search_products_tool] EXCEPTION for query=%r category=%r", query, category)
         return {
             'success': False,
             'error': str(e),
