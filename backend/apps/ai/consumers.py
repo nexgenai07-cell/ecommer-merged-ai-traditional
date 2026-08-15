@@ -8,6 +8,7 @@ import base64
 import mimetypes
 from channels.generic.websocket import AsyncWebsocketConsumer
 from asgiref.sync import sync_to_async
+from django.core.cache import cache   # NEW — FIX: idle-nudge flag ko reconnects ke across persist karne ke liye
 from langchain_core.messages import HumanMessage, AIMessage
 
 from apps.ai.agents.shopping_agent import run_shopping_agent
@@ -21,6 +22,7 @@ from apps.stores.models import Store
 
 MAX_HISTORY_MESSAGES = 12
 IDLE_THRESHOLD_SECONDS = 30
+IDLE_NUDGE_TTL_SECONDS = 60 * 60 * 6   # NEW — 6 ghante, ek poori chat session ke liye kaafi
 
 # NEW — FIX: raw Python exceptions (jaise "create_pending_action() missing
 # 1 required positional argument") pehle seedha customer ko chat message
@@ -29,6 +31,10 @@ IDLE_THRESHOLD_SECONDS = 30
 # hain — kabhi bhi str(e) seedha frontend ko nahi bhejte.
 logger = logging.getLogger(__name__)
 FRIENDLY_ERROR_MESSAGE = "Sorry, kuch masla ho gaya hai. Please thodi dair baad dobara koshish karein."
+
+
+def _idle_nudge_cache_key(session_key: str) -> str:   # NEW
+    return f"chat_idle_nudge_sent:{session_key}"
 
 
 class ChatConsumer(AsyncWebsocketConsumer):
@@ -64,7 +70,16 @@ class ChatConsumer(AsyncWebsocketConsumer):
         # bhi tab reset hota hai — taake "ek idle period mein sirf ek baar"
         # ka rule follow ho, lekin agli baar phir se idle hone par dobara fire ho sake.
         self.last_activity = time.monotonic()
-        self.idle_already_sent = False
+        # NEW — FIX: pehle idle_already_sent sirf is CONNECTION ke andar
+        # track hota tha (hamesha False se start) — is liye agar WebSocket
+        # kisi bhi wajah se reconnect ho jaye (network blip, Railway proxy
+        # timeout, frontend tab-switch/re-render), naya ChatConsumer
+        # instance banta tha aur idle-nudge DOBARA fire ho jata tha — isi
+        # se customer ko "kuch dhundne mein madad chahiye" wala msg
+        # baar-baar milta tha. Ab Redis mein session_key ke against
+        # persist karte hain — taake ye poori chat session mein SIRF EK
+        # BAAR aaye, chahe WebSocket beech mein kitni bhi baar reconnect ho.
+        self.idle_already_sent = bool(await sync_to_async(cache.get)(_idle_nudge_cache_key(self.session_key)))
         self.page_context = None  # frontend agar "page_context" bheje to yahan store hoga
         self.idle_task = asyncio.create_task(self._idle_watcher())
 
@@ -112,6 +127,14 @@ class ChatConsumer(AsyncWebsocketConsumer):
             message = f"Kuch aur dhoondna hai {self.page_context} ke ilawa?"
         else:
             message = "Kuch dhoondne mein madad chahiye?"
+
+        # NEW — FIX: Redis mein hamesha ke liye (session ki TTL tak) mark
+        # kar dete hain ke is session ke liye idle-nudge bheja ja chuka
+        # hai — taake reconnect hone pe bhi dobara na chale (upar connect()
+        # mein iska check dekhein).
+        await sync_to_async(cache.set)(
+            _idle_nudge_cache_key(self.session_key), True, timeout=IDLE_NUDGE_TTL_SECONDS
+        )
 
         await self.send(text_data=json.dumps({
             "type": "message",

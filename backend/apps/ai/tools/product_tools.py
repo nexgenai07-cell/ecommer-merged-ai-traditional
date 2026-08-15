@@ -94,6 +94,14 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
         for result in search_results:
             payload = result.payload
 
+            # NEW — FIX: out-of-stock products customer ko dikhana band —
+            # ye khareed hi nahi sakta, aur "Add to Cart" tap karne pe
+            # silently fail ho kar confusing recovery-message trigger
+            # karta tha ("product available nahi, ye related dekhein").
+            stock = payload.get('stock', 0) or 0
+            if not payload.get('in_stock', True) or stock <= 0:
+                continue
+
             # Price filter
             if max_price and payload.get('price', 0) > max_price:
                 continue

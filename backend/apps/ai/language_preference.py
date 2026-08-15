@@ -17,10 +17,15 @@ VALID_LANGUAGES = {'english', 'roman_urdu', 'urdu_script'}
 # Suggestion-chip label <-> internal language code — ek hi jagah maintained,
 # suggestions.py aur shopping_agent.py dono isay use karte hain taake
 # labels kabhi out-of-sync na hon.
+# NEW — FIX: pehle in labels ke aage '?' tha — jab customer chip tap karta
+# tha, yehi text uske "user message" bubble mein bhi wahi ? ke sath dikhta
+# tha. Ab '?' hata diya — detect_language_selection() neeche pehle se hi
+# '.rstrip('?')' kar ke compare karta hai, is liye matching logic par koi
+# asar nahi padega.
 LANGUAGE_CHIPS = {
-    'english':     'Wanna talk in English?',
-    'roman_urdu':  'Wanna talk in Roman Urdu?',
-    'urdu_script': 'Wanna talk in pure Urdu?',
+    'english':     'Wanna talk in English',
+    'roman_urdu':  'Wanna talk in Roman Urdu',
+    'urdu_script': 'Wanna talk in pure Urdu',
 }
 
 

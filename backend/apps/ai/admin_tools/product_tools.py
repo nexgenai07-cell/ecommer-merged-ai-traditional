@@ -11,11 +11,14 @@
 
 import random
 import string
+import logging   # NEW — FIX: list_products ke price-field diagnostic ke liye
 
 from django.contrib.auth import get_user_model   # NEW — FIX: propose_update_product ke andar current value fetch karne ke liye
 
 from apps.ai.admin_tools.api_client import call_internal_api
 from apps.ai.admin_tools.pending_actions import create_pending_action
+
+logger = logging.getLogger("ai.admin_tools.product_tools")   # NEW
 
 
 def _generate_sku(name: str) -> str:
@@ -58,10 +61,26 @@ def propose_create_product(session_key: str, user_id: int, name: str, price: flo
 
 
 def execute_create_product(user, payload: dict) -> dict:
-    """Confirm hone ke baad POST /api/v1/products/ call karta hai."""
+    """Confirm hone ke baad POST /api/v1/products/ call karta hai.
+
+    FIX — CRITICAL: create response ka shape kabhi POST wali serializer
+    ki wajah se incomplete/alag ho sakta hai (jaisa execute_update_product
+    mein PATCH ke sath dekha gaya — neeche uska comment dekhein). Isi
+    consistency ke liye, create ke turant baad bhi ek fresh GET karte
+    hain (get_product_details() reuse karke) taake image/price/stock
+    hamesha guaranteed-complete aur consistent shape mein aayein — POST
+    response ke shape par depend nahi karte."""
     result = call_internal_api(user, 'POST', '/api/v1/products/', json_body=payload)
     if not result['success']:
         return {'success': False, 'error': result['error']}
+
+    new_id = (result['data'] or {}).get('id')
+    if new_id:
+        fresh = get_product_details(user, new_id)
+        if fresh.get('success'):
+            return {'success': True, 'product': fresh['product']}
+
+    # fallback — agar fresh fetch fail ho (rare), purana POST response hi de dein
     return {'success': True, 'product': result['data']}
 
 
@@ -171,12 +190,27 @@ def propose_update_product(session_key: str, user_id: int, product_id: int, fiel
 
 
 def execute_update_product(user, payload: dict) -> dict:
-    """Confirm hone ke baad PATCH /api/v1/products/{id}/ call karta hai."""
+    """Confirm hone ke baad PATCH /api/v1/products/{id}/ call karta hai.
+
+    FIX — CRITICAL: PATCH ka response kabhi sirf CHANGED fields wapis
+    karta hai, poora product object nahi (image/full price is mein
+    missing reh jate thay) — isi wajah se confirm ke baad admin ko image
+    ghayab aur "Rs. 0" price dikhti thi, chahe DB mein update sahi ho
+    chuka ho. Ab PATCH ke turant baad ek fresh GET karte hain
+    (get_product_details() reuse karke, bilkul propose_update_product
+    jaisa live-fetch pattern) — poora, guaranteed-complete product data
+    milta hai, PATCH response ke shape pe depend nahi karte."""
     product_id = payload['product_id']
     fields = payload['fields']
     result = call_internal_api(user, 'PATCH', f'/api/v1/products/{product_id}/', json_body=fields)
     if not result['success']:
         return {'success': False, 'error': result['error']}
+
+    fresh = get_product_details(user, product_id)
+    if fresh.get('success'):
+        return {'success': True, 'product': fresh['product']}
+
+    # fallback — agar fresh fetch fail ho (rare), purana PATCH response hi de dein
     return {'success': True, 'product': result['data']}
 
 
@@ -319,12 +353,34 @@ def list_products(user, category_id: int = None, search: str = None, limit: int 
     data = result['data'] or {}
     results = data.get('results', data if isinstance(data, list) else [])
 
+    # NEW — FIX: price field ka exact naam /api/v1/products/search/ ke
+    # response mein confirm nahi tha (apps/products serializer is repo
+    # mein nahi hai) — is liye kuch common alternate naam bhi try karte
+    # hain. Agar PEHLE product mein bhi in sab keys mein se koi genuinely
+    # missing/empty nikle, ek dafa Railway logs mein raw shape likh dete
+    # hain taake asal field-naam foran maloom ho sake.
+    if results and not any(
+        results[0].get(k) not in (None, '')
+        for k in ('price', 'selling_price', 'unit_price', 'product_price')
+    ):
+        logger.warning(
+            "[list_products] price field missing/empty in search response — raw keys: %s | sample: %s",
+            list(results[0].keys()), results[0],
+        )
+
+    def _price(p):
+        for key in ('price', 'selling_price', 'unit_price', 'product_price'):
+            val = p.get(key)
+            if val not in (None, ''):
+                return val
+        return None
+
     products = [
         {
             'product_id': p.get('id'),
             'category_id': p.get('category', {}).get('id') if isinstance(p.get('category'), dict) else None,
             'name': p.get('name'),
-            'price': p.get('price'),
+            'price': _price(p),          # NEW — multi-key fallback
             'stock': p.get('stock'),
             'image': p.get('primary_image'),
         }

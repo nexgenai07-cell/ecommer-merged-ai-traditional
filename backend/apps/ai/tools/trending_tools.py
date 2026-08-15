@@ -49,7 +49,14 @@ def get_trending_products_tool(limit: int = 5) -> dict:
                 continue
             detail = get_product_details_tool(pid)
             if detail.get('success'):
-                products.append(detail['product'])
+                product = detail['product']
+                # NEW — FIX: trending mein bhi out-of-stock product dikhana
+                # band — customer khareed nahi sakta, aur "Add to Cart"
+                # tap karne pe silently fail ho jata tha.
+                stock = product.get('stock', 0) or 0
+                if not product.get('in_stock', True) or stock <= 0:
+                    continue
+                products.append(product)
 
         if not products:
             return {

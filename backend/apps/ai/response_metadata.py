@@ -4,6 +4,9 @@
 # karta hai, taake AI ke text jawab ke SATH structured metadata bhi
 # frontend ko bheja ja sake — frontend isi se product cards render karega.
 
+from collections import Counter   # NEW — FIX: dominant-category filter ke liye
+
+
 def extract_product_metadata(intermediate_steps):
     """
     Args:
@@ -90,7 +93,7 @@ def extract_product_metadata(intermediate_steps):
         # dekhein) — empty/all-irrelevant calls ignore hoti hain.
         if tool_name in ('search_products', 'get_trending_products') and isinstance(tool_output.get('products'), list):
             if not primary_search_done:
-                found_any = False
+                candidates = []
                 for p in tool_output['products']:
                     if not isinstance(p, dict):
                         continue
@@ -101,9 +104,30 @@ def extract_product_metadata(intermediate_steps):
                     score = p.get('relevance_score')
                     if score is not None and score < MIN_RELEVANCE_SCORE_FOR_METADATA:
                         continue
-                    _add_product(p)
-                    found_any = True
-                if found_any:
+                    candidates.append(p)
+
+                if candidates:
+                    # NEW — FIX: customer ki request sirf EK category ke
+                    # liye hoti hai (jaise "clothes dikhao"), lekin Qdrant
+                    # semantic search kabhi doosri categories ke products
+                    # bhi threshold se upar la deta hai (jaise saath mein
+                    # ek "bag" ya "shoes" aa jana) — jo customer ki asal
+                    # request se unrelated dikhte thay metadata cards mein.
+                    # Ab hum results mein sabse zyada common ("dominant")
+                    # category ko customer ki asal ask maante hain aur
+                    # sirf usi category ke products metadata (image cards)
+                    # mein bhejte hain — AI apne TEXT jawab mein phir bhi
+                    # doosri cheez mention/suggest kar sakta hai, bas
+                    # unki image card nahi banegi.
+                    category_counts = Counter(
+                        p.get('category_id') for p in candidates if p.get('category_id') is not None
+                    )
+                    dominant_category = category_counts.most_common(1)[0][0] if category_counts else None
+
+                    for p in candidates:
+                        if dominant_category is not None and p.get('category_id') != dominant_category:
+                            continue
+                        _add_product(p)
                     primary_search_done = True
             continue
 
