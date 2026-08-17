@@ -6,6 +6,7 @@ import time
 import asyncio
 import base64
 import mimetypes
+from decimal import Decimal   # NEW — FIX: Decimal→JSON-safe conversion ke liye
 from channels.generic.websocket import AsyncWebsocketConsumer
 from asgiref.sync import sync_to_async
 from django.core.cache import cache   # NEW — FIX: idle-nudge flag ko reconnects ke across persist karne ke liye
@@ -19,6 +20,27 @@ from apps.ai.message_sanitization import validate_message, escape_for_storage, u
 from apps.ai.ws_auth import extract_token_from_scope, is_token_expired_or_invalid
 from apps.ai.suggestions import get_initial_suggestions
 from apps.stores.models import Store
+
+
+def _json_safe(obj):
+    """NEW — CRITICAL FIX: ChatMessage.metadata (Postgres JSONField) mein
+    save karte waqt "Object of type Decimal is not JSON serializable"
+    crash aata tha — kyunke Product model se seedha aane wali price/
+    original_price jaisi fields Decimal type hoti hain, aur koi bhi tool
+    (search/cart/trending/compare, ab ya future mein) inhe bina float()
+    kiye wapis kar sakta hai. Ye poora crash silently pura AI response hi
+    girva deta tha — customer ko sahi jawab ki jagah generic "kuch masla
+    hua" error milta tha, chahe AI ne jawab sahi bana liya ho. Ab save
+    karne se THEEK PEHLE, poore metadata dict/list ko recursively scan
+    karke har Decimal ko float mein convert karte hain — chahe wo kisi
+    bhi tool se, kisi bhi depth par kyun na aaya ho."""
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    return obj
 
 MAX_HISTORY_MESSAGES = 12
 IDLE_THRESHOLD_SECONDS = 30
@@ -311,9 +333,17 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 for block in output
             ).strip()
 
+        # NEW — FIX: _json_safe() yahan lagaya — is exact jagah crash aa
+        # raha tha ("Decimal is not JSON serializable"), poora response
+        # save hone se pehle fail ho jata tha aur customer ko generic
+        # error milta tha. Ab products_metadata mein agar kahin bhi
+        # Decimal ho (kisi bhi tool se), save hone se pehle float ban
+        # jayega — crash hi nahi hoga.
+        safe_products_metadata = _json_safe(products_metadata)
+
         ai_message = ChatMessage.objects.create(
             session=chat_session, sender='ai', message=output,
-            metadata={"products": products_metadata} if products_metadata else None,
+            metadata={"products": safe_products_metadata} if safe_products_metadata else None,
         )
 
-        return output, products_metadata, suggestions, ai_message.id
+        return output, safe_products_metadata, suggestions, ai_message.id
