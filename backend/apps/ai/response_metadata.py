@@ -4,15 +4,16 @@
 # karta hai, taake AI ke text jawab ke SATH structured metadata bhi
 # frontend ko bheja ja sake — frontend isi se product cards render karega.
 
-from collections import Counter   # NEW — FIX: dominant-category filter ke liye
 
-
-def extract_product_metadata(intermediate_steps):
+def extract_product_metadata(intermediate_steps, output_text=""):
     """
     Args:
         intermediate_steps: AgentExecutor se milne wali list of
             (AgentAction, tool_output) tuples — tool_output hamesha
             hamare tools ka dict return value hota hai.
+        output_text: AI ke FINAL text jawab ka poora string (result["output"]).
+            NEW — metadata ko is text ke sath align karne ke liye chahiye
+            (neeche dekhein).
 
     Returns:
         List of dicts, har ek mein kam az kam product_id aur category_id
@@ -47,6 +48,7 @@ def extract_product_metadata(intermediate_steps):
     products = []
     seen_ids = set()
     primary_search_done = False   # NEW — sirf pehli search_products/get_trending_products call ke products lene hain
+    output_lower = (output_text or "").lower()   # NEW
 
     # NEW — FIX: Qdrant ka search_products_tool score_threshold=0.3 pe filter
     # karta hai, jo customer ki ASAL request se bilkul unrelated products bhi
@@ -107,27 +109,43 @@ def extract_product_metadata(intermediate_steps):
                     candidates.append(p)
 
                 if candidates:
-                    # NEW — FIX: customer ki request sirf EK category ke
-                    # liye hoti hai (jaise "clothes dikhao"), lekin Qdrant
-                    # semantic search kabhi doosri categories ke products
-                    # bhi threshold se upar la deta hai (jaise saath mein
-                    # ek "bag" ya "shoes" aa jana) — jo customer ki asal
-                    # request se unrelated dikhte thay metadata cards mein.
-                    # Ab hum results mein sabse zyada common ("dominant")
-                    # category ko customer ki asal ask maante hain aur
-                    # sirf usi category ke products metadata (image cards)
-                    # mein bhejte hain — AI apne TEXT jawab mein phir bhi
-                    # doosri cheez mention/suggest kar sakta hai, bas
-                    # unki image card nahi banegi.
-                    category_counts = Counter(
-                        p.get('category_id') for p in candidates if p.get('category_id') is not None
-                    )
-                    dominant_category = category_counts.most_common(1)[0][0] if category_counts else None
-
+                    # NEW — FIX (v2): pehle yahan "dominant category" wala
+                    # heuristic tha — jo results mein sabse common
+                    # category_id chunta tha aur baaki sab category_id
+                    # products drop kar deta tha. Ye 2 tarah se galat nikla:
+                    # (1) DB mein duplicate/similar categories hain (jaise
+                    # "Women clothing" id=42 aur "women's clothing" id=45
+                    # dono alag rows) — is se Gloves aur Dress jaise dono
+                    # genuinely relevant products ALAG category_id ke sath
+                    # count hote thay, aur sirf 1 survive karta tha, chahe
+                    # AI ne TEXT mein teeno (Gloves/Dress/Joggers) describe
+                    # kiye hon. (2) agar customer "home accessories" jaisi
+                    # cheez maange jo exist hi nahi karti, AI text mein
+                    # kabhi "iPhone – Electronics" jaisi bilkul unrelated
+                    # cheez bhi mention kar deta — us waqt bhi wahi "iPhone"
+                    # ki category dominant ban kar sirf usay dikhati thi.
+                    #
+                    # Ab hum metadata ko seedha AI ke TEXT JAWAB se align
+                    # karte hain: jis candidate ka NAAM (case-insensitive)
+                    # AI ke final text mein genuinely mention hua hai, sirf
+                    # wahi metadata (image card) mein jayega. Isse text aur
+                    # cards HAMESHA exactly sync mein rehte hain — jitne
+                    # products AI ne baat ki hai utne hi cards, na kam na
+                    # zyada — chahe wo 1 category ke hon ya 3.
+                    matched_any = False
                     for p in candidates:
-                        if dominant_category is not None and p.get('category_id') != dominant_category:
-                            continue
-                        _add_product(p)
+                        name = (p.get('name') or '').strip()
+                        if name and name.lower() in output_lower:
+                            _add_product(p)
+                            matched_any = True
+
+                    # Fallback — agar text-match kisi wajah se kuch bhi
+                    # match na kar paye (jaise AI ne product ka naam
+                    # thoda alag likha ho), to metadata bilkul khali
+                    # rehne se behtar hai sab relevant candidates dikha dena.
+                    if not matched_any:
+                        for p in candidates:
+                            _add_product(p)
                     primary_search_done = True
             continue
 

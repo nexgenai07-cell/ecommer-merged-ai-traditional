@@ -129,6 +129,9 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
             candidate_ids, list(live_map.keys()),
         )
 
+        products = []
+        products_without_category_filter = []   # NEW — fallback ke liye
+
         for result in search_results:
             payload = result.payload
             pid = payload.get('product_id')
@@ -159,21 +162,7 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
 
             category_name = live.category.name if live.category else None
 
-            # NEW — FIX: pehle EXACT string match tha (category_name.lower()
-            # != category.lower()) — agar LLM ne "Kitchen" bheja lekin DB
-            # mein category ka asal naam "Kitchen & Dining" ya "Home &
-            # Kitchen" hai, to ye EXACT match fail ho jata aur sab results
-            # (jo Qdrant ki semantic search ke hisab se already relevant
-            # thay) silently ud jate thay — is se genuinely available
-            # product bhi "not available" dikhta tha. Ab substring-based
-            # (dono taraf) match karte hain — zyada forgiving, kam false-negatives.
-            if category:
-                cat_l = category.lower().strip()
-                name_l = (category_name or '').lower().strip()
-                if not name_l or (cat_l not in name_l and name_l not in cat_l):
-                    continue
-
-            products.append({
+            product_dict = {
                 'product_id':      live.id,
                 'name':             live.name,
                 'category':         category_name,
@@ -189,10 +178,45 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
                 # (jo asal bug tha) se bohot chhota risk hai.
                 'image':            payload.get('image'),
                 'relevance_score':  round(result.score, 3),
-            })
+            }
+
+            if len(products_without_category_filter) < limit:
+                products_without_category_filter.append(product_dict)
+
+            # NEW — FIX: pehle EXACT string match tha (category_name.lower()
+            # != category.lower()) — agar LLM ne "Kitchen" bheja lekin DB
+            # mein category ka asal naam "Kitchen & Dining" ya "Home &
+            # Kitchen" hai, to ye EXACT match fail ho jata aur sab results
+            # (jo Qdrant ki semantic search ke hisab se already relevant
+            # thay) silently ud jate thay — is se genuinely available
+            # product bhi "not available" dikhta tha. Ab substring-based
+            # (dono taraf) match karte hain — zyada forgiving, kam false-negatives.
+            if category:
+                cat_l = category.lower().strip()
+                name_l = (category_name or '').lower().strip()
+                if not name_l or (cat_l not in name_l and name_l not in cat_l):
+                    continue
+
+            products.append(product_dict)
 
             if len(products) >= limit:
                 break
+
+        # NEW — FIX: agar category filter ki wajah se list bilkul KHALI ho
+        # gayi ho (jaise LLM ne category="shoes"/"footwear" bheja jo
+        # hamari DB mein exist hi nahi karti, is liye koi bhi category
+        # match nahi hui), lekin semantic search ne otherwise RELEVANT
+        # products diye thay (jaise "shoes" ke liye "joggers") — to
+        # bilkul khali list dene ke bajaye un unfiltered-but-relevant
+        # results wapis karte hain. Agent phir khud decide karega ke ye
+        # exact match nahi lekin ek reasonable alternative hai (system
+        # prompt rule 1 isay explicitly is tarah handle karne ko kehta hai).
+        if category and not products and products_without_category_filter:
+            logger.warning(
+                "[search_products_tool] category=%r filtered everything out — falling back to %d unfiltered relevant result(s)",
+                category, len(products_without_category_filter),
+            )
+            products = products_without_category_filter
 
         # FLOW: ye poora dict wapis registry.py ke tool function ko jata
         # hai, phir LangChain Agent ko, jo isay dekh kar natural jawab likhta hai
