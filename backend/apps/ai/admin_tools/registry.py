@@ -229,8 +229,11 @@ def get_admin_operations_tools(session_key: str, user):
 
     @tool
     def update_order(order_id: str, fields: dict) -> dict:
-        """Update an order's status/tracking_number. MUTATING — requires confirmation."""
-        return _track(propose_update_order(session_key, user.id, order_id, fields))
+        """Update an order's status/tracking_number. MUTATING — requires confirmation.
+        Moving status to 'processing'/'shipped'/'delivered' will be blocked if
+        the order's payment is still pending — tell the admin plainly if that happens,
+        do not retry or invent a workaround."""
+        return _track(propose_update_order(session_key, user, order_id, fields))
 
     @tool
     def cancel_order(order_id: str, reason: Optional[str] = "") -> dict:

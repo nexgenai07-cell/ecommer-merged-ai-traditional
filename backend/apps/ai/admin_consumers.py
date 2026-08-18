@@ -21,6 +21,60 @@ MAX_HISTORY_MESSAGES = 12
 logger = logging.getLogger(__name__)
 FRIENDLY_ERROR_MESSAGE = "Sorry, kuch masla ho gaya hai. Please thodi dair baad dobara koshish karein."
 
+# NEW — CRITICAL FIX: production mein dekha gaya ke agent kabhi kabhi
+# (weaker fallback model ke sath) ussi turn mein propose_* ke turant baad
+# khud hi confirm_pending_action bhi call kar deta hai (jo prompt rule 5
+# "NEVER call confirm_pending_action speculatively" ki violation hai).
+# registry.py ka `created_this_turn` guard is confirm ko rok deta hai
+# (theek hai), lekin model us internal guard-error ko ("...could not be
+# processed...") seedha admin ko sunata dikha deta tha — confusing. Isi
+# tarah, jab admin baad mein "haan" kehta, model kabhi wahi preview text
+# DOBARA likh deta (bina real confirm_pending_action call kiye) — jo bhi
+# thora alag/inconsistent ho sakta tha.
+#
+# Fix: jab bhi is turn ka metadata mein ek REAL pending_action ho (matlab
+# koi propose_* tool actually chala aur ek asal action_id bana), hum
+# admin ko HAMESHA ek clean, deterministic preview khud (Python se)
+# render karte hain seedha pending_action['preview'] dict se — model ke
+# apne freeform text ko is case mein ignore kar dete hain. Isse preview
+# hamesha us EXACT action_id se guaranteed match karta hai jo confirm
+# hoga, aur koi bhi internal error-text kabhi admin tak nahi pahunchta.
+_ACTION_TYPE_LABELS = {
+    'create_product': 'Naya product create karne ka preview',
+    'update_product': 'Product update karne ka preview',
+    'delete_product': 'Product delete karne ka preview',
+    'create_category': 'Nayi category create karne ka preview',
+    'update_category': 'Category update karne ka preview',
+    'delete_category': 'Category delete karne ka preview',
+    'update_inventory': 'Stock update karne ka preview',
+    'update_order': 'Order status update karne ka preview',
+    'cancel_order': 'Order cancel karne ka preview',
+}
+
+
+def _render_pending_action_preview(pending_action: dict) -> str:
+    preview = pending_action.get('preview') or {}
+    action_type = pending_action.get('action_type')
+    lines = [_ACTION_TYPE_LABELS.get(action_type, 'Is action ka preview') + ':', '']
+
+    def _fmt_key(k):
+        return k.replace('_', ' ').title()
+
+    for key, value in preview.items():
+        if key == 'action':
+            continue
+        if key == 'fields' and isinstance(value, dict):
+            for fk, fv in value.items():
+                lines.append(f"- {_fmt_key(fk)} → {fv}")
+        elif key == 'note':
+            lines.append(f"\n({value})")
+        elif value not in (None, ''):
+            lines.append(f"- {_fmt_key(key)}: {value}")
+
+    lines.append('')
+    lines.append('Confirm karen? (haan/nahi)')
+    return '\n'.join(lines)
+
 
 class AdminChatConsumer(AsyncWebsocketConsumer):
 
@@ -303,10 +357,21 @@ class AdminChatConsumer(AsyncWebsocketConsumer):
         # LEKIN metadata mein koi real pending_action nahi hai, to is
         # misleading response ko ek honest, clear message se replace kar
         # dete hain — taake admin confuse na ho ke kya asal mein hua.
+        real_pending_action = (metadata or {}).get('pending_action')
+        if real_pending_action:
+            # NEW — FIX: real pending_action mila hai — model ka apna
+            # freeform output ignore karke hamesha ye clean, deterministic
+            # preview dikhate hain (upar _render_pending_action_preview
+            # dekhein). Isse "confirmation could not be processed..."
+            # jaisa internal-guard error, ya koi bhi inconsistent/dobara
+            # likha preview, kabhi admin ko nahi dikhega.
+            output = _render_pending_action_preview(real_pending_action)
+            suggestions = suggestions or ["Confirm karo", "Cancel karo"]
+
         looks_like_fake_preview = (
-            re.search(r'confirm\s*karen\?\s*\(?\s*haan', output, re.IGNORECASE)
+            not real_pending_action
+            and re.search(r'confirm\s*karen\?\s*\(?\s*haan', output, re.IGNORECASE)
             and ('preview' in output.lower() or '→' in output or '->' in output)
-            and not (metadata or {}).get('pending_action')
         )
         if looks_like_fake_preview:
             logger.warning(

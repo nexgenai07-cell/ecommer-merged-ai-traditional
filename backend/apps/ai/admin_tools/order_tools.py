@@ -28,7 +28,15 @@ def get_order_details(user, order_id: str) -> dict:
     return {'success': True, 'order': results[0]}
 
 
-def propose_update_order(session_key: str,user_id: int, order_id: str, fields: dict) -> dict:
+"""FLOW: propose_update_order ke payment-gate check ke liye — 'processing'/
+'shipped'/'delivered' jaisi status sirf tab propose hoti hai jab order
+'pending_payment' state mein na ho. get_order_details() (isi file mein
+neeche) reuse karte hain — ek alag HTTP round-trip nahi, order_tools.py
+ke andar hi function-call hai."""
+PAYMENT_REQUIRED_STATUSES = {'processing', 'shipped', 'delivered'}
+
+
+def propose_update_order(session_key: str, user, order_id: str, fields: dict) -> dict:
     """FLOW: preview banata hai — sirf 'status'/'tracking_number' allow karta hai"""
     """
     Order update ka preview. Backend endpoint (AdminOrderStatusUpdateView)
@@ -40,6 +48,33 @@ def propose_update_order(session_key: str,user_id: int, order_id: str, fields: d
     filtered_fields = {k: v for k, v in fields.items() if k in allowed_fields}
     ignored_fields = set(fields.keys()) - allowed_fields
 
+    # NEW — CRITICAL FIX: pehle koi payment-status check nahi tha — admin
+    # order ko 'processing'/'shipped'/'delivered' mein move karne ka
+    # preview maang sakta tha chahe order abhi tak 'pending_payment' state
+    # mein ho (customer ne payment abhi ki hi na ho). Ab preview banane se
+    # PEHLE hi current order fetch karke check karte hain — agar order
+    # abhi bhi pending_payment hai aur requested status payment maangti
+    # hai, to preview banaye bina hi saaf error de dete hain (koi
+    # pending_action create nahi hoti, is liye "Confirm karen?" kabhi
+    # dikhta hi nahi is case mein).
+    new_status = filtered_fields.get('status')
+    if new_status in PAYMENT_REQUIRED_STATUSES:
+        current = get_order_details(user, order_id)
+        if not current['success']:
+            return {'success': False, 'error': current['error']}
+        current_status = (current['order'] or {}).get('status')
+        if current_status == 'pending_payment':
+            return {
+                'success': False,
+                'error': (
+                    f"Order {order_id} ki payment abhi tak nahi hui hai (status: "
+                    f"pending_payment) — is liye ise '{new_status}' mein move nahi "
+                    f"kiya ja sakta. Customer ke payment complete karne ke baad hi "
+                    f"status update ho sakega."
+                ),
+            }
+
+    user_id = user.id
     preview = {
         'action': 'update_order',
         'order_id': order_id,
