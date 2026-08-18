@@ -460,6 +460,7 @@ class ReactivateRequestView(APIView):
                 "message": "If this account exists and is deactivated, a reactivation link has been sent to your email."
             }
         )
+        
 # Confirms a reactivation token and restores the account.
 class ReactivateConfirmView(APIView):
     permission_classes = [permissions.AllowAny]
