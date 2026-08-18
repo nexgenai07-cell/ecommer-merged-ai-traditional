@@ -5,9 +5,7 @@
 # koi HTTP call nahi) — kyunke ye AI agent usi Django process ke andar
 # chal raha hai jahan models available hain.
 
-import logging   # NEW — payment-link generation ke errors log karne ke liye
 from decimal import Decimal
-from django.conf import settings   # NEW — STRIPE_SECRET_KEY / FRONTEND_URL ke liye
 from django.db import transaction
 from langchain_core.tools import tool
 
@@ -17,8 +15,6 @@ from apps.stores.models import Store
 from apps.orders.models import Customer, Order, OrderItem, Payment      # FLOW → order database tables
 from apps.orders.views import generate_order_number
 from typing import Optional
-
-logger = logging.getLogger("ai.tools.cart_order_tools")   # NEW
 
 def _get_or_create_cart(user, session_key):
     store = Store.objects.first()
@@ -344,87 +340,15 @@ def get_cart_order_tools(session_key: str, user=None):
 
         return result
 
-    # NEW — CRITICAL FEATURE: is se pehle koi tool nahi tha jo REAL payment
-    # link bana sake — system prompt explicitly AI ko mana karta tha ke wo
-    # khud koi link INVENT na kare (jo sahi tha, fake link se customer ka
-    # trust tootta). Ab ye tool asal Stripe Checkout Session banata hai.
-    #
-    # ⚠️ ASSUMPTIONS FLAG — ye poora tool kuch cheezon ko assume karta hai
-    # jo is `ai` app ke zip mein confirm nahi ho saki (Stripe integration
-    # kahin aur, jaise apps/orders ya apps/payments mein ho sakti hai):
-    #   1. `stripe` Python package installed hai (`pip install stripe`)
-    #   2. settings.STRIPE_SECRET_KEY naam ki setting exist karti hai
-    #   3. settings.FRONTEND_URL naam ki setting exist karti hai (agar
-    #      nahi to neeche wala fallback URL istemal hoga — apna asal
-    #      frontend domain confirm kar lena)
-    #   4. Payment model mein 'stripe_session_id' field hai (agar nahi
-    #      hai, koi crash nahi hoga — bas wo field silently skip ho
-    #      jayegi, try/except se guarded hai)
-    #   5. Cart currency PKR hai aur tumhara Stripe account PKR accept
-    #      karta hai
-    # Agar in mein se koi assumption galat nikle, mujhe apps/orders ya
-    # apps/payments ka relevant code bhej dena — main exact fix de dungi.
-    @tool
-    def generate_payment_link(order_number: str) -> dict:
-        """Generate a REAL, working Stripe Checkout payment link for an
-        existing order that's pending payment. Use this right after an
-        order is placed, or whenever the customer asks how to pay / asks
-        for a payment link. order_number is REQUIRED. Customer must be
-        logged in and the order must belong to them."""
-        if not order_number:
-            return {'success': False, 'error': 'order_number is required. Ask the customer for their order number.'}
-
-        if user is None or not user.is_authenticated:
-            return {'success': False, 'error': 'Customer is not logged in. Ask them to log in first before generating a payment link.'}
-
-        try:
-            order = Order.objects.select_related('payment').get(order_number=order_number, customer__user=user)
-        except Order.DoesNotExist:
-            return {'success': False, 'error': 'Order not found.'}
-
-        if hasattr(order, 'payment') and order.payment.status == 'paid':
-            return {'success': False, 'error': 'This order has already been paid for.'}
-
-        try:
-            import stripe   # NEW — local import taake package na hone ki soorat mein sirf isi tool ka istemal fail ho, poori file nahi
-            stripe.api_key = settings.STRIPE_SECRET_KEY
-
-            frontend_url = getattr(settings, 'FRONTEND_URL', 'https://ecommerce-frontend-n7h2.vercel.app').rstrip('/')
-
-            session = stripe.checkout.Session.create(
-                mode='payment',
-                payment_method_types=['card'],
-                line_items=[{
-                    'price_data': {
-                        'currency': 'pkr',
-                        'product_data': {'name': f'Order {order.order_number}'},
-                        'unit_amount': int(round(float(order.total_amount) * 100)),  # Stripe smallest-unit (paisa) mein leta hai
-                    },
-                    'quantity': 1,
-                }],
-                success_url=f'{frontend_url}/orders/{order.order_number}?payment=success',
-                cancel_url=f'{frontend_url}/orders/{order.order_number}?payment=cancelled',
-                metadata={'order_number': order.order_number},
-            )
-
-            # NEW — session id save karna optional hai, agar field exist
-            # nahi karti to silently skip (guarded, crash nahi hoga)
-            try:
-                if hasattr(order, 'payment') and hasattr(order.payment, 'stripe_session_id'):
-                    order.payment.stripe_session_id = session.id
-                    order.payment.save(update_fields=['stripe_session_id'])
-            except Exception:
-                logger.exception("[generate_payment_link] couldn't save stripe_session_id for order=%s (non-fatal)", order_number)
-
-            return {
-                'success': True,
-                'payment_url': session.url,
-                'order_number': order.order_number,
-                'amount': float(order.total_amount),
-            }
-        except Exception as e:
-            logger.exception("[generate_payment_link] failed for order=%s", order_number)
-            return {'success': False, 'error': f'Could not generate payment link right now: {str(e)}'}
+    # REMOVED — CRITICAL: generate_payment_link tool yahan tha (Stripe
+    # Checkout Session banata tha), lekin production mein iski payment ke
+    # baad success_url localhost:5173 (dev URL) pe redirect kar rahi thi
+    # jo deployed site pe kaam nahi karti — customer ko "connection
+    # refused" error milta tha payment ke baad, aur agent kabhi kabhi
+    # confusing "confirmation" loop mein bhi phans jata tha. User ke
+    # explicit request par is poore feature ko wapis hata diya gaya hai —
+    # ab chatbot sirf payment karne ke STEPS batata hai (dekhein
+    # shopping_agent.py ka rule 11), koi link generate nahi karta.
 
     @tool
     def track_order(order_number: str) -> dict:
@@ -509,5 +433,5 @@ def get_cart_order_tools(session_key: str, user=None):
 
     return [
         add_to_cart, get_cart, get_wishlist, add_to_wishlist, remove_from_wishlist,
-        create_order, list_my_orders, track_order, cancel_order, generate_payment_link,
+        create_order, list_my_orders, track_order, cancel_order,
     ]

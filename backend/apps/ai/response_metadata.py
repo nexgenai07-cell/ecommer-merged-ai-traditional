@@ -157,8 +157,20 @@ def extract_product_metadata(intermediate_steps, output_text=""):
                     _add_product(p)
             continue
 
-        # add_to_cart — single product (explicit customer action, hamesha shamil)
-        if 'product_id' in tool_output:
+        # add_to_cart / add_to_wishlist / remove_from_wishlist — single
+        # product, explicit customer action, hamesha shamil karte hain.
+        #
+        # FIX — CRITICAL: pehle ye check HAR tool_output pe lagta tha jisme
+        # 'product_id' key ho — lekin get_product_details bhi 'product_id'
+        # return karta hai, aur agent kabhi ek product action ke doraan
+        # KISI AUR product ke liye bhi get_product_details call kar leta
+        # hai (jaise verification/comparison ke liye). Isi wajah se jaise
+        # "iPhone 17 wishlist mein add karo" bolne par, agent ne agar
+        # beech mein "iPhone 15" ka bhi details check kiya (kisi wajah se),
+        # to DONO metadata mein aa jate thay — sirf jo genuinely add hua
+        # tha wo nahi, balke dono. Ab sirf in EXPLICIT single-product
+        # customer-action tools ka output hi metadata mein jata hai.
+        if tool_name in ('add_to_cart', 'add_to_wishlist', 'remove_from_wishlist') and 'product_id' in tool_output:
             _add_product(tool_output)
 
         # create_order — items list (product_id/category_id per item)
