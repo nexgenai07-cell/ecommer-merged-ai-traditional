@@ -343,7 +343,7 @@ def get_product_details(user, product_id: int) -> dict:
     }
 
 
-def list_products(user, category_id: int = None, search: str = None, limit: int = 20) -> dict:
+def list_products(user, category_id: int = None, search: str = None, limit: int = 50) -> dict:
     """
     Read-only. Products list karta hai (optional category/search filter ke sath).
     GET /api/v1/products/search/ use karta hai — admin authenticated hone ki
@@ -356,12 +356,42 @@ def list_products(user, category_id: int = None, search: str = None, limit: int 
     if search:
         params['q'] = search
 
-    result = call_internal_api(user, 'GET', '/api/v1/products/search/', params=params)
-    if not result['success']:
-        return {'success': False, 'error': result['error'], 'products': []}
+    # NEW — CRITICAL FIX: DRF ka ListAPIView aksar default PAGE_SIZE (jaise
+    # 10) ke sath paginate karta hai — pehle ye function sirf FIRST PAGE ka
+    # 'results' leta tha aur 'next' page ko kabhi follow nahi karta tha. Isi
+    # wajah se agar store mein 10 se zyada products hon (out-of-stock,
+    # inactive, ya koi bhi extra product), wo silently missing dikhte thay
+    # — "Total found: 10" aata tha jab ke asal mein zyada products maujood
+    # thay. Ab hum page-by-page sab results collect karte hain jab tak
+    # 'next' na mile ya humara apna `limit` cap na aa jaye.
+    all_results = []
+    page = 1
+    while True:
+        page_params = dict(params)
+        page_params['page'] = page
+        result = call_internal_api(user, 'GET', '/api/v1/products/search/', params=page_params)
+        if not result['success']:
+            if page == 1:
+                return {'success': False, 'error': result['error'], 'products': []}
+            break   # baad ke page mein fail ho to jo ab tak mila wahi de dein, poora crash na ho
 
-    data = result['data'] or {}
-    results = data.get('results', data if isinstance(data, list) else [])
+        data = result['data'] or {}
+
+        if isinstance(data, list):
+            # API paginate hi nahi karti — sab ek hi list mein aata hai
+            all_results.extend(data)
+            break
+
+        page_results = data.get('results', [])
+        all_results.extend(page_results)
+
+        if not data.get('next') or not page_results or len(all_results) >= limit:
+            break
+        page += 1
+        if page > 20:   # safety cap — infinite loop se bachne ke liye
+            break
+
+    results = all_results
 
     # NEW — FIX: price field ka exact naam /api/v1/products/search/ ke
     # response mein confirm nahi tha (apps/products serializer is repo
@@ -392,9 +422,16 @@ def list_products(user, category_id: int = None, search: str = None, limit: int 
             'name': p.get('name'),
             'price': _price(p),          # NEW — multi-key fallback
             'stock': p.get('stock'),
+            'is_active': p.get('is_active'),   # NEW — admin ko active/inactive dikhna chahiye
             'image': p.get('primary_image'),
         }
         for p in results[:limit]
     ]
+
+    # NEW — DIAGNOSTIC
+    logger.warning(
+        "[list_products] pages_fetched=%d total_collected=%d returned=%d",
+        page, len(all_results), len(products),
+    )
 
     return {'success': True, 'products': products, 'total_found': len(products)}

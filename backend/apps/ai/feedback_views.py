@@ -35,6 +35,19 @@ def _normalize_rating(raw):
 
 
 class MessageFeedbackView(ChatAuthErrorMixin, APIView):
+    # NEW — CRITICAL FIX: agar Django REST Framework ki
+    # DEFAULT_AUTHENTICATION_CLASSES mein SessionAuthentication shamil hai
+    # (bohot common default), to wo AllowAny permission ke bawajood bhi
+    # POST/DELETE requests par CSRF token maangti hai — aur ek anonymous
+    # ya guest customer ka browser fetch() call generally CSRF header
+    # nahi bhejta (khaaskar jab chat widget ka WebSocket flow separate
+    # hai aur CSRF cookie kabhi set hi nahi hui). Result: 403 "CSRF
+    # Failed", jo frontend ko "Couldn't save your feedback" generic error
+    # ke tor pe dikhta hai — chahe rating value bilkul sahi ho. Is view
+    # ke liye authentication zaroori nahi hai (feedback anonymous bhi ho
+    # sakti hai), is liye authentication_classes ko khali kar ke CSRF
+    # check hi bypass kar dete hain.
+    authentication_classes = []
     permission_classes = [permissions.AllowAny]
     throttle_classes = [ChatUserRateThrottle, ChatAnonRateThrottle]
 
@@ -64,9 +77,15 @@ class MessageFeedbackView(ChatAuthErrorMixin, APIView):
             )
             return Response({'error': 'Feedback can only be given on AI messages.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        message.rating = rating
-        message.rated_at = timezone.now()
-        message.save(update_fields=['rating', 'rated_at'])
+        try:
+            message.rating = rating
+            message.rated_at = timezone.now()
+            message.save(update_fields=['rating', 'rated_at'])
+        except Exception:
+            # NEW — DIAGNOSTIC: agar save() hi kisi wajah se fail ho
+            # (jaise DB constraint), poori traceback log mein aayegi
+            logger.exception("[MessageFeedbackView] failed to save rating for message_id=%s", message_id)
+            return Response({'error': 'Could not save feedback right now.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         return Response({'message_id': message.id, 'rating': rating}, status=status.HTTP_200_OK)
 
