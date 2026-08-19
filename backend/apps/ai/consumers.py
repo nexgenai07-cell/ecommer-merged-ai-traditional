@@ -64,6 +64,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         self.session_key = self.scope['url_route']['kwargs']['session_key']
 
+        # DEBUG — session_key mix-up track karne ke liye (customer bot)
+        print(f"[CUSTOMER-BOT][CONNECT] session_key={self.session_key}")
+
         session_valid = await self.check_session_not_deleted()
         if not session_valid:
             await self.close(code=4404)
@@ -185,6 +188,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
         except (json.JSONDecodeError, TypeError):
             await self.send(text_data=json.dumps({"type": "error", "message": "Invalid message format — expected JSON."}, ensure_ascii=False))
             return
+
+        # DEBUG — session_key mix-up track karne ke liye (customer bot)
+        print(f"[CUSTOMER-BOT][MESSAGE] session_key={self.session_key} message={data.get('message', '')!r}")
 
         # FIX: customer ne chat mein kuch bhej diya — idle proactive-nudge
         # sirf connect ke baad, PEHLE message se pehle wali khamoshi ke liye

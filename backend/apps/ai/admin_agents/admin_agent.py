@@ -1,44 +1,60 @@
-# PATH: apps/ai/admin_agents/admin_agent.py
+# ==============================================================================
+# FILE PATH: apps/ai/admin_agents/admin_agent.py
+# PURPOSE: Admin AI Chatbot Agent jo Dashboard ke tasks (Products, Inventory, 
+#          Orders, Analytics) ko handle karta hai.
+# ==============================================================================
 
-# FLOW: admin_consumers.py se yahan aata hai. Customer wale
-# shopping_agent.py jaisa hi pattern hai (LLM + tools + fallback),
-# FARQ: tools apps/ai/admin_tools/registry.py se aate hain (product +
-# category + inventory + order + analytics — sab ek sath).
-
+# Django project ke central settings (e.g. API Keys, DEBUG mode) import kar rahe hain
 from django.conf import settings
-import logging   # NEW — diagnostic logging: konsa model jawab de raha hai, tool call hua ya nahi
-from langchain_openai import ChatOpenAI   # CHANGED — primary model ab NVIDIA (OpenAI-compatible) hai
+
+# System backend logs print karne ke liye python logger import kar rahe hain
+import logging 
+
+# LangChain library se OpenAI-compatible interface import kar rahe hain (NVIDIA models chalane ke liye)
+from langchain_openai import ChatOpenAI 
+
+# Groq platform ke LLM models chalane ke liye LangChain wrapper
 from langchain_groq import ChatGroq
+
+# LangChain Agent Executor aur Tool-calling Agent builder import kar rahe hain
 from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
+
+# AI Prompt structure aur history/scratchpad placeholders ke liye classes import kar rahe hain
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
-from apps.ai.admin_tools.registry import get_admin_agent_tools      # FLOW → apps/ai/admin_tools/registry.py
-from apps.ai.admin_tools.analytics_tools import detect_date_range_hint   # NEW — FIX: deterministic date_range detection
-from apps.ai.gemini_utils import call_with_model_fallback    # FLOW → apps/ai/gemini_utils.py (LLM chain ke liye — Gemini key rotation wala call_with_fallback NAHI, wo sirf embeddings ke liye hai)
+# Admin ke tamam tools (Product, Category, Order, Analytics) fetch karne ka registry function
+from apps.ai.admin_tools.registry import get_admin_agent_tools 
 
-logger = logging.getLogger("ai.admin_agent")   # NEW
+# Admin input se date range (e.g., 'today', 'last_7_days') automatically detect karne ka helper
+from apps.ai.admin_tools.analytics_tools import detect_date_range_hint 
 
-# NEW — FIX: admin_agent.py mein pehle koi language/script handling nahi
-# thi (shopping_agent.py mein hai). Isi wajah se fallback/weaker models
-# kabhi Urdu (Hindi/Devanagari) script mein jawab de dete thay chahe admin
-# ne poora message Latin/Roman letters mein likha ho. Yahan hum sirf
-# CURRENT message ka script deterministically detect karte hain (chip-based
-# sticky preference ki zaroorat nahi — admin dashboard mein language-chip UI
-# hai hi nahi) aur ek concrete per-turn instruction banate hain — bilkul
-# wahi pattern jo shopping_agent.py mein date/pending-action hints ke liye
-# use hota hai (LLM se "khud detect karo" kehne ke bajaye Python khud
-# detect kar ke deta hai, jo reliable hai).
-import re   # NEW
-_URDU_SCRIPT_PATTERN = re.compile(r'[\u0600-\u06FF\u0750-\u077F]')  # Arabic + Arabic Supplement blocks
+# Models retry/fallback handling function (Agar primary model fail ho to next model try karta hai)
+from apps.ai.gemini_utils import call_with_model_fallback 
+
+# Is specific file ke liye diagnostic logger initialize kar rahe hain
+logger = logging.getLogger("ai.admin_agent") 
+
+# Regular Expressions import kar rahe hain taake Urdu/Arabic characters match kar sakein
+import re 
+
+# Urdu aur Arabic Unicode character ranges ko regular expression mein compile kar rahe hain
+_URDU_SCRIPT_PATTERN = re.compile(r'[\u0600-\u06FF\u0750-\u077F]')
 
 
 def _detect_admin_language_hint(text: str) -> str:
-    """Current admin message ke script ke hisab se is turn ke liye reply-language instruction banata hai."""
+    """
+    KISI USER INPUT KA SCRIPT DETECT KARTA HAI:
+    - Agar input mein Urdu/Arabic characters hain -> AI Urdu Script mein reply karega.
+    - Agar input English/Roman Urdu mein hai -> AI Latin/Roman script mein reply karega.
+    """
+    # Check kar rahe hain ke text exist karta hai aur usme Urdu characters hain ya nahi
     if text and _URDU_SCRIPT_PATTERN.search(text):
         return (
             "The admin's CURRENT message is written in Urdu (Arabic) script. "
             "Reply in Urdu script only."
         )
+    
+    # Agar Urdu characters nahi milte to Latin/Roman script ka instruction return karte hain
     return (
         "The admin's CURRENT message is written in Latin/Roman script (English "
         "letters), NOT Urdu (Arabic) script and NOT Hindi (Devanagari) script — "
@@ -50,6 +66,7 @@ def _detect_admin_language_hint(text: str) -> str:
     )
 
 
+# SYSTEM_PROMPT: AI Agent ki personality, rules, aur operational limits set karta hai
 SYSTEM_PROMPT = """You are the Admin Assistant for an e-commerce platform's dashboard. You help
 the admin with TWO kinds of tasks ONLY:
 
@@ -259,14 +276,11 @@ right one.
 Be precise and professional. Always show exact numbers (prices, quantities, IDs). If a
 request is ambiguous, ask a clarifying question instead of guessing."""
 
+
 def _format_date_range_hint(hint):
     """
-    FLOW: run_admin_agent() detect_date_range_hint() se milne wale
-    result (ya None) ko is turn ke liye ek concrete, unambiguous
-    instruction mein badalta hai — taake model ko khud enum se
-    "guess"/"map" na karna pade, jo Railway logs ke mutabiq reliably
-    nahi ho pa raha tha (primary model ne "last year" ko galti se
-    'last_week' bhej diya tha).
+    DETECTION HELPER FOR DATE RANGES:
+    detect_date_range_hint() se mile string ko AI Prompt ke liye clear English instruction mein convert karta hai.
     """
     if hint:
         return (
@@ -288,15 +302,9 @@ def _format_date_range_hint(hint):
 
 def _format_pending_action_hint(hint):
     """
-    FLOW: admin_consumers.py se milta hai. Wahan Python code deterministically
-    (LLM se nahi) check karta hai ke sabse recent AI turn ka pending_action
-    abhi tak resolve/expire to nahi hua (pending_actions cache se verify
-    karke). Ye function us result (dict ya None) ko is turn ke liye ek
-    concrete, unambiguous instruction mein badalta hai — same pattern jo
-    date_range ke liye upar (_format_date_range_hint) use ho raha hai,
-    kyunke LLM se free text (chat_history) mein se UUID "dhoondhna" ya
-    "yaad rakhna" reliable nahi tha, khaaskar fallback chain ke weaker
-    models ke sath (Groq llama-3.1-8b-instant wagera).
+    DETECTION HELPER FOR PENDING ACTIONS:
+    Agar admin ka koi purana action pending hai (e.g. "Price 500 kar do - confirm?"),
+    to uska action_id aur status formatted string mein AI ko deta hai.
     """
     if hint and hint.get('action_id'):
         return (
@@ -323,14 +331,9 @@ def _format_pending_action_hint(hint):
 
 def _format_active_product_hint(hint):
     """
-    FLOW: admin_consumers.py se milta hai. Wahan Python code deterministically
-    (LLM se nahi) sabse recent AI turn ka metadata['products'] dekh kar
-    decide karta hai "abhi kaunsa product zeri-e-baat hai" (agar us turn
-    mein exactly 1 product diya gaya tha). Ye same pattern hai jo
-    _format_pending_action_hint upar use karta hai — LLM se chat_history
-    mein se product ID "yaad rakhna"/"dhoondhna" reliable nahi nikla
-    (khaaskar weaker fallback models ke sath), is liye Python khud track
-    kar ke deterministic hint deta hai.
+    DETECTION HELPER FOR ACTIVE PRODUCT:
+    Agar admin pehle se kisi product par baat kar raha tha aur ab "is product ka price badlo" bolta hai,
+    to ye function deterministically us active product ka ID AI ko pass karta hai.
     """
     if hint and hint.get('product_id'):
         name_part = f" ({hint['name']})" if hint.get('name') else ""
@@ -351,9 +354,14 @@ def _format_active_product_hint(hint):
 
 
 def _build_executor(llm, session_key, user):
-
+    """
+    EXECUTIVE PIPELINE BUILDER:
+    LLM Model, Admin Tools aur Prompt Template ko combine kar ke LangChain Agent Executor banata hai.
+    """
+    # User aur session context ke mutabiq available tools fetch karte hain
     tools = get_admin_agent_tools(session_key, user)
 
+    # Prompt Template create karte hain jisme SYSTEM_PROMPT, history, user input aur scratchpad (tool logs) shaamil hain
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
         MessagesPlaceholder("chat_history", optional=True),
@@ -361,122 +369,124 @@ def _build_executor(llm, session_key, user):
         MessagesPlaceholder("agent_scratchpad"),
     ])
 
+    # LLM, Tools aur Prompt ko mila kar tool-calling agent banate hain
     agent = create_tool_calling_agent(llm, tools, prompt)
 
+    # AgentExecutor object return karte hain jo actual execution control karta hai
     return AgentExecutor(
         agent=agent,
         tools=tools,
-        verbose=settings.DEBUG,
-        return_intermediate_steps=True,
+        verbose=settings.DEBUG,  # Debugging mode mein verbose logs prints honge
+        return_intermediate_steps=True,  # Intermediate tool steps save karega
     )
 
 
 def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, pending_action_hint=None, active_product_hint=None):
+    """
+    MAIN ENTRY POINT FUNCTION:
+    Admin Dashboard ka chat consumer sabse pehle is function ko call karta hai.
+    """
+    # Chat history ensure karte hain ke list format mein ho
     chat_history = chat_history or []
-    date_range_hint = _format_date_range_hint(detect_date_range_hint(user_input))   # NEW — FIX
-    pending_action_hint_text = _format_pending_action_hint(pending_action_hint)     # NEW — FIX
-    active_product_hint_text = _format_active_product_hint(active_product_hint)     # NEW — FIX
-    language_hint = _detect_admin_language_hint(user_input)   # NEW — FIX: script-matching, mirrors shopping_agent.py
+    
+    # Hints ko format kar ke local variables mein ready kar rahe hain
+    date_range_hint = _format_date_range_hint(detect_date_range_hint(user_input))
+    pending_action_hint_text = _format_pending_action_hint(pending_action_hint)
+    active_product_hint_text = _format_active_product_hint(active_product_hint)
+    language_hint = _detect_admin_language_hint(user_input)
 
-    # NVIDIA model chain — (model_id, extra llm kwargs).
-    # Order = priority: [0] primary, baaki fallback (upar wala fail ho
-    # tabhi neeche wala try hota hai).
-    #
-    # UPDATED — admin ki request pe (data-accuracy/tool-calling reliability
-    # behtar karne ki umeed mein) "openai/gpt-oss-120b" ko wapis PRIMARY
-    # bana diya. NOTE: production logs (2026-08-03) mein isay consistently
-    # slow/unreliable paya gaya tha (~21s fail hone mein) — lekin us waqt
-    # ka slow-fallback bug (gemini-key-count-based retry loop) alag se fix
-    # ho chuka hai, is liye ab worst-case sirf ~8s (single timeout) lagega
-    # is model ke fail hone tak, phir turant deepseek-v4-flash pe fallback
-    # ho jayega. Agar response time phir bhi kharab lage, is list ka order
-    # wapis palat dena (deepseek-v4-flash ko index 0 pe le aana).
+    # NVIDIA Models chain (Priority wise: Primary pehle, baki fallbacks hain)
     NVIDIA_MODEL_CHAIN = [
-        ("openai/gpt-oss-120b", {}),                        # NEW PRIMARY — admin ki request pe try kiya ja raha
-        ("deepseek-ai/deepseek-v4-flash", {}),              # fast fallback — pehle primary tha
-        ("deepseek-ai/deepseek-v4-pro", {}),                # strong reasoning, same family
-        ("nvidia/nemotron-3-super-120b-a12b", {}),          # NVIDIA's own agentic model — sahi slug (-a12b zaroori tha)
-        ("meta/llama-3.3-70b-instruct", {}),                # well-established, stable, reliable tool-calling
+        ("openai/gpt-oss-120b", {}),                # Primary Model
+        ("deepseek-ai/deepseek-v4-flash", {}),      # Fast Fallback 1
+        ("deepseek-ai/deepseek-v4-pro", {}),        # Reasoning Fallback 2
+        ("nvidia/nemotron-3-super-120b-a12b", {}),  # Agentic Fallback 3
+        ("meta/llama-3.3-70b-instruct", {}),        # Stable Fallback 4
     ]
 
     def make_nvidia_attempt(model_id, extra_kwargs):
+        """Helper closure: NVIDIA model calling logic ko wrap karta hai."""
         def attempt():
+            # OpenAI API-compatible format mein NVIDIA model setup karte hain
             llm = ChatOpenAI(
                 model=model_id,
                 api_key=settings.NVIDIA_API_KEY,
                 base_url="https://integrate.api.nvidia.com/v1",
                 temperature=0.2,
-                max_retries=0,   # NEW — FIX: pehle 1 tha — client apni taraf se ek chhupi hui retry karta tha jo hamare `timeout` ke UPAR extra wait jorti thi (isi wajah se ek failing model ka wait ~2x ho raha tha). Retry ab sirf hamare apne call_with_model_fallback level pe hoga.
-                timeout=8,   # NEW — FIX: 10s se 8s kiya
+                max_retries=0,  # Automatic internal retries disable hain (hamara custom fallback control karega)
+                timeout=8,      # Maximum 8 seconds wait limit
                 **extra_kwargs,
             )
+            
+            # Agent Executor initialize karte hain
             executor = _build_executor(llm, session_key, user)
 
-            logger.warning(f"[admin_agent] TRYING model={model_id}")   # NEW — diagnostic
+            logger.warning(f"[admin_agent] TRYING model={model_id}")
 
+            # Agent ko run/invoke kar rahe hain
             result = executor.invoke({
                 "input": user_input,
                 "chat_history": chat_history,
-                "date_range_hint": date_range_hint,   # NEW — FIX
-                "pending_action_hint": pending_action_hint_text,   # NEW — FIX
-                "active_product_hint": active_product_hint_text,   # NEW — FIX
-                "language_hint": language_hint,   # NEW — FIX
+                "date_range_hint": date_range_hint,
+                "pending_action_hint": pending_action_hint_text,
+                "active_product_hint": active_product_hint_text,
+                "language_hint": language_hint,
             })
 
+            # Check karte hain ke is turn mein AI ne kaun se tools use kiye
             steps = result.get("intermediate_steps", [])
             tool_names = [step[0].tool for step in steps] if steps else []
-            logger.warning(   # NEW — diagnostic: ye line saaf batayegi tool call hua ya nahi
+            logger.warning(
                 f"[admin_agent] model={model_id} SUCCEEDED — tools_called={tool_names or 'NONE (model answered directly)'}"
             )
 
-            # Metadata and Suggestions extraction
+            # Execution Result se Extra Metadata aur Suggestions extract karte hain
             from apps.ai.admin_response_metadata import extract_admin_metadata
             from apps.ai.suggestions import get_admin_followup_suggestions
 
             metadata = extract_admin_metadata(result.get("intermediate_steps", []))
-            suggestions = get_admin_followup_suggestions(metadata.get('pending_action'), steps)   # FIX — steps pass kiye taake success ke baad bhi relevant suggestions milein
+            suggestions = get_admin_followup_suggestions(metadata.get('pending_action'), steps)
 
+            # Output text, metadata, aur follow-up chips/suggestions return karte hain
             return result["output"], metadata, suggestions
         return attempt
 
     def make_groq_attempt(model_name):
+        """Helper closure: Emergency Groq model attempt wrapper (Jab NVIDIA ke saare models fail hon)."""
         def attempt():
-            llm = ChatGroq(model=model_name, groq_api_key=settings.GROQ_API_KEY, temperature=0.2, timeout=8)   # NEW — FIX: timeout 8s
+            llm = ChatGroq(model=model_name, groq_api_key=settings.GROQ_API_KEY, temperature=0.2, timeout=8)
             executor = _build_executor(llm, session_key, user)
             
             result = executor.invoke({
                 "input": user_input,
                 "chat_history": chat_history,
-                "date_range_hint": date_range_hint,   # NEW — FIX
-                "pending_action_hint": pending_action_hint_text,   # NEW — FIX
-                "active_product_hint": active_product_hint_text,   # NEW — FIX
-                "language_hint": language_hint,   # NEW — FIX
+                "date_range_hint": date_range_hint,
+                "pending_action_hint": pending_action_hint_text,
+                "active_product_hint": active_product_hint_text,
+                "language_hint": language_hint,
             })
             
-            # Metadata and Suggestions extraction
-            from apps.ai.admin_response_metadata import extract_admin_metadata
-            from apps.ai.suggestions import get_admin_followup_suggestions
-            
-            groq_steps = result.get("intermediate_steps", [])   # FIX — suggestions ko steps dene ke liye
+            groq_steps = result.get("intermediate_steps", [])
             metadata = extract_admin_metadata(groq_steps)
-            suggestions = get_admin_followup_suggestions(metadata.get('pending_action'), groq_steps)   # FIX
+            suggestions = get_admin_followup_suggestions(metadata.get('pending_action'), groq_steps)
 
             return result["output"], metadata, suggestions
         return attempt
 
+    # Primary NVIDIA model attempt construct karte hain
     primary_model_id, primary_kwargs = NVIDIA_MODEL_CHAIN[0]
     nvidia_attempt = make_nvidia_attempt(primary_model_id, primary_kwargs)
 
+    # Bakaya NVIDIA models ki fallback list banate hain
     fallback_fns = [
         make_nvidia_attempt(model_id, extra_kwargs)
         for model_id, extra_kwargs in NVIDIA_MODEL_CHAIN[1:]
     ]
 
+    # Agar GROQ_API_KEY mojood ho to Groq models ko bhi last-resort fallbacks mein add kar dete hain
     if settings.GROQ_API_KEY:
-        # Last-resort fallback — sirf tab try hota hai jab SAARE NVIDIA models
-        # (upar wali chain) fail/quota-exhaust ho chuke hon.
         fallback_fns.append(make_groq_attempt("llama-3.3-70b-versatile"))
         fallback_fns.append(make_groq_attempt("llama-3.1-8b-instant"))
 
-    # Return 3 values (output, metadata, suggestions)
-    return call_with_model_fallback(nvidia_attempt, fallback_fns=fallback_fns)   # FIX — ab needlessly gemini-key-count baar repeat nahi hoga
+    # Primary attempt chalate hain. Agar wo fail ho to call_with_model_fallback baari baari fallback_fns try karega
+    return call_with_model_fallback(nvidia_attempt, fallback_fns=fallback_fns)
