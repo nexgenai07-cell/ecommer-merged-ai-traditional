@@ -4,6 +4,8 @@ from django.urls import path
 from .views import (
     AdminOrderDetailView,
     CheckoutView,
+    CheckoutPrefillView,
+    SaveAddressView,
     OrderListView,
     OrderDetailView,
     OrderCancelView,
@@ -23,6 +25,8 @@ from .complaint_views import (
 # Customer-facing order URLs (mounted at /api/v1/orders/)
 urlpatterns = [
     path('checkout/', CheckoutView.as_view(), name='checkout'),
+    path('checkout/prefill/', CheckoutPrefillView.as_view(), name='checkout-prefill'),
+    path('save-address/', SaveAddressView.as_view(), name='save-address'),
     path('', OrderListView.as_view(), name='order-list'),
     path('<str:order_number>/', OrderDetailView.as_view(), name='order-detail'),
     path('<str:order_number>/cancel/', OrderCancelView.as_view(), name='order-cancel'),
@@ -57,5 +61,4 @@ complaint_urlpatterns = [
 admin_complaint_urlpatterns = [
     path('<int:pk>/status/', AdminComplaintStatusUpdateView.as_view(), name='admin-complaint-status'),
     path('<int:pk>/respond/', AdminComplaintRespondView.as_view(), name='admin-complaint-respond'),
-]   
-
+]

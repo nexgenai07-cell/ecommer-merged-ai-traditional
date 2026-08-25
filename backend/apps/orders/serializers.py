@@ -1,7 +1,18 @@
 # PATH: apps/orders/serializers.py
 
+import re
+
 from rest_framework import serializers
 from .models import Customer, Order, OrderItem, Payment
+
+# Pakistani mobile/landline numbers: optional +92 or leading 0, then 9-11
+# digits. Kept permissive on purpose (spaces/dashes stripped before check)
+# so real numbers aren't rejected, but garbage input is (B15).
+PHONE_RE = re.compile(r'^(\+92|0)\d{9,10}$')
+
+# Pakistan Post uses 5-digit postal codes. Field stays optional (B18) —
+# this only runs when the customer actually typed something in.
+POSTAL_CODE_RE = re.compile(r'^\d{4,6}$')
 
 # Converts each order item into API response format.
 # Used inside OrderDetailSerializer.
@@ -102,6 +113,9 @@ class OrderDetailSerializer(serializers.ModelSerializer):
             "total_amount",
             "discount_amount",
             "shipping_address",
+            "city",
+            "postal_code",
+            "contact_phone",
             "tracking_number",
             "notes",
             "created_at",
@@ -124,13 +138,133 @@ class OrderDetailSerializer(serializers.ModelSerializer):
 
 # Validates checkout request before creating an order.
 class CheckoutSerializer(serializers.Serializer):
-    """POST /api/v1/orders/checkout/"""
+    """POST /api/v1/orders/checkout/
 
-    shipping_address = serializers.CharField()
+    FIX (B15/B18/B19/B22/F8): previously this only had shipping_address +
+    notes, so city/postal_code/phone had nowhere to go — the frontend could
+    send them but the backend silently dropped them, and there was zero
+    validation on any of it. Every field here is required=False because the
+    view falls back to the customer's last saved profile (Customer.city /
+    Customer.postal_code / Customer.phone) when a field is omitted — that's
+    what makes prefill (F8) and "returning customer doesn't retype
+    everything" actually work. shipping_address and city are the only two
+    that are truly mandatory to place an order, and that's enforced in
+    CheckoutView once the fallback has been applied, not here.
+    """
+
+    shipping_address = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=500,
+    )
+    city = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=100,
+    )
+    # FIX (B18): explicitly optional — checkout must not block on this.
+    postal_code = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=20,
+    )
+    # FIX (B15): validated contact number, separate from account phone.
+    phone = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=20,
+    )
+    # FIX (B22): when true, whatever address/city/postal_code/phone was
+    # used for this order also gets written back onto the Customer profile.
+    save_address = serializers.BooleanField(required=False, default=False)
+
     notes = serializers.CharField(
         required=False,
         allow_blank=True,
     )
+
+    # FIX (B19): city/address get real validation instead of none.
+    def validate_shipping_address(self, value):
+        value = value.strip()
+        if value and len(value) < 8:
+            raise serializers.ValidationError(
+                "Shipping address looks too short — please enter a full address."
+            )
+        return value
+
+    def validate_city(self, value):
+        value = value.strip()
+        if value and any(ch.isdigit() for ch in value):
+            raise serializers.ValidationError(
+                "City name should not contain numbers."
+            )
+        return value
+
+    # FIX (B18/B19): postal code is optional, but if the customer types
+    # something in, it has to actually look like a postal code.
+    def validate_postal_code(self, value):
+        value = value.strip()
+        if value and not POSTAL_CODE_RE.match(value):
+            raise serializers.ValidationError(
+                "Postal code should be 4-6 digits (leave blank if unknown)."
+            )
+        return value
+
+    # FIX (B15): this is the "number field bug during checkout" — there
+    # was no server-side validation at all before, so malformed numbers
+    # (letters, wrong length, missing country/area code) were accepted and
+    # silently stored.
+    def validate_phone(self, value):
+        cleaned = re.sub(r'[\s-]', '', value)
+        if cleaned and not PHONE_RE.match(cleaned):
+            raise serializers.ValidationError(
+                "Enter a valid phone number, e.g. 03001234567 or +923001234567."
+            )
+        return cleaned
+
+# NEW (F8/B22): what GET /api/v1/orders/checkout/prefill/ returns, and the
+# body PUT /api/v1/orders/save-address/ accepts.
+class CheckoutPrefillSerializer(serializers.Serializer):
+    shipping_address = serializers.CharField(allow_blank=True, allow_null=True)
+    city = serializers.CharField(allow_blank=True, allow_null=True)
+    postal_code = serializers.CharField(allow_blank=True, allow_null=True)
+    phone = serializers.CharField(allow_blank=True, allow_null=True)
+
+
+class SaveAddressSerializer(serializers.Serializer):
+    """PUT /api/v1/orders/save-address/ — B22: a standalone way to update the
+    saved address, independent of going through checkout."""
+
+    shipping_address = serializers.CharField(max_length=500)
+    city = serializers.CharField(max_length=100)
+    postal_code = serializers.CharField(
+        required=False, allow_blank=True, max_length=20
+    )
+    phone = serializers.CharField(required=False, allow_blank=True, max_length=20)
+
+    def validate_shipping_address(self, value):
+        value = value.strip()
+        if len(value) < 8:
+            raise serializers.ValidationError(
+                "Shipping address looks too short — please enter a full address."
+            )
+        return value
+
+    def validate_postal_code(self, value):
+        value = value.strip()
+        if value and not POSTAL_CODE_RE.match(value):
+            raise serializers.ValidationError(
+                "Postal code should be 4-6 digits (leave blank if unknown)."
+            )
+        return value
+
+    def validate_phone(self, value):
+        cleaned = re.sub(r'[\s-]', '', value)
+        if cleaned and not PHONE_RE.match(cleaned):
+            raise serializers.ValidationError(
+                "Enter a valid phone number, e.g. 03001234567 or +923001234567."
+            )
+        return cleaned
 
 # Validates order status updates made by the admin.
 class AdminOrderStatusSerializer(serializers.Serializer):

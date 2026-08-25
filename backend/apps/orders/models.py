@@ -33,6 +33,13 @@ class Customer(models.Model):
     email = models.EmailField(null=True, blank=True)
     address = models.TextField(null=True, blank=True)
 
+    # FIX (B18/B19/B22/F8): saved shipping details so checkout can prefill
+    # and "Save Address" has somewhere to actually write to. postal_code is
+    # intentionally optional (blank=True) — B18 asked for it to NOT be
+    # mandatory.
+    city = models.CharField(max_length=100, null=True, blank=True)
+    postal_code = models.CharField(max_length=20, null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -91,6 +98,18 @@ class Order(models.Model):
     )
 
     shipping_address = models.TextField()
+
+    # FIX (B18/B19): city + postal_code are now real, separately validated
+    # fields on the order (snapshot at checkout time) instead of being
+    # smushed into the single shipping_address text blob. postal_code stays
+    # optional per B18.
+    city = models.CharField(max_length=100, blank=True, default="")
+    postal_code = models.CharField(max_length=20, blank=True, default="")
+
+    # FIX (B15): contact number captured explicitly at checkout time and
+    # validated (see CheckoutSerializer.validate_contact_phone), instead of
+    # silently falling back to whatever happens to be on the user's account.
+    contact_phone = models.CharField(max_length=20, blank=True, default="")
 
     tracking_number = models.CharField(
         max_length=100,

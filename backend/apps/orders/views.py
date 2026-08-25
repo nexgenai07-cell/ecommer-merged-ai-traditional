@@ -22,11 +22,14 @@ from .serializers import (
     AdminOrderListSerializer,
     OrderDetailSerializer,
     CheckoutSerializer,
+    CheckoutPrefillSerializer,
+    SaveAddressSerializer,
     AdminOrderStatusSerializer,
 )
 
 from apps.cart.models import Cart
 from apps.products.models import Product, StockMovement
+from apps.stores.models import Store
 from apps.users.permissions import IsAdmin
 
 
@@ -124,6 +127,38 @@ class CheckoutView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # FIX (F8/B18/B19): resolve the customer profile first so we can
+        # fall back to their previously saved address/city/postal_code/phone
+        # for any field the request didn't send. shipping_address and city
+        # are the only two that actually block checkout if still missing
+        # after the fallback — postal_code and phone stay optional (B18).
+        customer = get_or_create_customer(
+            request.user,
+            store_id=cart.store_id,
+        )
+
+        shipping_address = data.get("shipping_address") or (customer.address or "")
+        city = data.get("city") or (customer.city or "")
+        postal_code = data.get("postal_code") or (customer.postal_code or "")
+        contact_phone = data.get("phone") or (customer.phone or "")
+
+        missing = []
+        if not shipping_address.strip():
+            missing.append("shipping_address")
+        if not city.strip():
+            missing.append("city")
+
+        if missing:
+            return Response(
+                {
+                    "error": (
+                        "Please provide your shipping details before "
+                        f"checking out. Missing: {', '.join(missing)}."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         with transaction.atomic():
 
             cart_items = list(
@@ -182,11 +217,6 @@ class CheckoutView(APIView):
 
             total_amount = subtotal - discount_amount
 
-            customer = get_or_create_customer(
-                request.user,
-                store_id=cart.store_id,
-            )
-
             order = Order.objects.create(
                 store_id=cart.store_id,
                 customer=customer,
@@ -194,9 +224,25 @@ class CheckoutView(APIView):
                 total_amount=total_amount,
                 discount_amount=discount_amount,
                 status="pending_payment",
-                shipping_address=data["shipping_address"],
+                shipping_address=shipping_address,
+                city=city,
+                postal_code=postal_code,
+                contact_phone=contact_phone,
                 notes=data.get("notes", ""),
             )
+
+            # FIX (B22): "Save Address" via checkout — write the resolved
+            # values back onto the customer profile so next time everything
+            # is prefilled (F8) and this bug can't recur.
+            if data.get("save_address"):
+                customer.address = shipping_address
+                customer.city = city
+                customer.postal_code = postal_code
+                if contact_phone:
+                    customer.phone = contact_phone
+                customer.save(
+                    update_fields=["address", "city", "postal_code", "phone", "updated_at"]
+                )
 
             for item in cart_items:
                 OrderItem.objects.create(
@@ -249,6 +295,58 @@ class CheckoutView(APIView):
             OrderDetailSerializer(order).data,
             status=status.HTTP_201_CREATED,
         )
+
+# NEW (F8): lets the frontend prefill the checkout form with whatever the
+# customer already has saved, instead of asking them to retype everything.
+class CheckoutPrefillView(APIView):
+    """GET /api/v1/orders/checkout/prefill/"""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        customer = Customer.objects.filter(user=request.user).first()
+
+        data = {
+            "shipping_address": customer.address if customer else "",
+            "city": customer.city if customer else "",
+            "postal_code": customer.postal_code if customer else "",
+            "phone": (customer.phone if customer else "") or request.user.phone or "",
+        }
+        return Response(CheckoutPrefillSerializer(data).data)
+
+
+# NEW (B22): "Save Address" as its own action, independent of checkout —
+# fixes it being non-functional by giving it a real endpoint to call.
+class SaveAddressView(APIView):
+    """PUT /api/v1/orders/save-address/"""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def put(self, request):
+        serializer = SaveAddressSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        store = Store.objects.first()
+        customer = get_or_create_customer(request.user, store_id=store.id if store else 1)
+
+        customer.address = data["shipping_address"]
+        customer.city = data["city"]
+        customer.postal_code = data.get("postal_code", customer.postal_code)
+        if data.get("phone"):
+            customer.phone = data["phone"]
+        customer.save(
+            update_fields=["address", "city", "postal_code", "phone", "updated_at"]
+        )
+
+        return Response(
+            {
+                "message": "Address saved.",
+                "shipping_address": customer.address,
+                "city": customer.city,
+                "postal_code": customer.postal_code,
+                "phone": customer.phone,
+            }
+        )
+
 
 # Returns all orders belonging to the logged-in customer.
 class OrderListView(generics.ListAPIView):

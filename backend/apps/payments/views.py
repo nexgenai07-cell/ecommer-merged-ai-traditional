@@ -1,4 +1,5 @@
 import stripe
+from decimal import Decimal, ROUND_HALF_UP
 
 from django.conf import settings
 from django.utils import timezone
@@ -39,8 +40,51 @@ class CreatePaymentIntentView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        payment = getattr(order, "payment", None)
+        if payment is None:
+            return Response(
+                {"error": "This order has no payment record."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # FIX: don't let an already-paid order create a second Stripe
+        # PaymentIntent (that's how you end up double-charging a customer).
+        if payment.status == "paid":
+            return Response(
+                {"error": "This order has already been paid."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # FIX (B16 — "Stripe form shows all values as zero"): when a coupon
+        # discounts an order down to Rs 0 (or total_amount is somehow unset),
+        # the old code still called Stripe with amount=0, which is exactly
+        # what produced a payment form full of zeros. A free order should
+        # never reach Stripe at all — it gets marked paid directly.
+        total_amount = order.total_amount or Decimal("0")
+        if total_amount <= 0:
+            payment.status = "paid"
+            payment.paid_at = timezone.now()
+            payment.save()
+
+            order.status = "confirmed"
+            order.save()
+
+            return Response(
+                {
+                    "free_order": True,
+                    "message": "Order total is Rs. 0 after discount — no payment needed.",
+                    "order_number": order.order_number,
+                }
+            )
+
+        # FIX: quantize before converting to paisa so a value like 1299.995
+        # rounds instead of getting silently truncated by int().
+        amount_in_paisa = int(
+            (total_amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        )
+
         intent = stripe.PaymentIntent.create(
-            amount=int(order.total_amount * 100),
+            amount=amount_in_paisa,
             currency="pkr",
             metadata={
                 "order_id": order.id,
@@ -48,16 +92,23 @@ class CreatePaymentIntentView(APIView):
             },
         )
 
-        payment = order.payment
         payment.stripe_payment_intent_id = intent.id
         payment.save()
 
+        # FIX (B20 — "coupon doesn't carry to payment step"): return the
+        # subtotal/discount alongside the final amount so the payment page
+        # can display them without the frontend having to re-fetch and
+        # recompute the cart (which is where the coupon was already
+        # cleared by the time checkout finishes).
         return Response(
             {
                 "client_secret": intent.client_secret,
                 "publishable_key": settings.STRIPE_PUBLISHABLE_KEY,
-                "amount": int(order.total_amount * 100),
+                "amount": amount_in_paisa,
                 "currency": "pkr",
+                "subtotal": str(total_amount + order.discount_amount),
+                "discount_amount": str(order.discount_amount),
+                "total_amount": str(total_amount),
                 "order_number": order.order_number,
             }
         )
