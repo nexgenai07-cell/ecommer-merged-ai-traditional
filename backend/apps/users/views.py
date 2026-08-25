@@ -1,5 +1,5 @@
 # PATH: apps/users/views.py
-
+from datetime import timedelta
 from rest_framework import status, generics, permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -7,12 +7,13 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
 
 from django.contrib.auth.tokens import default_token_generator
+from django.core.mail import send_mail
 from django.utils.http import (
     urlsafe_base64_encode,
     urlsafe_base64_decode,
 )
 from django.utils.encoding import force_bytes, force_str
-from django.core.mail import send_mail
+from .email_service import send_verification_with_resend
 from django.conf import settings
 
 from user_agents import parse as parse_user_agent
@@ -35,6 +36,7 @@ from .serializers import (
     UserSessionSerializer,
 )
 
+
 # Generates JWT access and refresh tokens for an authenticated user.
 def get_tokens_for_user(user):
     refresh = RefreshToken.for_user(user)
@@ -43,12 +45,14 @@ def get_tokens_for_user(user):
         "refresh": str(refresh),
     }
 
+
 # Retrieves the client's IP address from the incoming request.
 def get_client_ip(request):
     x_forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
     if x_forwarded_for:
         return x_forwarded_for.split(",")[0].strip()
     return request.META.get("REMOTE_ADDR")
+
 
 # Stores information about the user's current login session,
 # including device, browser, IP address, and JWT token IDs.
@@ -78,6 +82,7 @@ def create_session_record(request, user, refresh_token, access_token=None):
         location="Unknown",
     )
 
+
 # Generates an email verification token and sends
 # a verification link to the user's email.
 def send_verification_email(user):
@@ -88,17 +93,11 @@ def send_verification_email(user):
         f"{verification.token}/"
     )
 
-    send_mail(
-        subject="Verify your email address",
-        message=(
-            f"Click the link to verify your email:\n\n"
-            f"{verify_link}\n\n"
-            "This link is valid for 24 hours."
-        ),
-        from_email=settings.DEFAULT_FROM_EMAIL,
-        recipient_list=[user.email],
-        fail_silently=True,
+    return send_verification_with_resend(
+        user.email,
+        verify_link,
     )
+
 
 # Handles new user registration and sends an email
 # verification link after creating the account.
@@ -112,12 +111,11 @@ class RegisterView(generics.CreateAPIView):
         serializer.is_valid(raise_exception=True)
 
         user = serializer.save()
-        tokens = get_tokens_for_user(user)
 
         try:
             send_verification_email(user)
-        except Exception:
-            pass
+        except Exception as exc:
+            print("Verification email failed:", exc)
 
         return Response(
             {
@@ -126,10 +124,10 @@ class RegisterView(generics.CreateAPIView):
                     "Please check your email to verify your account."
                 ),
                 "user": UserProfileSerializer(user).data,
-                "tokens": tokens,
             },
             status=status.HTTP_201_CREATED,
         )
+
 
 # Authenticates users, verifies email status,
 # checks two-factor authentication, and returns JWT tokens.
@@ -142,13 +140,22 @@ class LoginView(APIView):
 
         user = serializer.validated_data["user"]
 
+        # Get Remember Me value from validated serializer data.
+        remember_me = serializer.validated_data.get(
+            "remember_me",
+            False
+        )
+
         # Do not allow login if account is deactivated
         if user.is_delete or not user.is_active:
             return Response(
                 {
                     "account_deactivated": True,
                     "email": user.email,
-                    "message": "This account has been deleted. Would you like to reactivate it?",
+                    "message": (
+                        "This account has been deleted. "
+                        "Would you like to reactivate it?"
+                    ),
                 },
                 status=status.HTTP_200_OK,
             )
@@ -159,29 +166,55 @@ class LoginView(APIView):
                 {
                     "email_not_verified": True,
                     "email": user.email,
-                    "message": "Please verify your email before logging in."
+                    "message": (
+                        "Please verify your email before logging in."
+                    ),
                 },
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        # Check whether 2FA is enabled
         two_fa = TwoFactorAuth.objects.filter(
             user=user,
             is_enabled=True,
         ).first()
 
         if two_fa:
+            # IMPORTANT:
+            # Do not issue tokens yet.
+            # Remember Me is returned so the second 2FA step
+            # knows which token lifetime the user selected.
             return Response(
                 {
-                    "message": "Two-factor authentication code required.",
+                    "message": (
+                        "Two-factor authentication code required."
+                    ),
                     "require_2fa": True,
                     "user_id": user.id,
+                    "remember_me": remember_me,
                 },
                 status=status.HTTP_200_OK,
             )
 
+        # Create refresh token
         refresh = RefreshToken.for_user(user)
+
+        # Remember Me controls how long the refresh token remains valid.
+        #
+        # Remember Me = True  → 30 days
+        # Remember Me = False → 7 days
+        if remember_me:
+            refresh.set_exp(
+                lifetime=timedelta(days=30)
+            )
+        else:
+            refresh.set_exp(
+                lifetime=timedelta(days=7)
+            )
+
         access = refresh.access_token
 
+        # Create login session
         create_session_record(
             request,
             user,
@@ -197,9 +230,11 @@ class LoginView(APIView):
                     "access": str(access),
                     "refresh": str(refresh),
                 },
+                "remember_me": remember_me,
             },
             status=status.HTTP_200_OK,
         )
+        
 
 # Logs out the current user by blacklisting
 # the provided refresh token.
@@ -229,6 +264,7 @@ class LogoutView(APIView):
             status=status.HTTP_200_OK,
         )
 
+
 # Sends a password reset link to the user's
 # registered email address.
 class PasswordResetRequestView(APIView):
@@ -249,7 +285,9 @@ class PasswordResetRequestView(APIView):
             f"{uid}/{token}/"
         )
 
-        send_mail(
+        send_verification_with_resend(
+            email,
+            reset_link,
             subject="Password Reset Request",
             message=(
                 f"Click the link to reset your password:\n\n"
@@ -269,6 +307,7 @@ class PasswordResetRequestView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
 
 # Verifies the password reset token and
 # updates the user's password.
@@ -315,6 +354,7 @@ class PasswordResetConfirmView(APIView):
             status=status.HTTP_200_OK,
         )
 
+
 # Returns and updates the authenticated user's profile.
 class MeView(generics.RetrieveUpdateAPIView):
     serializer_class = UserProfileSerializer
@@ -322,6 +362,7 @@ class MeView(generics.RetrieveUpdateAPIView):
 
     def get_object(self):
         return self.request.user
+
 
 # Allows authenticated users to securely
 # change their password.
@@ -343,6 +384,7 @@ class ChangePasswordView(APIView):
             {"message": "Password changed successfully."},
             status=status.HTTP_200_OK,
         )
+
 
 # Soft deletes the user account and revokes
 # all active JWT sessions.
@@ -376,6 +418,7 @@ class DeleteAccountView(APIView):
             status=status.HTTP_200_OK,
         )
 
+
 # Returns all active login sessions
 # belonging to the authenticated user.
 class SessionListView(generics.ListAPIView):
@@ -384,6 +427,7 @@ class SessionListView(generics.ListAPIView):
 
     def get_queryset(self):
         return UserSession.objects.filter(user=self.request.user)
+
 
 # Signs the user out from every device by
 # blacklisting all tokens and removing session records.
@@ -409,6 +453,7 @@ class RevokeAllSessionsView(APIView):
             {"message": "All sessions have been signed out."},
             status=status.HTTP_200_OK,
         )
+
 
 # Sends a reactivation link to a deactivated account's email.
 class ReactivateRequestView(APIView):
@@ -460,7 +505,8 @@ class ReactivateRequestView(APIView):
                 "message": "If this account exists and is deactivated, a reactivation link has been sent to your email."
             }
         )
-        
+
+
 # Confirms a reactivation token and restores the account.
 class ReactivateConfirmView(APIView):
     permission_classes = [permissions.AllowAny]
@@ -504,3 +550,4 @@ class ReactivateConfirmView(APIView):
                 "message": "Your account has been reactivated. You can now log in."
             }
         )
+        

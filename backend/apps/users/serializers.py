@@ -5,6 +5,7 @@ from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 
 
+
 class RegisterSerializer(serializers.ModelSerializer):
     """
     Used for public registration.
@@ -298,3 +299,6 @@ class UserSessionSerializer(serializers.ModelSerializer):
         except (KeyError, TypeError):
             return False
         return obj.access_jti == current_access_jti
+    
+class GoogleLoginSerializer(serializers.Serializer):
+    id_token = serializers.CharField(required=True)
