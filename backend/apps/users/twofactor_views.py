@@ -8,6 +8,8 @@
 # including enabling 2FA, verifying OTPs, disabling 2FA,
 # and completing secure login using OTP verification.
 
+from datetime import timedelta
+
 import pyotp
 import qrcode
 import io
@@ -16,6 +18,7 @@ from rest_framework import status, permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
+
 
 from .models import TwoFactorAuth, User
 from .serializers import UserProfileSerializer
@@ -69,6 +72,7 @@ class Enable2FAView(APIView):
             'manual_entry_key': secret,  # shown as fallback if user can't scan
         }, status=status.HTTP_200_OK)
 
+
 # Verifies the OTP entered by the user after scanning the QR code.
 # If the OTP is valid, Two-Factor Authentication is officially enabled.
 class Verify2FAView(APIView):
@@ -107,6 +111,7 @@ class Verify2FAView(APIView):
 
         return Response({'message': 'Two-factor authentication enabled successfully.'}, status=status.HTTP_200_OK)
 
+
 # Disables Two-Factor Authentication after confirming
 # the user's password for security.
 class Disable2FAView(APIView):
@@ -126,65 +131,130 @@ class Disable2FAView(APIView):
 
         return Response({'message': 'Two-factor authentication disabled.'}, status=status.HTTP_200_OK)
 
+
 # Completes the login process by verifying the OTP.
 # JWT tokens are generated only after successful OTP verification.
 class TwoFactorLoginVerifyView(APIView):
     """
     POST /api/v1/auth/2fa/login-verify/
 
-    NEW ENDPOINT (FIX — this is the missing "second half" of 2FA).
-    Previously, LoginView checked email+password only, and 2FA's
-    enable/verify/disable existed in complete isolation from the actual
-    login flow — enabling 2FA had zero effect at login time.
+    Request:
+    {
+        "user_id": 1,
+        "otp": "123456",
+        "remember_me": true
+    }
 
-    Flow now:
-      1. POST /api/v1/auth/login/ with email+password.
-         If the user has 2FA enabled, it responds with
-         {"require_2fa": true, "user_id": <id>} and issues NO tokens.
-      2. Frontend shows an "Enter your 6-digit code" screen, then calls
-         THIS endpoint with {"user_id": <id>, "otp": "123456"}.
-      3. Only if the OTP is correct do we issue real tokens and create
-         the UserSession row (same as a normal login).
+    The user_id and remember_me values come from the first login step.
 
-    Request: { "user_id": 1, "otp": "123456" }
-    Response (200 OK): same shape as normal login —
-      { "message": "...", "user": {...}, "tokens": {...} }
+    Tokens are issued only after successful OTP verification.
     """
+
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        # Imported here (not at top of file) to avoid a circular import
-        # between users/views.py and users/twofactor_views.py.
+        # Imported here to avoid a circular import between
+        # users/views.py and users/twofactor_views.py.
         from .views import create_session_record
 
-        user_id = request.data.get('user_id')
-        otp = request.data.get('otp')
+        user_id = request.data.get("user_id")
+        otp = request.data.get("otp")
+
+        # Remember Me comes from the frontend during the 2FA step.
+        remember_me = request.data.get(
+            "remember_me",
+            False
+        )
+
+        # Normalize string values in case frontend sends
+        # "true" / "false" instead of JSON boolean values.
+        if isinstance(remember_me, str):
+            remember_me = remember_me.lower() == "true"
 
         if not user_id or not otp:
-            return Response({'error': 'user_id and otp are required.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {
+                    "error": "user_id and otp are required."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
-            user = User.objects.get(id=user_id, is_active=True)
+            user = User.objects.get(
+                id=user_id,
+                is_active=True,
+            )
         except User.DoesNotExist:
-            return Response({'error': 'Invalid user.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {
+                    "error": "Invalid user."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
-            two_fa = TwoFactorAuth.objects.get(user=user, is_enabled=True)
+            two_fa = TwoFactorAuth.objects.get(
+                user=user,
+                is_enabled=True,
+            )
         except TwoFactorAuth.DoesNotExist:
-            return Response({'error': '2FA is not enabled for this account.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {
+                    "error": (
+                        "2FA is not enabled for this account."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
+        # Verify OTP
         totp = pyotp.TOTP(two_fa.secret)
-        if not totp.verify(otp, valid_window=1):
-            return Response({'error': 'Invalid or expired code.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        if not totp.verify(
+            otp,
+            valid_window=1
+        ):
+            return Response(
+                {
+                    "error": "Invalid or expired code."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # OTP is valid, so now issue JWT tokens.
         refresh = RefreshToken.for_user(user)
+
+        # Remember Me controls refresh token lifetime.
+        if remember_me:
+            refresh.set_exp(
+                lifetime=timedelta(days=30)
+            )
+        else:
+            refresh.set_exp(
+                lifetime=timedelta(days=7)
+            )
+
         access = refresh.access_token
-        tokens = {'access': str(access), 'refresh': str(refresh)}
 
-        create_session_record(request, user, refresh, access_token=access)
+        tokens = {
+            "access": str(access),
+            "refresh": str(refresh),
+        }
 
-        return Response({
-            'message': 'Login successful.',
-            'user': UserProfileSerializer(user).data,
-            'tokens': tokens,
-        }, status=status.HTTP_200_OK)
+        # Create login session only after successful 2FA.
+        create_session_record(
+            request,
+            user,
+            refresh,
+            access_token=access,
+        )
+
+        return Response(
+            {
+                "message": "Login successful.",
+                "user": UserProfileSerializer(user).data,
+                "tokens": tokens,
+                "remember_me": remember_me,
+            },
+            status=status.HTTP_200_OK,
+        )

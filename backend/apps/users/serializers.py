@@ -65,6 +65,25 @@ class RegisterSerializer(serializers.ModelSerializer):
             )
 
         return value
+    
+    
+    def validate_phone(self, value):
+       if value and not value.isdigit():
+        raise serializers.ValidationError(
+            "Phone number must contain digits only." #phone number validation added
+        )
+
+       if value and len(value) < 10:
+        raise serializers.ValidationError(
+            "Phone number must be at least 10 digits."
+        )
+
+       if value and len(value) > 15:
+        raise serializers.ValidationError(
+            "Phone number must not exceed 15 digits."
+        )
+
+        return value
 
     def validate(self, data):
 
@@ -101,6 +120,13 @@ class LoginSerializer(serializers.Serializer):
     email = serializers.EmailField()
     password = serializers.CharField(write_only=True)
 
+    # Remember Me is an actual request field.
+    # It must be declared at class level, NOT inside validate().
+    remember_me = serializers.BooleanField(
+        required=False,
+        default=False
+    )
+
     def validate(self, data):
         email = data.get("email")
         password = data.get("password")
@@ -120,8 +146,8 @@ class LoginSerializer(serializers.Serializer):
             )
 
         # Deleted account response
-        # IMPORTANT: keep this after password verification
-        # so nobody can discover deleted accounts.
+        # Keep this after password verification so nobody can
+        # discover deleted accounts.
         if user.is_delete:
             raise serializers.ValidationError(
                 {
@@ -140,9 +166,8 @@ class LoginSerializer(serializers.Serializer):
             )
 
         data["user"] = user
+
         return data
-
-
 class UserProfileSerializer(serializers.ModelSerializer):
     # Returns the logged-in user's profile information
     # and indicates whether two-factor authentication is enabled.

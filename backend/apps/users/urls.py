@@ -14,7 +14,6 @@ from .views import (
     DeleteAccountView,
     SessionListView,
     RevokeAllSessionsView,
-
     # NEW
     ReactivateRequestView,
     ReactivateConfirmView,
@@ -49,6 +48,7 @@ urlpatterns = [
         LoginView.as_view(),
         name="login",
     ),
+    
 
     path(
         "logout/",
