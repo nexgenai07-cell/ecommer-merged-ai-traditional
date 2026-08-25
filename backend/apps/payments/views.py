@@ -2,6 +2,7 @@ import stripe
 from decimal import Decimal, ROUND_HALF_UP
 
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 
 from rest_framework import status, permissions
@@ -13,6 +14,11 @@ from rest_framework.decorators import (
 )
 
 from apps.orders.models import Order
+# FIX (B59): stock deduction moved out of checkout and into the two places
+# an order actually becomes paid — imported from apps.orders.views since
+# that's where the shared, locked, audited helper already lives (same
+# pattern used for restore_stock_for_order on cancellation).
+from apps.orders.views import deduct_stock_for_order
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
@@ -49,6 +55,12 @@ class CreatePaymentIntentView(APIView):
 
         # FIX: don't let an already-paid order create a second Stripe
         # PaymentIntent (that's how you end up double-charging a customer).
+        # NOTE (B31): this same check is also exactly what makes "Pay Now"
+        # work for a pending_payment order — as long as payment.status
+        # isn't "paid" yet, this endpoint can be called again for the same
+        # order_number to resume payment. No separate endpoint is needed
+        # for B31 on the backend; the frontend just needs to call this with
+        # the pending order's order_number.
         if payment.status == "paid":
             return Response(
                 {"error": "This order has already been paid."},
@@ -62,12 +74,17 @@ class CreatePaymentIntentView(APIView):
         # never reach Stripe at all — it gets marked paid directly.
         total_amount = order.total_amount or Decimal("0")
         if total_amount <= 0:
-            payment.status = "paid"
-            payment.paid_at = timezone.now()
-            payment.save()
+            with transaction.atomic():
+                payment.status = "paid"
+                payment.paid_at = timezone.now()
+                payment.save()
 
-            order.status = "confirmed"
-            order.save()
+                order.status = "confirmed"
+                order.save()
+
+                # FIX (B59): this is one of the two real "payment confirmed"
+                # moments — stock must be deducted now, not back at checkout.
+                deduct_stock_for_order(order, user=None)
 
             return Response(
                 {
@@ -140,13 +157,19 @@ class StripeWebhookView(APIView):
             try:
                 order = Order.objects.get(order_number=order_number)
 
-                payment = order.payment
-                payment.status = "paid"
-                payment.paid_at = timezone.now()
-                payment.save()
+                with transaction.atomic():
+                    payment = order.payment
+                    payment.status = "paid"
+                    payment.paid_at = timezone.now()
+                    payment.save()
 
-                order.status = "confirmed"
-                order.save()
+                    order.status = "confirmed"
+                    order.save()
+
+                    # FIX (B59): the second, and main, "payment confirmed"
+                    # moment — real Stripe payments go through here. Stock
+                    # is deducted only now, not at checkout time.
+                    deduct_stock_for_order(order, user=None)
 
             except Order.DoesNotExist:
                 pass

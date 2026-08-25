@@ -17,16 +17,40 @@ POSTAL_CODE_RE = re.compile(r'^\d{4,6}$')
 # Converts each order item into API response format.
 # Used inside OrderDetailSerializer.
 class OrderItemSerializer(serializers.ModelSerializer):
+    # FIX (B25): product image was completely missing from order items, so
+    # the customer had no way to identify what they ordered from the order
+    # detail screen. Uses the same primary-image lookup pattern already
+    # used in products/serializers.py (ProductListSerializer.get_primary_image)
+    # so behaviour stays consistent across the app.
+    product_image = serializers.SerializerMethodField()
+
     class Meta:
         model = OrderItem
         fields = [
             "id",
             "product",
             "product_name",
+            "product_image",
             "price",
             "quantity",
             "total_price",
         ]
+
+    def get_product_image(self, obj):
+        product = obj.product
+        # product can be None — OrderItem.product is SET_NULL if the
+        # product was later deleted, but the order should still render.
+        if not product:
+            return None
+
+        img = product.images.filter(is_primary=True).first() or product.images.first()
+        if not img or not img.image:
+            return None
+
+        image = img.image
+        if hasattr(image, "url"):
+            return image.url.replace("http://", "https://")
+        return str(image)
 
 # Converts payment details into API response.
 # Used when returning complete order information.
@@ -268,11 +292,14 @@ class SaveAddressSerializer(serializers.Serializer):
 
 # Validates order status updates made by the admin.
 class AdminOrderStatusSerializer(serializers.Serializer):
+    # FIX (B30): "out_for_delivery" added — was missing, so admins had no
+    # matching status to set once a shipment was actually on its way.
     status = serializers.ChoiceField(
         choices=[
             "pending_payment",
             "confirmed",
             "shipped",
+            "out_for_delivery",
             "delivered",
             "cancelled",
         ]
@@ -282,3 +309,20 @@ class AdminOrderStatusSerializer(serializers.Serializer):
         required=False,
         allow_blank=True,
     )
+
+    # FIX (B27): admin cancelling an order must now give a reason — this
+    # is only mandatory when status == "cancelled", enforced in validate()
+    # below since a plain field-level required=True would also block every
+    # non-cancel status update.
+    cancellation_reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=1000,
+    )
+
+    def validate(self, attrs):
+        if attrs.get("status") == "cancelled" and not attrs.get("cancellation_reason", "").strip():
+            raise serializers.ValidationError(
+                {"cancellation_reason": "Please provide a reason for cancelling this order."}
+            )
+        return attrs

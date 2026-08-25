@@ -1,3 +1,5 @@
+# PATH: apps/orders/views.py
+
 import stripe
 from django.conf import settings
 import random
@@ -14,7 +16,11 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 
 from core.pagination import StandardResultsPagination
-from apps.notifications.utils import create_notification
+from apps.notifications.utils import (
+    create_notification,
+    send_order_confirmation_email,
+    send_refund_confirmation_email,
+)
 
 from .models import Customer, Order, OrderItem, Payment
 from .serializers import (
@@ -76,44 +82,145 @@ def restore_stock_for_order(order, user=None):
     OrderCancelView, which is still a real actor (request.user), so
     callers should pass request.user; this stays None only if truly
     system-triggered elsewhere in the future.
+
+    FIX (B59): stock is only ever deducted once payment is confirmed (see
+    deduct_stock_for_order below), so restoring stock only makes sense —
+    and must only happen — if this specific order actually had stock
+    deducted in the first place. Without this guard, cancelling an unpaid
+    order (which never touched stock) would incorrectly ADD stock back
+    that was never removed. order.stock_deducted is the single source of
+    truth for this and gets flipped back to False here; callers still do
+    their own order.save() right after, which persists it.
     """
+    if not order.stock_deducted:
+        return
+
     items = list(order.items.select_related("product").all())
     product_ids = [item.product_id for item in items if item.product_id]
 
-    if not product_ids:
+    if product_ids:
+        locked_products = {
+            p.id: p
+            for p in Product.objects.select_for_update().filter(id__in=product_ids)
+        }
+
+        for item in items:
+            product = locked_products.get(item.product_id)
+            if not product:
+                continue
+
+            old_stock = product.stock
+            new_stock = old_stock + item.quantity
+
+            product.stock = new_stock
+            product.save(update_fields=["stock"])
+
+            StockMovement.objects.create(
+                product=product,
+                changed_by=user,
+                old_stock=old_stock,
+                new_stock=new_stock,
+                delta=item.quantity,
+                reason="order_cancelled",
+                note=f"Order {order.order_number} cancelled",
+            )
+
+    order.stock_deducted = False
+
+
+# NEW (B59): stock now only leaves inventory once payment is actually
+# confirmed — not at checkout/pending_payment time. Called from
+# payments/views.py at the two places an order genuinely becomes paid:
+# CreatePaymentIntentView's free-order (Rs. 0) branch, and
+# StripeWebhookView's payment_intent.succeeded handler.
+def deduct_stock_for_order(order, user=None):
+    """
+    Mirrors restore_stock_for_order's locked + audited pattern. Idempotent
+    via order.stock_deducted — safe to call twice (e.g. a retried/duplicate
+    Stripe webhook event) without double-deducting.
+
+    Stock can legitimately have moved between checkout and payment
+    confirmation (other customers checking out, manual admin adjustments),
+    so this clamps at 0 instead of going negative and logs a shortfall
+    note for an admin to follow up on, rather than raising and breaking
+    the payment flow for a customer who has already paid.
+    """
+    if order.stock_deducted:
         return
 
-    locked_products = {
-        p.id: p
-        for p in Product.objects.select_for_update().filter(id__in=product_ids)
-    }
+    items = list(order.items.select_related("product").all())
+    product_ids = [item.product_id for item in items if item.product_id]
 
-    for item in items:
-        product = locked_products.get(item.product_id)
-        if not product:
+    if product_ids:
+        locked_products = {
+            p.id: p
+            for p in Product.objects.select_for_update().filter(id__in=product_ids)
+        }
+
+        for item in items:
+            product = locked_products.get(item.product_id)
+            if not product:
+                continue
+
+            old_stock = product.stock
+            new_stock = max(old_stock - item.quantity, 0)
+
+            product.stock = new_stock
+            product.save(update_fields=["stock"])
+
+            shortfall = item.quantity - (old_stock - new_stock)
+            note = f"Order {order.order_number} payment confirmed"
+            if shortfall > 0:
+                note += f" (WARNING: {shortfall} short of stock — oversold, admin follow-up needed)"
+
+            StockMovement.objects.create(
+                product=product,
+                changed_by=user,
+                old_stock=old_stock,
+                new_stock=new_stock,
+                delta=new_stock - old_stock,
+                reason="order_confirmed",
+                note=note,
+            )
+
+    order.stock_deducted = True
+
+
+# NEW (B27): when an admin cancels an order, suggest in-stock alternatives
+# for any item that was out of stock — cheap "same category, currently
+# available" lookup, top 3 per item.
+def suggest_alternatives_for_order(order):
+    suggestions = {}
+
+    for item in order.items.select_related("product", "product__category").all():
+        product = item.product
+        if not product or product.stock > 0:
             continue
 
-        old_stock = product.stock
-        new_stock = old_stock + item.quantity
+        alternatives_qs = Product.objects.filter(
+            is_active=True,
+            is_delete=False,
+            stock__gt=0,
+        ).exclude(id=product.id)
 
-        product.stock = new_stock
-        product.save(update_fields=["stock"])
+        if product.category_id:
+            alternatives_qs = alternatives_qs.filter(category_id=product.category_id)
 
-        StockMovement.objects.create(
-            product=product,
-            changed_by=user,
-            old_stock=old_stock,
-            new_stock=new_stock,
-            delta=item.quantity,
-            reason="order_cancelled",
-            note=f"Order {order.order_number} cancelled",
+        alternatives = list(
+            alternatives_qs.values("id", "name", "price", "stock")[:3]
         )
 
-# Handles checkout by creating an order, deducting stock and creating payment.
+        if alternatives:
+            suggestions[item.product_name] = alternatives
+
+    return suggestions
+
+# Handles checkout by creating an order, validating stock and creating payment.
 class CheckoutView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
-# Validates cart, creates order, deducts stock, creates payment and clears cart.
+# Validates cart, creates order, and creates a pending payment. Stock is
+# intentionally NOT deducted here anymore (see FIX B59 below).
     def post(self, request):
         serializer = CheckoutSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -167,10 +274,13 @@ class CheckoutView(APIView):
 
             product_ids = [item.product_id for item in cart_items]
 
-            # FIX (stock race-condition): lock the actual Product rows,
-            # not just the cart items. Locking CartItem rows alone did
-            # not protect against a concurrent checkout or manual stock
-            # adjustment touching the same Product at the same time.
+            # Lock the actual Product rows while we check availability, so
+            # two concurrent checkouts reading the same product don't both
+            # see stale stock numbers. NOTE (B59): this only *checks*
+            # availability now — it does not decrement stock. Real
+            # deduction happens later, only once payment is confirmed (see
+            # deduct_stock_for_order), so an abandoned/never-paid order can
+            # no longer hold stock hostage.
             locked_products = {
                 p.id: p
                 for p in Product.objects.select_for_update().filter(id__in=product_ids)
@@ -253,26 +363,13 @@ class CheckoutView(APIView):
                     quantity=item.quantity,
                     total_price=item.product.price * item.quantity,
                 )
-
-                # FIX (stock race-condition): decrement via the row we
-                # already locked above, and log the movement in the same
-                # audit table used by the manual adjust endpoint.
-                product = locked_products[item.product_id]
-                old_stock = product.stock
-                new_stock = old_stock - item.quantity
-
-                product.stock = new_stock
-                product.save(update_fields=["stock"])
-
-                StockMovement.objects.create(
-                    product=product,
-                    changed_by=None,
-                    old_stock=old_stock,
-                    new_stock=new_stock,
-                    delta=-item.quantity,
-                    reason="order_placed",
-                    note=f"Order {order.order_number} checkout",
-                )
+                # FIX (B59): stock is deliberately NOT touched here anymore.
+                # It used to be decremented right at checkout (while the
+                # order was still "pending_payment"), which meant an order
+                # nobody ever paid for was still holding real inventory
+                # hostage. Deduction now happens in deduct_stock_for_order,
+                # triggered only from payments/views.py once money has
+                # actually moved (free-order branch or Stripe webhook).
 
             Payment.objects.create(
                 order=order,
@@ -290,6 +387,12 @@ class CheckoutView(APIView):
             message=f"Your order #{order.order_number} has been created and is awaiting payment.",
             notification_type="order",
         )
+
+        # FIX (F14): actual email confirmation, not just an in-app
+        # notification. Failure here must never break checkout for the
+        # customer — send_order_confirmation_email swallows/logs its own
+        # exceptions.
+        send_order_confirmation_email(order)
 
         return Response(
             OrderDetailSerializer(order).data,
@@ -350,17 +453,36 @@ class SaveAddressView(APIView):
 
 # Returns all orders belonging to the logged-in customer.
 class OrderListView(generics.ListAPIView):
+    """GET /api/v1/orders/
+
+    FIX (B32): supports optional start_date / end_date query params (e.g.
+    ?start_date=2026-08-01&end_date=2026-08-25) so customers can filter
+    their own order history by date range, mirroring what admins already
+    had via AdminOrderFilterView.
+    """
     serializer_class = OrderListSerializer
     permission_classes = [permissions.IsAuthenticated]
     pagination_class = StandardResultsPagination
 
     def get_queryset(self): # Fetches customer order history.
-        return (
+        qs = (
             Order.objects.filter(
                 customer__user=self.request.user
             )
             .order_by("-created_at")
         )
+
+        params = self.request.query_params
+
+        start_date = params.get("start_date")
+        if start_date:
+            qs = qs.filter(created_at__date__gte=start_date)
+
+        end_date = params.get("end_date")
+        if end_date:
+            qs = qs.filter(created_at__date__lte=end_date)
+
+        return qs
 
 # Returns complete details of a single order.
 class OrderDetailView(generics.RetrieveAPIView):
@@ -389,7 +511,7 @@ class OrderCancelView(APIView):
     """PUT /api/v1/orders/{order_number}/cancel/"""
     permission_classes = [permissions.IsAuthenticated]
 
-# Cancels order, restores stock and updates payment.
+# Cancels order, restores stock (if any was deducted) and updates payment.
     def put(self, request, order_number):
         try:
             order = Order.objects.get(
@@ -417,15 +539,38 @@ class OrderCancelView(APIView):
         with transaction.atomic():
             # FIX (stock race-condition): stock restoration now goes
             # through the shared, locked, audited helper instead of a
-            # plain read-modify-save loop.
+            # plain read-modify-save loop. FIX (B59): the helper itself is
+            # now a no-op if this order never had stock deducted in the
+            # first place (i.e. it was still unpaid), so cancelling an
+            # unpaid order no longer incorrectly adds phantom stock back.
             restore_stock_for_order(order, user=request.user)
 
             order.status = "cancelled"
             order.save()
 
+            # FIX (B29): refunded_at timestamp gives a real, checkable
+            # confirmation that the refund was processed, instead of just
+            # a silent status flip.
+            was_paid = False
             if hasattr(order, "payment"):
+                was_paid = order.payment.status == "paid"
                 order.payment.status = "refunded"
+                order.payment.refunded_at = timezone.now()
                 order.payment.save()
+
+        # FIX (B28): customer-initiated cancellation previously created no
+        # notification at all, unlike the admin-initiated path — so the
+        # customer had nothing confirming the cancellation actually
+        # registered on their side.
+        create_notification(
+            user=request.user,
+            title="Order Cancelled",
+            message=f"Your order #{order.order_number} has been cancelled.",
+            notification_type="order",
+        )
+
+        if was_paid:
+            send_refund_confirmation_email(order)
 
         return Response(OrderDetailSerializer(order).data)
 
@@ -504,14 +649,52 @@ class AdminOrderStatusUpdateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # FIX (B29): admin could previously mark an order "shipped" or
+        # "delivered" even though it had never actually been paid for.
+        # Block that transition outright — payment must be confirmed
+        # ("paid") before an order can move to shipped / out_for_delivery
+        # / delivered.
+        if new_status in ("shipped", "out_for_delivery", "delivered"):
+            payment = getattr(order, "payment", None)
+            if not payment or payment.status != "paid":
+                return Response(
+                    {
+                        "error": (
+                            "This order's payment has not been confirmed yet — "
+                            "it cannot be marked as "
+                            f"'{new_status.replace('_', ' ')}' until payment is received."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        suggested_alternatives = {}
+        was_paid_before_cancel = False
+
         if new_status == "cancelled" and order.status != "cancelled":
+            # FIX (B27): reason is now mandatory for admin cancellations
+            # (enforced in AdminOrderStatusSerializer.validate) and gets
+            # stored on the order so there's a permanent record of why.
+            order.cancellation_reason = serializer.validated_data.get(
+                "cancellation_reason", ""
+            ).strip()
+
+            # FIX (B27): surface in-stock alternatives for any item that
+            # was out of stock, so the admin can pass them on to the
+            # customer instead of just saying "sorry, cancelled".
+            suggested_alternatives = suggest_alternatives_for_order(order)
+
             with transaction.atomic():
-                # FIX (stock race-condition): same shared, locked,
-                # audited helper as the customer-facing cancel view.
+                # FIX (stock race-condition + B59): same shared, locked,
+                # audited helper as the customer-facing cancel view — and
+                # it's a no-op if this order's stock was never deducted
+                # (i.e. it was cancelled before payment was ever confirmed).
                 restore_stock_for_order(order, user=request.user)
 
                 if hasattr(order, "payment"):
+                    was_paid_before_cancel = order.payment.status == "paid"
                     order.payment.status = "refunded"
+                    order.payment.refunded_at = timezone.now()
                     order.payment.save()
 
         order.status = new_status
@@ -530,6 +713,7 @@ class AdminOrderStatusUpdateView(APIView):
             "pending_payment": "Awaiting Payment",
             "confirmed": "Order Confirmed",
             "shipped": "Order Shipped",
+            "out_for_delivery": "Out for Delivery",
             "delivered": "Order Delivered",
             "cancelled": "Order Cancelled",
         }
@@ -537,11 +721,21 @@ class AdminOrderStatusUpdateView(APIView):
         status_messages = {
             "pending_payment": f"Your order #{order.order_number} is awaiting payment.",
             "confirmed": f"Your order #{order.order_number} has been confirmed.",
-            "shipped": f"Your order #{order.order_number} is on its way.",
+            "shipped": f"Your order #{order.order_number} has been shipped.",
+            "out_for_delivery": f"Your order #{order.order_number} is out for delivery.",
             "delivered": f"Your order #{order.order_number} has been delivered.",
-            "cancelled": f"Your order #{order.order_number} has been cancelled.",
+            "cancelled": (
+                f"Your order #{order.order_number} has been cancelled. "
+                f"Reason: {order.cancellation_reason}"
+                if order.cancellation_reason
+                else f"Your order #{order.order_number} has been cancelled."
+            ),
         }
 
+        # FIX (B28): this notification already existed and already fires
+        # correctly on every admin status change (including cancellation)
+        # — kept as-is, just extended with the new statuses above so the
+        # customer's status always matches what the admin set.
         create_notification(
             user=order.customer.user,
             store=order.store,
@@ -553,8 +747,69 @@ class AdminOrderStatusUpdateView(APIView):
             notification_type="order",
         )
 
+        if new_status == "cancelled" and was_paid_before_cancel:
+            send_refund_confirmation_email(order)
+
+        response_data = OrderDetailSerializer(order).data
+        if suggested_alternatives:
+            response_data["suggested_alternatives"] = suggested_alternatives
+
+        return Response(response_data)
+
+
+# NEW (B29): "ability to re-pay for a reinstated order" — lets an admin
+# undo a cancellation and put the order back into pending_payment so the
+# customer can pay for it again via the existing, already-working Pay Now
+# flow (CreatePaymentIntentView in payments/views.py already supports any
+# order_number whose payment isn't "paid" yet — B31 needed no backend
+# change, this is what makes it usable for a previously-cancelled order).
+class AdminOrderReinstateView(APIView):
+    """PUT /api/v1/admin/orders/{order_number}/reinstate/"""
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+
+    def put(self, request, order_number):
+        try:
+            order = Order.objects.get(order_number=order_number)
+        except Order.DoesNotExist:
+            return Response(
+                {"error": "Order not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if order.status != "cancelled":
+            return Response(
+                {"error": "Only a cancelled order can be reinstated."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        order.status = "pending_payment"
+        order.cancellation_reason = None
+        order.save()
+
+        if hasattr(order, "payment"):
+            # A fresh PaymentIntent must be created next time the customer
+            # pays — clearing the old id prevents CreatePaymentIntentView's
+            # "already paid" check from getting confused by stale data, and
+            # avoids ever reusing a Stripe intent tied to the old attempt.
+            order.payment.status = "pending"
+            order.payment.stripe_payment_intent_id = None
+            order.payment.paid_at = None
+            order.payment.refunded_at = None
+            order.payment.save()
+
+        create_notification(
+            user=order.customer.user,
+            store=order.store,
+            title="Order Reinstated",
+            message=(
+                f"Your order #{order.order_number} has been reinstated. "
+                "You can complete payment to proceed with it."
+            ),
+            notification_type="order",
+        )
+
         return Response(OrderDetailSerializer(order).data)
-    
+
 # Returns filtered order list for administrators.
 class AdminOrderFilterView(generics.ListAPIView):
     """

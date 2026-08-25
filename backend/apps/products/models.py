@@ -132,6 +132,9 @@ class StockMovement(models.Model):
         # adjust endpoint's serializer choices):
         ('order_placed', 'Order Placed (checkout)'),
         ('order_cancelled', 'Order Cancelled (stock restored)'),
+        # FIX (B59): stock deduction ab checkout pe nahi, payment confirm
+        # hone par hoti hai — ye reason us waqt use hota hai.
+        ('order_confirmed', 'Order Payment Confirmed (stock deducted)'),
     ]
 
     product = models.ForeignKey(

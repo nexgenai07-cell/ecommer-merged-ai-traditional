@@ -58,10 +58,13 @@ class Customer(models.Model):
 # Stores the main order information after checkout.
 class Order(models.Model):
     # Defines all possible order statuses.
+    # FIX (B30): "out_for_delivery" added — was completely missing before,
+    # so admins had no way to mark an order as on its way.
     STATUS_CHOICES = [
         ("pending_payment", "Pending Payment"),
         ("confirmed", "Confirmed"),
         ("shipped", "Shipped"),
+        ("out_for_delivery", "Out for Delivery"),
         ("delivered", "Delivered"),
         ("cancelled", "Cancelled"),
     ]
@@ -121,6 +124,19 @@ class Order(models.Model):
         null=True,
         blank=True,
     )
+
+    # FIX (B27): admin ab cancel karte waqt reason dena mandatory hai —
+    # ye field wahi reason store karti hai (order fairly cancel hua, koi
+    # bhi baad mein wajah dekh sakta hai).
+    cancellation_reason = models.TextField(
+        null=True,
+        blank=True,
+    )
+
+    # FIX (B59): stock ab checkout pe nahi, is flag ke true hone pe (yani
+    # payment confirm hone ke baad) deduct hoti hai. Ye guard rakhta hai
+    # taake ek order ki stock kabhi do baar deduct/restore na ho.
+    stock_deducted = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -197,6 +213,14 @@ class Payment(models.Model):
     )
 
     paid_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    # FIX (B29): "no refund proof" — jab bhi refund hota hai (order cancel
+    # hone par), timestamp yahan record hota hai taake customer/admin ko
+    # confirmation mile ke refund process ho chuka hai.
+    refunded_at = models.DateTimeField(
         null=True,
         blank=True,
     )

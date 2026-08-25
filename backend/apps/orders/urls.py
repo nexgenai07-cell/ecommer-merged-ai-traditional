@@ -12,6 +12,7 @@ from .views import (
     OrderTrackView,
     AdminOrderListView,
     AdminOrderStatusUpdateView,
+    AdminOrderReinstateView,
     AdminOrderFilterView,
     )
 from .return_views import (
@@ -40,6 +41,7 @@ admin_order_urlpatterns = [
     path("filter/", AdminOrderFilterView.as_view(), name="admin-order-filter"),
     path("<str:order_number>/", AdminOrderDetailView.as_view(), name="admin-order-detail"),
     path("<str:order_number>/status/", AdminOrderStatusUpdateView.as_view(), name="admin-order-status"),
+    path("<str:order_number>/reinstate/", AdminOrderReinstateView.as_view(), name="admin-order-reinstate"),
 ]
 
 # Returns (mounted at /api/v1/returns/ and /api/v1/admin/returns/)
