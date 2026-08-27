@@ -52,6 +52,11 @@ class User(AbstractBaseUser, PermissionsMixin):
     email_verified  = models.BooleanField(default=False)
     is_active       = models.BooleanField(default=True)
     is_staff        = models.BooleanField(default=False)
+    # Soft-delete flag. Matches migration 0004_user_is_delete, which added
+    # this column to the database, but the field was missing from this
+    # model class — causing AttributeError: 'User' object has no attribute
+    # 'is_delete' whenever serializers.py / views.py accessed user.is_delete.
+    is_delete       = models.BooleanField(default=False)
     created_at      = models.DateTimeField(auto_now_add=True)
     updated_at      = models.DateTimeField(auto_now=True)
 
@@ -160,5 +165,3 @@ class EmailVerification(models.Model):
             token=secrets.token_urlsafe(32),
             expires_at=timezone.now() + timedelta(hours=validity_hours),
         )
-        
-        
