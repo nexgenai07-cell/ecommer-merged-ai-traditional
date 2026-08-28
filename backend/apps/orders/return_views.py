@@ -9,17 +9,20 @@ from rest_framework.response import Response
 from apps.returns.models import Return
 from apps.returns.serializers import ReturnSerializer, CreateReturnSerializer, AdminReturnStatusSerializer
 from .models import Order
-from apps.users.permissions import IsAdmin
+# FIX (B43): IsCustomer import ki gayi taake return-request endpoint bhi
+# admin login se accessible na ho.
+from apps.users.permissions import IsAdmin, IsCustomer
 from core.pagination import StandardResultsPagination
 
 # Allows customers to submit a return request for an order.
-# Only logged-in users can request returns.
+# Only logged-in customers can request returns.
 class CreateReturnView(APIView):
     """
     POST /api/v1/orders/{order_number}/return/
     Customer can only request a return on a DELIVERED order.
     """
-    permission_classes = [permissions.IsAuthenticated]
+    # FIX (B43): customer-only.
+    permission_classes = [permissions.IsAuthenticated, IsCustomer]
 
 # Finds the customer's order using the order number.
 # Returns are only allowed after the order has been delivered.
@@ -36,9 +39,15 @@ class CreateReturnView(APIView):
             )
 
 # Prevents creating multiple return requests for the same order.
+        # FIX (B55): "pending" is not a valid Return status — the model's
+        # STATUS_CHOICES only has "requested" (default), "approved",
+        # "rejected", "completed". This meant the duplicate-check below
+        # never matched anything real, AND every new return was being
+        # saved with an invalid status (see fix below) that the admin
+        # returns page couldn't recognize/filter on correctly.
         if Return.objects.filter(
                order=order,
-               status__in=["pending", "approved"]
+               status__in=["requested", "approved"]
             ).exists():
             return Response({'error': 'A return request already exists for this order.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -46,11 +55,12 @@ class CreateReturnView(APIView):
         serializer.is_valid(raise_exception=True)
 
 # Creates a new return request in the database.
+        # FIX (B55): status='pending' -> 'requested' (matches Return.STATUS_CHOICES).
         return_request = Return.objects.create(
             order=order,
             customer=order.customer,
             reason=serializer.validated_data['reason'],
-            status='pending',
+            status='requested',
         )
 
         return Response(ReturnSerializer(return_request).data, status=status.HTTP_201_CREATED)

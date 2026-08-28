@@ -131,20 +131,23 @@ class DashboardView(APIView):
         today_orders = Order.objects.filter(created_at__date=today).count()
 
 
-        pending_orders = Order.objects.filter(status='pending').count()
-        low_stock_products = Product.objects.filter(
-    is_active=True,
-    is_delete=False,
-).count()
+        # FIX (B45): Order.STATUS_CHOICES has "pending_payment", not a bare
+        # "pending" — that value never matches any real order, so this
+        # count was always wrong (usually 0). Corrected to the real value.
+        pending_orders = Order.objects.filter(status='pending_payment').count()
 
+        # FIX (B45): removed the dead first computation of
+        # low_stock_products (it was calculated once with .count(), then
+        # immediately overwritten below) — kept only the correct
+        # threshold-based calculation.
         low_stock_products = sum(
-    1
-    for p in Product.objects.filter(
-        is_active=True,
-        is_delete=False,
-    )
-    if p.stock <= p.low_stock_threshold
-)
+            1
+            for p in Product.objects.filter(
+                is_active=True,
+                is_delete=False,
+            )
+            if p.stock <= p.low_stock_threshold
+        )
 
         data = {
             'total_revenue': total_revenue,
