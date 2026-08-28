@@ -21,7 +21,9 @@ class CategoryViewSet(viewsets.ModelViewSet):
     pagination_class = None
 
     def get_queryset(self):
-        queryset = Category.objects.filter(is_delete=False).order_by("name")
+        queryset = Category.objects.filter(
+            is_delete=False
+        ).order_by("name")
 
         # Customers and guests only see active categories.
         # Admins see both active and inactive categories.
@@ -36,36 +38,61 @@ class CategoryViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
         if self.action in ["list", "retrieve"]:
             return [permissions.AllowAny()]
-        return [permissions.IsAuthenticated(), IsAdmin()]
+
+        return [
+            permissions.IsAuthenticated(),
+            IsAdmin(),
+        ]
 
     def perform_create(self, serializer):
-        # Automatically assign the logged-in admin's store.
+        """
+        Create a new category for the logged-in admin's store.
+
+        B49 FIX:
+        Newly created categories must immediately be visible
+        on the customer-facing site, so they are always created
+        with is_active=True and is_delete=False.
+        """
+
         user_store = self.request.user.stores.first()
 
-        if user_store:
-            serializer.save(store=user_store)
-        else:
+        if not user_store:
             from rest_framework.exceptions import ValidationError
 
             raise ValidationError(
                 {
-                    "detail": "This admin user is not associated with any store in the database."
+                    "detail": (
+                        "This admin user is not associated with any "
+                        "store in the database."
+                    )
                 }
             )
 
+        serializer.save(
+            store=user_store,
+            is_active=True,
+            is_delete=False,
+        )
+
     def perform_destroy(self, instance):
-      """
-    Soft delete category.
-    """
-      instance.is_active = False
-      instance.is_delete = True
-      instance.save(update_fields=["is_active", "is_delete"])
+        """
+        Soft delete category.
+        """
+        instance.is_active = False
+        instance.is_delete = True
+
+        instance.save(
+            update_fields=["is_active", "is_delete"]
+        )
 
     def destroy(self, request, *args, **kwargs):
         """
         DELETE /api/v1/categories/{id}/
-        Soft delete the category.
+
+        Soft delete the category instead of permanently
+        removing it from the database.
         """
+
         instance = self.get_object()
         self.perform_destroy(instance)
 
