@@ -32,7 +32,6 @@ class GoogleLoginView(APIView):
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
-        firebase_uid = decoded_token.get("uid")
         email = decoded_token.get("email")
         name = decoded_token.get("name", "")
 
@@ -43,6 +42,8 @@ class GoogleLoginView(APIView):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        email = email.lower().strip()
 
         # Find existing account
         user = User.objects.filter(email=email).first()
@@ -56,25 +57,23 @@ class GoogleLoginView(APIView):
                 role="customer",
             )
 
-        # Don't allow deleted/deactivated accounts
-        if user.is_delete or not user.is_active:
+        # Don't allow deactivated accounts
+        if not user.is_active:
             return Response(
                 {
                     "account_deactivated": True,
                     "email": user.email,
-                    "message": (
-                        "This account has been deleted or deactivated."
-                    ),
+                    "message": "This account is deactivated.",
                 },
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        # Google has already verified the user's email
+        # Google/Firebase authenticated email
         if not user.email_verified:
             user.email_verified = True
             user.save(update_fields=["email_verified"])
 
-        # Generate JWT
+        # Generate JWT tokens
         refresh = RefreshToken.for_user(user)
 
         # Google login behaves like Remember Me = True

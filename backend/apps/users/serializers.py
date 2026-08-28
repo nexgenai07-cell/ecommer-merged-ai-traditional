@@ -37,37 +37,15 @@ class RegisterSerializer(serializers.ModelSerializer):
         }
 
     def validate_email(self, value):
+      value = value.lower().strip()
 
-        # Check if this email belongs to a previously deleted account
-        deleted_user = User.objects.filter(
-            email=value,
-            is_delete=True
-        ).first()
+      if User.objects.filter(email=value).exists():
+        raise serializers.ValidationError(
+            "A user with this email already exists."
+        )
 
-        if deleted_user:
-            raise serializers.ValidationError(
-                {
-                    "account_deleted": True,
-                    "message": (
-                        "This account was deleted. "
-                        "Please reactivate your account."
-                    ),
-                    "email": value,
-                }
-            )
+      return value
 
-        # Check active accounts only
-        if User.objects.filter(
-            email=value,
-            is_delete=False
-        ).exists():
-            raise serializers.ValidationError(
-                "A user with this email already exists."
-            )
-
-        return value
-    
-    
     def validate_phone(self, value):
        if value and not value.isdigit():
         raise serializers.ValidationError(

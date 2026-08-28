@@ -57,20 +57,19 @@ class ProductListSerializer(serializers.ModelSerializer):
 
     # Returns the primary product image URL.
     def get_primary_image(self, obj):
-        img = obj.images.filter(is_primary=True).first() or obj.images.first()
+      images = list(obj.images.all())
 
-        if not img:
-            return None
+      primary = next(
+        (img for img in images if img.is_primary),
+        None,
+    )
 
-        image = img.image
+      img = primary or (images[0] if images else None)
 
-        if not image:
-            return None
+      if not img or not img.image:
+        return None
 
-        if hasattr(image, "url"):
-            return image.url.replace("http://", "https://")
-
-        return str(image)
+      return img.image.url.replace("http://", "https://")
 
 # Used for the Low Stock API to display products that need restocking.
 class LowStockProductSerializer(serializers.ModelSerializer):

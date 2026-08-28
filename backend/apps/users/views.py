@@ -1,5 +1,7 @@
 # PATH: apps/users/views.py
 from datetime import timedelta
+from threading import Thread
+
 from rest_framework import status, generics, permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -112,10 +114,13 @@ class RegisterView(generics.CreateAPIView):
 
         user = serializer.save()
 
-        try:
-            send_verification_email(user)
-        except Exception as exc:
-            print("Verification email failed:", exc)
+        # Send verification email in the background so registration
+        # does not wait for the Resend API response.
+        Thread(
+            target=self._send_verification_email,
+            args=(user,),
+            daemon=True,
+        ).start()
 
         return Response(
             {
@@ -128,7 +133,12 @@ class RegisterView(generics.CreateAPIView):
             status=status.HTTP_201_CREATED,
         )
 
-
+    @staticmethod
+    def _send_verification_email(user):
+        try:
+            send_verification_email(user)
+        except Exception as exc:
+            print("Verification email failed:", exc)
 # Authenticates users, verifies email status,
 # checks two-factor authentication, and returns JWT tokens.
 class LoginView(APIView):
