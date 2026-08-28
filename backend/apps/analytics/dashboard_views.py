@@ -150,17 +150,17 @@ class DashboardView(APIView):
         )
 
         data = {
-            'total_revenue': total_revenue,
-            'total_orders': total_orders,
-            'total_customers': total_customers,
-            'total_products': total_products,
-            'revenue_growth': growth_pct(this_period_revenue, prev_period_revenue),
-            'orders_growth': growth_pct(this_period_orders, prev_period_orders),
-            'pending_orders': pending_orders,
-            'low_stock_products': low_stock_products,
-            'today_revenue': today_revenue,
-            'today_orders': today_orders,
-        }
+         'total_revenue': total_revenue,
+         'total_orders': total_orders,
+         'total_customers': total_customers,
+         'total_products': total_products,
+         'revenue_growth': growth_pct(this_period_revenue, prev_period_revenue),
+         'orders_growth': growth_pct(this_period_orders, prev_period_orders),
+         'pending_orders': pending_orders,
+         'low_stock_products': low_stock_products,
+         'today_revenue': today_revenue,
+         'today_orders': today_orders,
+}
 
 
         cache.set(cache_key, data, timeout=300)  # 5 minutes
