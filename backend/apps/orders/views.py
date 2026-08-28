@@ -36,7 +36,10 @@ from .serializers import (
 from apps.cart.models import Cart
 from apps.products.models import Product, StockMovement
 from apps.stores.models import Store
-from apps.users.permissions import IsAdmin
+# FIX (B43): IsCustomer ab import ho rahi hai taake customer-only
+# endpoints par admin ka login access na kar sake (pehle sirf IsAdmin
+# import thi, IsCustomer kahin bhi use nahi ho rahi thi).
+from apps.users.permissions import IsAdmin, IsCustomer
 
 
 def generate_order_number(): # Generates a unique order number for every new order.
@@ -217,7 +220,10 @@ def suggest_alternatives_for_order(order):
 
 # Handles checkout by creating an order, validating stock and creating payment.
 class CheckoutView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+    # FIX (B43): admin login ab checkout nahi kar sakta — sirf customer
+    # role allowed hai. Pehle IsAuthenticated hi kaafi tha, is liye admin
+    # token bhi is endpoint ko hit kar sakta tha.
+    permission_classes = [permissions.IsAuthenticated, IsCustomer]
 
 # Validates cart, creates order, and creates a pending payment. Stock is
 # intentionally NOT deducted here anymore (see FIX B59 below).
@@ -403,7 +409,8 @@ class CheckoutView(APIView):
 # customer already has saved, instead of asking them to retype everything.
 class CheckoutPrefillView(APIView):
     """GET /api/v1/orders/checkout/prefill/"""
-    permission_classes = [permissions.IsAuthenticated]
+    # FIX (B43): customer-only.
+    permission_classes = [permissions.IsAuthenticated, IsCustomer]
 
     def get(self, request):
         customer = Customer.objects.filter(user=request.user).first()
@@ -421,7 +428,8 @@ class CheckoutPrefillView(APIView):
 # fixes it being non-functional by giving it a real endpoint to call.
 class SaveAddressView(APIView):
     """PUT /api/v1/orders/save-address/"""
-    permission_classes = [permissions.IsAuthenticated]
+    # FIX (B43): customer-only.
+    permission_classes = [permissions.IsAuthenticated, IsCustomer]
 
     def put(self, request):
         serializer = SaveAddressSerializer(data=request.data)
@@ -461,7 +469,9 @@ class OrderListView(generics.ListAPIView):
     had via AdminOrderFilterView.
     """
     serializer_class = OrderListSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    # FIX (B43): customer-only — this returns the logged-in user's own
+    # order history, so an admin account should never be able to call it.
+    permission_classes = [permissions.IsAuthenticated, IsCustomer]
     pagination_class = StandardResultsPagination
 
     def get_queryset(self): # Fetches customer order history.
@@ -509,7 +519,8 @@ class OrderDetailView(generics.RetrieveAPIView):
 # Allows a customer to cancel an order.
 class OrderCancelView(APIView):
     """PUT /api/v1/orders/{order_number}/cancel/"""
-    permission_classes = [permissions.IsAuthenticated]
+    # FIX (B43): customer-only.
+    permission_classes = [permissions.IsAuthenticated, IsCustomer]
 
 # Cancels order, restores stock (if any was deducted) and updates payment.
     def put(self, request, order_number):

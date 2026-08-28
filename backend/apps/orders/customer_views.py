@@ -22,12 +22,23 @@ class AdminCustomerListView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
     pagination_class = None
     
-# Fetches all customers and applies search filters if provided.
+# Fetches all customers and applies search + order-status filters if provided.
     def get_queryset(self):
         qs = Customer.objects.select_related('user').all().order_by('-created_at')
         search = self.request.query_params.get('search')
         if search:
             qs = qs.filter(Q(name__icontains=search) | Q(phone__icontains=search) | Q(email__icontains=search))
+
+        # FIX (B57): "Pending" filter tha hi nahi is view mein — is liye
+        # kaam nahi kar raha tha. Ab ?status=pending_payment (ya koi bhi
+        # valid Order status) se customers ko filter kiya ja sakta hai
+        # jinke us status waale order hain. .distinct() isliye taake ek
+        # customer ke multiple matching orders hone par woh list mein
+        # duplicate na aaye.
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            qs = qs.filter(orders__status=status_filter).distinct()
+
         return qs
 
 # Returns complete information for a selected customer.

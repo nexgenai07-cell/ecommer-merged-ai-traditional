@@ -147,20 +147,25 @@ class Complaint(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-class Meta:
-    db_table = "complaints"
-    ordering = ["-created_at"]
+    # FIX: Meta/clean/save/__str__ pehle module-level par (Complaint class
+    # ke bahar) likhe hue the — is wajah se ye Complaint model ka hissa
+    # bante hi nahi the: db_table/ordering apply nahi hoti thi, order<->
+    # customer validation kabhi chalti nahi thi, aur save() override kaam
+    # nahi karta tha. Ab sahi tarah class ke andar indent kar diya.
+    class Meta:
+        db_table = "complaints"
+        ordering = ["-created_at"]
 
-def clean(self):
-    if self.order and self.customer:
-        if self.order.customer_id != self.customer_id:
-            raise ValidationError(
-                "Selected order does not belong to this customer."
-            )
+    def clean(self):
+        if self.order and self.customer:
+            if self.order.customer_id != self.customer_id:
+                raise ValidationError(
+                    "Selected order does not belong to this customer."
+                )
 
-def save(self, *args, **kwargs):
-    self.full_clean()
-    super().save(*args, **kwargs)
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
 
-def __str__(self):
-    return f"Complaint by {self.customer.name} [{self.status}]"
+    def __str__(self):
+        return f"Complaint by {self.customer.name} [{self.status}]"
