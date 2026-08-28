@@ -192,6 +192,34 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
             )
 
         return value
+    
+    def validate(self, data):
+      price = data.get(
+        "price",
+        getattr(self.instance, "price", None),
+    )
+
+      original_price = data.get(
+        "original_price",
+        getattr(self.instance, "original_price", None),
+    )
+
+      if (
+        price is not None
+        and original_price is not None
+        and price > original_price
+    ):
+        raise serializers.ValidationError(
+            {
+                "price": (
+                    "Actual price cannot be greater than "
+                    "original price because this would create "
+                    "a negative discount."
+                )
+            }
+        )
+
+      return data
 
     # Updates existing product information.
     def update(self, instance, validated_data):
