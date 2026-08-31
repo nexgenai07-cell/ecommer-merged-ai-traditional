@@ -172,17 +172,35 @@ class ProductViewSet(viewsets.ModelViewSet):
              Response(serializer.data); now uses paginate_queryset() /
              get_paginated_response() so the shape matches the documented
              {count, next, previous, results}, same as the standard list().
+          4. FIX (A1): 'q' ab sirf name/description nahi, sku bhi match
+             karta h — ?q=ELE-BUL-A1C9 ab us product ko dhoond leta h
+             chahe wo string name mei kahin na ho.
+          5. FIX (A1): 'in_stock=false' pehle silently ignore ho raha tha
+             (sirf 'true' check hota tha), is liye out-of-stock filter
+             kabhi lagta hi nahi tha aur count hamesha poore catalog ka
+             aata tha. Ab 'false' explicitly stock<=0 pe filter karta h.
+          6. FIX (A1/E3): 'category_id' ab multiple values accept karta h
+             — comma-separated (?category_id=5,8) aur repeated
+             (?category_id=5&category_id=8) dono formats chalte hain.
         """
         qs = self.get_queryset()
 
         q = request.query_params.get('q')
         if q:
-            qs = qs.filter(Q(name__icontains=q) | Q(description__icontains=q))
+            qs = qs.filter(
+                Q(name__icontains=q) |
+                Q(description__icontains=q) |
+                Q(sku__icontains=q)
+            )
 
-        # FIX (Bug 1): 'category_id' ab sahi se padha ja raha hai.
-        category_id = request.query_params.get('category_id')
-        if category_id:
-            qs = qs.filter(category_id=category_id)
+        # FIX (Bug 1 / A1 / E3): 'category_id' ab sahi se padha ja raha hai,
+        # aur ek se zyada values bhi accept karta h.
+        category_id_values = request.query_params.getlist('category_id')
+        category_ids = []
+        for raw in category_id_values:
+            category_ids.extend([v.strip() for v in raw.split(',') if v.strip()])
+        if category_ids:
+            qs = qs.filter(category_id__in=category_ids)
 
         min_price = request.query_params.get('min_price')
         if min_price:
@@ -192,9 +210,15 @@ class ProductViewSet(viewsets.ModelViewSet):
         if max_price:
             qs = qs.filter(price__lte=max_price)
 
+        # FIX (A1): 'false' ab explicitly handle ho raha h — pehle sirf
+        # 'true' check hota tha, is liye in_stock=false kabhi filter hi
+        # nahi karta tha aur count poore catalog ka aata tha.
         in_stock = request.query_params.get('in_stock')
-        if in_stock == 'true':
-            qs = qs.filter(stock__gt=0)
+        if in_stock is not None:
+            if in_stock.lower() == 'true':
+                qs = qs.filter(stock__gt=0)
+            elif in_stock.lower() == 'false':
+                qs = qs.filter(stock__lte=0)
 
         # FIX: 'ordering' param ab handle ho raha hai (pehle ignore hota tha).
         # Sirf inhi fields pe ordering allow hai — kisi bhi arbitrary column

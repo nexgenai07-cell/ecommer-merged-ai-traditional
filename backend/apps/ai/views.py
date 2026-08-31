@@ -13,6 +13,7 @@
 #   karega (Step 2 se connect karne ke liye).
 
 import uuid
+from django.db.models import Q
 from rest_framework import generics, permissions, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -21,6 +22,7 @@ from apps.stores.models import Store
 from apps.users.permissions import IsAdmin
 from .models import ChatSession, ChatMessage, AuditLog
 from .serializers import ChatSessionSerializer, ChatSessionHistorySerializer, AuditLogSerializer
+from core.pagination import StandardResultsPagination
 
 from apps.ai.mixins import ChatAuthErrorMixin
 from apps.ai.throttles import ChatUserRateThrottle
@@ -97,11 +99,36 @@ class ClearChatSessionView(ChatAuthErrorMixin, APIView):
 
 class AuditLogListView(generics.ListAPIView):
     """
-    GET /api/v1/admin/audit-logs/
+    GET /api/v1/admin/audit-logs/?page=&entity=&user=&search=
 
     Lets admin see a history of every action performed (web or WhatsApp).
     Read-only — logs are created internally by the system, not via this API.
+
+    FIX (A6): 'page' was already working via the project's global
+    DEFAULT_PAGINATION_CLASS (StandardResultsPagination) — set here
+    explicitly now so the shape doesn't silently depend on that global
+    setting. 'entity' and 'user' filter server-side; 'search' matches
+    the log's action text (the model has no separate "description"
+    field — 'action' is it, e.g. "create_product").
     """
     serializer_class = AuditLogSerializer
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
-    queryset = AuditLog.objects.select_related('user').all()
+    pagination_class = StandardResultsPagination
+
+    def get_queryset(self):
+        qs = AuditLog.objects.select_related('user').all()
+        params = self.request.query_params
+
+        entity = params.get('entity')
+        if entity:
+            qs = qs.filter(entity=entity)
+
+        user_id = params.get('user')
+        if user_id:
+            qs = qs.filter(user_id=user_id)
+
+        search = params.get('search')
+        if search:
+            qs = qs.filter(Q(action__icontains=search))
+
+        return qs

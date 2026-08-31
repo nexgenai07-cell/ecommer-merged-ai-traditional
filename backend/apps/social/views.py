@@ -4,11 +4,13 @@ from django.utils import timezone
 from rest_framework import viewsets, generics, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from django.db.models import Q
 
 from apps.users.permissions import IsAdmin
 from .models import SocialAccount, SocialPost, SocialPostAnalytics
 from .serializers import SocialAccountSerializer, SocialPostSerializer, SocialPostCreateSerializer
 from apps.notifications.utils import create_notification
+from core.pagination import StandardResultsPagination
 
 class SocialPostViewSet(viewsets.ModelViewSet):
     """
@@ -26,18 +28,25 @@ class SocialPostViewSet(viewsets.ModelViewSet):
     """
     queryset = SocialPost.objects.select_related('product', 'analytics').all()
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
-    # FIX (Postman testing — 09 Jul 2026): doc (API 91) expects a plain
-    # array for GET /social/posts/. This viewset was picking up the
-    # project's global DEFAULT_PAGINATION_CLASS (from DRF settings),
-    # which wrapped the response in {count, next, previous, results}.
-    # Setting pagination_class = None here overrides that for this
-    # viewset only, so list() goes back to a plain array.
-    pagination_class = None
+    # FIX (A4 — supersedes the 09 Jul fix below): the new backend spec
+    # (v7) requires full pagination parity with every other list
+    # endpoint here — "no partial fix, a bare array is not acceptable".
+    # That reverses the old pagination_class = None. 'search' (caption
+    # + hashtags) is new, added via get_queryset below.
+    pagination_class = StandardResultsPagination
 
     def get_serializer_class(self):
         if self.action == 'create':
             return SocialPostCreateSerializer
         return SocialPostSerializer
+
+    def get_queryset(self):
+        qs = self.queryset
+        # FIX (A4): 'search' now matches caption or hashtags.
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(Q(caption__icontains=search) | Q(hashtags__icontains=search))
+        return qs
 
     @action(detail=True, methods=['put'], url_path='approve')
     def approve(self, request, pk=None):
@@ -64,6 +73,7 @@ class SocialPostViewSet(viewsets.ModelViewSet):
             'status': post.status,
         })
 
+    # ... baaki file (reject, schedule, calendar, delete waghera) waisi hi h, koi change nahi
     @action(detail=True, methods=['put'], url_path='reject')
     def reject(self, request, pk=None):
         """

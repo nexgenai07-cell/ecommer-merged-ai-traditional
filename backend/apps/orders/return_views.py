@@ -68,12 +68,16 @@ class CreateReturnView(APIView):
 
 class ReturnListView(generics.ListAPIView):
     """
-    GET /api/v1/returns/ — customer sees own, admin sees all
+    GET /api/v1/returns/?ordering= — customer sees own, admin sees all
 
     FIX (Postman testing — 09 Jul 2026): doc (API 61) expects
     {count, next, previous, results}. pagination_class wasn't attached
     here before, so it fell back to no pagination at all / an
     incomplete shape. Now explicitly attached.
+
+    FIX (D1): 'ordering=created_at' / 'ordering=-created_at' now works
+    (default stays -created_at, same as before, when 'ordering' is
+    absent or not one of these two values).
     """
     serializer_class = ReturnSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -82,8 +86,14 @@ class ReturnListView(generics.ListAPIView):
     def get_queryset(self):
         user = self.request.user
         if user.role == 'admin':
-            return Return.objects.all().order_by('-created_at')
-        return Return.objects.filter(customer__user=user).order_by('-created_at')
+            qs = Return.objects.all()
+        else:
+            qs = Return.objects.filter(customer__user=user)
+
+        ordering = self.request.query_params.get('ordering')
+        if ordering in ('created_at', '-created_at'):
+            return qs.order_by(ordering)
+        return qs.order_by('-created_at')
 
 
 class ReturnDetailView(generics.RetrieveAPIView):

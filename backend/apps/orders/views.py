@@ -833,6 +833,7 @@ class AdminOrderFilterView(generics.ListAPIView):
     - search
     - customer_id
     - page
+    - ordering (created_at, total_amount — see D1 fix below)
     """
 
     serializer_class = AdminOrderListSerializer
@@ -884,6 +885,19 @@ class AdminOrderFilterView(generics.ListAPIView):
                 Q(contact_phone__icontains=search) |
                 Q(customer__phone__icontains=search)
             )
+
+        # FIX (D1): 'ordering' — created_at / total_amount, both real
+        # DB columns on Order, so no annotation needed (unlike the
+        # customers endpoint). Whitelisted the same way as Products'
+        # search endpoint — unknown values are silently ignored rather
+        # than raising a DB error.
+        allowed_ordering_fields = {
+            'created_at', '-created_at',
+            'total_amount', '-total_amount',
+        }
+        ordering = params.get('ordering')
+        if ordering in allowed_ordering_fields:
+            qs = qs.order_by(ordering)
 
         return qs
 

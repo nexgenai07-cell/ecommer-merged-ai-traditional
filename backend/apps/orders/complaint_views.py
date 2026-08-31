@@ -4,6 +4,8 @@ from rest_framework import status, permissions, generics
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from django.db.models import Q
+import re
 
 from apps.returns.models import Complaint
 from apps.returns.complaint_serializers import (
@@ -28,6 +30,13 @@ class CreateComplaintView(generics.ListCreateAPIView):
     {count, next, previous, results} for the GET/list action.
     pagination_class wasn't attached here before, so the response was
     missing the next/previous keys. Now explicitly attached.
+
+    FIX (A3): 'status' and 'search' query params now work (page already
+    did, via pagination_class above). 'search' matches the complaint's
+    reference number — the model has no dedicated reference-number
+    field, so formats like "CMP-36", "CP-36", "#CP-36", or a bare "36"
+    are all matched against the primary key — and/or the complaint's
+    message text.
     """
 
     serializer_class = ComplaintSerializer
@@ -39,12 +48,35 @@ class CreateComplaintView(generics.ListCreateAPIView):
     def get_queryset(self):
         user = self.request.user
         if user.role == "admin":
-            return Complaint.objects.all().order_by("-created_at")
-
+            qs = Complaint.objects.all().order_by("-created_at")
+        else:
 # Customers can only see their own complaints.
-        return Complaint.objects.filter(
-            customer__user=user
-        ).order_by("-created_at")
+            qs = Complaint.objects.filter(
+                customer__user=user
+            ).order_by("-created_at")
+
+        params = self.request.query_params
+
+        status_param = params.get("status")
+        if status_param:
+            qs = qs.filter(status=status_param)
+
+        # FIX (A3): reference number format ka jhamela avoid karne k liye
+        # regex se match kiya h — "CMP-36", "CP-36", "#CP-36", "#CMP36",
+        # ya sirf "36" — sab se id=36 resolve ho jata h. Poori string
+        # anchor (^...$) k sath match hoti h, is liye normal message-text
+        # searches (jinme numbers k sath asal alfaz bhi hon) galti se
+        # id-match nahi ban jate.
+        search = params.get("search")
+        if search:
+            search = search.strip()
+            search_filter = Q(message__icontains=search)
+            ref_match = re.match(r'^#?\s*[A-Za-z]{0,6}-?\s*(\d+)$', search)
+            if ref_match:
+                search_filter |= Q(id=int(ref_match.group(1)))
+            qs = qs.filter(search_filter)
+
+        return qs
 
     def create(self, request, *args, **kwargs):
         serializer = CreateComplaintSerializer(
