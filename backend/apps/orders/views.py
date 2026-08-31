@@ -870,11 +870,19 @@ class AdminOrderFilterView(generics.ListAPIView):
             qs = qs.filter(created_at__date__lte=end_date)
 
         # Search
+        # FIX (A5 - CRITICAL): search ab phone number pe bhi match karta h.
+        # Do jagah check ki ja rahi hain: Order.contact_phone (jo checkout
+        # k waqt diya gaya tha, guest checkout mei customer.phone se
+        # different ho sakta h) aur Customer.phone (customer ka saved
+        # number). Pehle sirf order_number aur customer name match hota
+        # tha, is liye admin phone number se order dhoond nahi pate the.
         search = params.get("search")
         if search:
             qs = qs.filter(
                 Q(order_number__icontains=search) |
-                Q(customer__name__icontains=search)
+                Q(customer__name__icontains=search) |
+                Q(contact_phone__icontains=search) |
+                Q(customer__phone__icontains=search)
             )
 
         return qs
