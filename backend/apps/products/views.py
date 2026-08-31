@@ -35,6 +35,9 @@ class ProductViewSet(viewsets.ModelViewSet):
     PUT    /api/v1/products/{id}/images/{image_id}/set-primary/ -> set primary (admin only)
 
     POST   /api/v1/products/{id}/stock/adjust/                  -> atomic stock adjustment (admin only)
+
+    GET    /api/v1/products/check-name/                         -> live name-availability check (admin only)
+    GET    /api/v1/products/check-sku/                           -> live SKU-availability check (admin only)
     """
     filter_backends = [filters.SearchFilter]
     search_fields = ['name', 'description']
@@ -366,5 +369,95 @@ class ProductViewSet(viewsets.ModelViewSet):
                 "message": "Primary image updated.",
                 "image_id": image.id,
             },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="check-name",
+        permission_classes=[permissions.IsAuthenticated, IsAdmin],
+    )
+    def check_name(self, request):
+        """
+        GET /api/v1/products/check-name/?name=Perfume&exclude_id=15
+
+        Checks whether a product name already exists.
+
+        Matching:
+        - case-insensitive
+        - trimmed
+        - exclude_id ignored when editing the same product
+        """
+        name = request.query_params.get("name")
+
+        if name is None:
+            return Response(
+                {"detail": "name query parameter is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        name = name.strip()
+
+        if not name:
+            return Response(
+                {"detail": "name query parameter cannot be empty."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        qs = Product.objects.filter(name__iexact=name)
+
+        exclude_id = request.query_params.get("exclude_id")
+
+        if exclude_id:
+            qs = qs.exclude(pk=exclude_id)
+
+        return Response(
+            {"exists": qs.exists()},
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="check-sku",
+        permission_classes=[permissions.IsAuthenticated, IsAdmin],
+    )
+    def check_sku(self, request):
+        """
+        GET /api/v1/products/check-sku/?sku=SKU123&exclude_id=15
+
+        Checks whether a product SKU already exists.
+
+        Matching:
+        - exact stored value
+        - case-sensitive
+        - exclude_id ignored when editing the same product
+        """
+        sku = request.query_params.get("sku")
+
+        if sku is None:
+            return Response(
+                {"detail": "sku query parameter is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        sku = sku.strip()
+
+        if not sku:
+            return Response(
+                {"detail": "sku query parameter cannot be empty."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        qs = Product.objects.filter(sku=sku)
+
+        exclude_id = request.query_params.get("exclude_id")
+
+        if exclude_id:
+            qs = qs.exclude(pk=exclude_id)
+
+        return Response(
+            {"exists": qs.exists()},
             status=status.HTTP_200_OK,
         )

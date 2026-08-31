@@ -1,4 +1,5 @@
 from rest_framework import viewsets, permissions, status
+from rest_framework.decorators import action
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
 
@@ -14,6 +15,9 @@ class CategoryViewSet(viewsets.ModelViewSet):
     GET    /api/v1/categories/{id}/  -> retrieve (anyone)
     PUT    /api/v1/categories/{id}/  -> update (admin only)
     DELETE /api/v1/categories/{id}/  -> soft delete (admin only)
+
+    GET    /api/v1/categories/check-name/
+           -> check category name availability (admin only)
     """
 
     serializer_class = CategorySerializer
@@ -43,6 +47,48 @@ class CategoryViewSet(viewsets.ModelViewSet):
             permissions.IsAuthenticated(),
             IsAdmin(),
         ]
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="check-name",
+        permission_classes=[permissions.IsAuthenticated, IsAdmin],
+    )
+    def check_name(self, request):
+        """
+        GET /api/v1/categories/check-name/?name=&exclude_id=
+
+        Checks whether a category name already exists.
+
+        Matching:
+        - Case-insensitive
+        - Leading/trailing spaces ignored
+
+        exclude_id:
+        - Used when editing an existing category
+        - Prevents the category from being detected as a duplicate of itself
+        """
+
+        name = request.query_params.get("name", "").strip()
+        exclude_id = request.query_params.get("exclude_id")
+
+        if not name:
+            return Response(
+                {"detail": "name is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        queryset = Category.objects.filter(
+            name__iexact=name
+        )
+
+        if exclude_id:
+            queryset = queryset.exclude(pk=exclude_id)
+
+        return Response(
+            {"exists": queryset.exists()},
+            status=status.HTTP_200_OK,
+        )
 
     def perform_create(self, serializer):
         """
@@ -78,6 +124,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
         """
         Soft delete category.
         """
+
         instance.is_active = False
         instance.is_delete = True
 

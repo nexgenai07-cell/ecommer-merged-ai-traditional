@@ -124,3 +124,52 @@ class DiscountValidateView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+        
+class DiscountCodeAvailabilityView(APIView):
+    """
+    GET /api/v1/discounts/check-code/
+
+    Checks whether a discount code already exists.
+
+    Query parameters:
+        code: required
+        exclude_id: optional, used when editing an existing discount
+
+    Response:
+        {"exists": true}
+        {"exists": false}
+    """
+
+    permission_classes = [
+        permissions.IsAuthenticated,
+        IsAdmin,
+    ]
+
+    def get(self, request):
+        code = request.query_params.get("code")
+
+        if not code:
+            return Response(
+                {"detail": "code is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Discount codes are stored uppercase.
+        code = code.strip().upper()
+
+        queryset = Discount.objects.filter(
+            code__iexact=code,
+            is_delete=False,
+        )
+
+        exclude_id = request.query_params.get("exclude_id")
+
+        if exclude_id:
+            queryset = queryset.exclude(id=exclude_id)
+
+        return Response(
+            {
+                "exists": queryset.exists()
+            },
+            status=status.HTTP_200_OK,
+        )
