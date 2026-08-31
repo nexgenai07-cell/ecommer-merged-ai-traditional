@@ -9,7 +9,9 @@ from apps.stores.models import Store
 logger = logging.getLogger(__name__)
 
 
-def create_notification(user, title, message, notification_type, store=None, sent_via="web"):
+# FIX (B2): default sent_via updated from "web" to "in_app" to match
+# the new Notification.SENT_VIA_CHOICES (in_app/email/sms).
+def create_notification(user, title, message, notification_type, store=None, sent_via="in_app"):
     if store is None:
         store = Store.objects.first()
 

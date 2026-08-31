@@ -160,22 +160,36 @@ class SendNotificationView(APIView):
     POST /api/v1/notifications/send/
 
     Admin-only endpoint to manually create/send a notification.
-    Unchanged in this round - sent_via value list (B2) is being handled
-    separately.
     """
 
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
+
+    # FIX (B2): final, confirmed sent_via values - kept in sync with
+    # Notification.SENT_VIA_CHOICES on the model.
+    ALLOWED_SENT_VIA = {"in_app", "email", "sms"}
 
     def post(self, request):
         user_id = request.data.get("user")
         title = request.data.get("title")
         message = request.data.get("message")
         notif_type = request.data.get("type", "system")
-        sent_via = request.data.get("sent_via", "web")
+        sent_via = request.data.get("sent_via", "in_app")
 
         if not title or not message:
             return Response(
                 {"error": "title and message are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # FIX (B2): previously any string was accepted here and saved
+        # as-is (model 'choices' aren't enforced by .create(), only by
+        # full_clean()) - an invalid sent_via would silently save bad
+        # data instead of erroring. Now validated explicitly.
+        if sent_via not in self.ALLOWED_SENT_VIA:
+            return Response(
+                {
+                    "error": f"Invalid 'sent_via'. Accepted values: {sorted(self.ALLOWED_SENT_VIA)}",
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 

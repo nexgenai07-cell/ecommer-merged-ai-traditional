@@ -10,10 +10,19 @@ class Notification(models.Model):
         ("system", "System"),
     ]
 
+    # FIX (B2): aligned with the frontend's actual dropdown values and
+    # with standard notification-channel naming (in_app / email / sms -
+    # same convention used by most notification platforms). 'web' is
+    # renamed to 'in_app' (same concept, just the standard name);
+    # 'whatsapp' is dropped - grep across the whole codebase confirmed
+    # nothing ever sets sent_via='whatsapp', it was a declared-but-
+    # unused choice. If WhatsApp delivery is actually needed later
+    # (there's already a whatsapp app in this project), it's a
+    # one-line addition back to this list + a migration.
     SENT_VIA_CHOICES = [
-        ("whatsapp", "WhatsApp"),
+        ("in_app", "In-App"),
         ("email", "Email"),
-        ("web", "Web"),
+        ("sms", "SMS"),
     ]
 
     store = models.ForeignKey(
@@ -45,7 +54,7 @@ class Notification(models.Model):
     sent_via = models.CharField(
         max_length=20,
         choices=SENT_VIA_CHOICES,
-        default="web",
+        default="in_app",
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
