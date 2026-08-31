@@ -5,7 +5,9 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.core.cache import cache
-from django.db.models import Sum, Count, Min, Max, OuterRef, Subquery, IntegerField
+from django.db.models import (
+    Sum, Count, Min, Max, OuterRef, Subquery, IntegerField, Q, Value, DecimalField,
+)
 from django.db.models.functions import (
     TruncDate,
     TruncWeek,
@@ -15,14 +17,15 @@ from django.db.models.functions import (
 )
 from django.utils import timezone
 
-from rest_framework import permissions
+from rest_framework import permissions, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 
 from apps.orders.models import Order, OrderItem, Customer
-from apps.products.models import Product
+from apps.products.models import Product, Discount
+from apps.social.models import SocialPost
+from apps.returns.models import Return, Complaint
 from apps.users.permissions import IsAdmin
-
 
 def parse_date_range(request):
     """
@@ -584,29 +587,63 @@ class InventoryAlertsView(APIView):
 
 class AnalyticsExportView(APIView):
     """
-    GET /api/v1/analytics/export/?start_date=&end_date=
-    Returns a CSV file of orders within the date range.
+    GET /api/v1/analytics/export/?type=<type>&start_date=&end_date=
+    Returns a CSV file for the requested report type.
+
+    FIX (B1): 'type' was completely ignored before this fix - every
+    request returned the exact same orders CSV no matter what type was
+    passed. Now dispatches to a type-specific CSV export. The 10
+    accepted values are exactly the ones the frontend already sends
+    (confirmed, none needed renaming):
+        sales, orders, discounts, inventory, returns, complaints,
+        social_posts, customers, revenue, products
+    A missing or unrecognized 'type' returns 400 with the full accepted
+    list, instead of silently exporting orders.
+
+    NOTE on column choices: the v7 doc didn't specify exact CSV columns
+    per type (only that each type must export "a real CSV, not an
+    error, not an empty file"), so the columns below are my best-effort
+    pick of what's actually useful per report. If the frontend/product
+    side wants specific columns for any of these, tell me and I'll
+    adjust - these are easy to change.
     """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
+    ALLOWED_TYPES = {
+        'sales', 'orders', 'discounts', 'inventory', 'returns',
+        'complaints', 'social_posts', 'customers', 'revenue', 'products',
+    }
 
     def get(self, request):
         import csv
         from django.http import HttpResponse
 
+        export_type = request.query_params.get('type')
+        if export_type not in self.ALLOWED_TYPES:
+            return Response(
+                {
+                    'error': "Invalid or missing 'type' parameter.",
+                    'accepted_values': sorted(self.ALLOWED_TYPES),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         start_date, end_date, _ = parse_date_range(request)
-        qs = filter_orders_by_date(Order.objects.all(), start_date, end_date)
-
 
         response = HttpResponse(content_type='text/csv')
-        response['Content-Disposition'] = 'attachment; filename="orders_export.csv"'
-
-
+        response['Content-Disposition'] = f'attachment; filename="{export_type}_export.csv"'
         writer = csv.writer(response)
+
+        handler = getattr(self, f'_export_{export_type}')
+        handler(writer, start_date, end_date)
+
+        return response
+
+    # ---- per-type CSV handlers ----------------------------------------
+
+    def _export_orders(self, writer, start_date, end_date):
+        qs = filter_orders_by_date(Order.objects.all(), start_date, end_date)
         writer.writerow(['Order Number', 'Customer', 'Total Amount', 'Status', 'Payment Status', 'Created At'])
-
-
         for order in qs.select_related('customer', 'payment'):
             payment_status = order.payment.status if hasattr(order, 'payment') and order.payment else 'N/A'
             writer.writerow([
@@ -614,5 +651,128 @@ class AnalyticsExportView(APIView):
                 order.status, payment_status, order.created_at,
             ])
 
+    def _export_sales(self, writer, start_date, end_date):
+        # Per-order sales record: same underlying orders as the 'orders'
+        # export, trimmed/reshaped to what a sales report typically
+        # needs (item count instead of payment status).
+        qs = filter_orders_by_date(Order.objects.all(), start_date, end_date)
+        writer.writerow(['Order Number', 'Customer', 'Items', 'Total Amount', 'Status', 'Created At'])
+        for order in qs.select_related('customer').prefetch_related('items'):
+            writer.writerow([
+                order.order_number, order.customer.name, order.items.count(),
+                order.total_amount, order.status, order.created_at,
+            ])
 
-        return response
+    def _export_revenue(self, writer, start_date, end_date):
+        # Revenue-recognized orders only - excludes cancelled /
+        # pending_payment, same exclusion used for the customers
+        # total_spent calculation elsewhere (A2), for consistency.
+        qs = filter_orders_by_date(Order.objects.all(), start_date, end_date)
+        qs = qs.exclude(status__in=['cancelled', 'pending_payment'])
+        writer.writerow(['Order Number', 'Customer', 'Total Amount', 'Status', 'Created At'])
+        for order in qs.select_related('customer'):
+            writer.writerow([
+                order.order_number, order.customer.name,
+                order.total_amount, order.status, order.created_at,
+            ])
+
+    def _export_discounts(self, writer, start_date, end_date):
+        qs = Discount.objects.filter(is_delete=False)
+        if start_date:
+            qs = qs.filter(created_at__date__gte=start_date)
+        if end_date:
+            qs = qs.filter(created_at__date__lte=end_date)
+        writer.writerow(['Code', 'Type', 'Value', 'Min Order Amount', 'Start Date', 'End Date', 'Is Active', 'Created At'])
+        for d in qs:
+            writer.writerow([
+                d.code, d.type, d.value, d.min_order_amount or '',
+                d.start_date, d.end_date, d.is_active, d.created_at,
+            ])
+
+    def _export_inventory(self, writer, start_date, end_date):
+        # Inventory is a point-in-time snapshot (current stock levels),
+        # so start_date/end_date are intentionally not applied here.
+        qs = Product.objects.filter(is_delete=False).select_related('category')
+        writer.writerow(['SKU', 'Name', 'Category', 'Stock', 'Low Stock Threshold', 'Is Active'])
+        for p in qs:
+            writer.writerow([
+                p.sku, p.name, p.category.name if p.category else '',
+                p.stock, p.low_stock_threshold, p.is_active,
+            ])
+
+    def _export_products(self, writer, start_date, end_date):
+        qs = Product.objects.filter(is_delete=False).select_related('category')
+        if start_date:
+            qs = qs.filter(created_at__date__gte=start_date)
+        if end_date:
+            qs = qs.filter(created_at__date__lte=end_date)
+        writer.writerow(['SKU', 'Name', 'Category', 'Price', 'Stock', 'Is Active', 'Created At'])
+        for p in qs:
+            writer.writerow([
+                p.sku, p.name, p.category.name if p.category else '',
+                p.price, p.stock, p.is_active, p.created_at,
+            ])
+
+    def _export_returns(self, writer, start_date, end_date):
+        qs = Return.objects.select_related('order', 'customer')
+        if start_date:
+            qs = qs.filter(created_at__date__gte=start_date)
+        if end_date:
+            qs = qs.filter(created_at__date__lte=end_date)
+        writer.writerow(['Order Number', 'Customer', 'Reason', 'Status', 'Created At', 'Resolved At'])
+        for r in qs:
+            writer.writerow([
+                r.order.order_number, r.customer.name if r.customer else '',
+                r.reason, r.status, r.created_at, r.resolved_at or '',
+            ])
+
+    def _export_complaints(self, writer, start_date, end_date):
+        qs = Complaint.objects.select_related('customer', 'order')
+        if start_date:
+            qs = qs.filter(created_at__date__gte=start_date)
+        if end_date:
+            qs = qs.filter(created_at__date__lte=end_date)
+        writer.writerow(['ID', 'Customer', 'Order Number', 'Type', 'Status', 'Priority', 'Created At'])
+        for c in qs:
+            writer.writerow([
+                c.id, c.customer.name, c.order.order_number if c.order else '',
+                c.type, c.status, c.priority, c.created_at,
+            ])
+
+    def _export_social_posts(self, writer, start_date, end_date):
+        qs = SocialPost.objects.all()
+        if start_date:
+            qs = qs.filter(created_at__date__gte=start_date)
+        if end_date:
+            qs = qs.filter(created_at__date__lte=end_date)
+        writer.writerow(['ID', 'Platform', 'Caption', 'Hashtags', 'Status', 'Created At'])
+        for p in qs:
+            writer.writerow([
+                p.id, p.platform, p.caption, p.hashtags, p.status, p.created_at,
+            ])
+
+    def _export_customers(self, writer, start_date, end_date):
+        # Same "exclude cancelled + pending_payment" total_orders /
+        # total_spent logic as AdminCustomerListView (A2), for
+        # consistency between the admin customers list and this export.
+        qs = Customer.objects.all()
+        if start_date:
+            qs = qs.filter(created_at__date__gte=start_date)
+        if end_date:
+            qs = qs.filter(created_at__date__lte=end_date)
+
+        excluded_statuses = ['cancelled', 'pending_payment']
+        qs = qs.annotate(
+            _total_orders=Count(
+                'orders', filter=~Q(orders__status__in=excluded_statuses), distinct=True,
+            ),
+            _total_spent=Coalesce(
+                Sum('orders__total_amount', filter=~Q(orders__status__in=excluded_statuses)),
+                Value(0), output_field=DecimalField(),
+            ),
+        )
+        writer.writerow(['Name', 'Phone', 'Email', 'Total Orders', 'Total Spent', 'Created At'])
+        for c in qs:
+            writer.writerow([
+                c.name, c.phone, c.email or '', c._total_orders, c._total_spent, c.created_at,
+            ])
