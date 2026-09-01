@@ -7,14 +7,13 @@ Run with: python manage.py seed_data
 What it creates:
   - 1 Store (if not exists)
   - 1 Admin user (if not exists)
-  - 5 Customer users
-  - 12 Categories (Electronics, Clothing, Shoes, etc.)
-  - 60 Products across all categories (with prices, stock, SKUs)
+  - 5 Customer users + profiles
+  - 12 Categories (Electronics, Clothing, Shoes, etc.) — each with a real image
+  - 65 Products across all categories (with prices, stock, SKUs) — each with a real image
   - 4 Active discount codes
-  - 5 Sample customer profiles
-  - 8 Sample orders with items and payments
-  - 3 Sample returns
-  - 3 Sample complaints
+
+Orders/Returns/Complaints seeding was removed (schema mismatch with the
+current Order model — payment_method field doesn't exist on it).
 
 Safe to run multiple times — uses get_or_create everywhere.
 """
@@ -25,15 +24,17 @@ from decimal import Decimal
 from datetime import timedelta
 from django.core.management.base import BaseCommand
 from django.utils import timezone
+from django.utils.text import slugify
 from django.db import transaction
 from requests import options
+
+import cloudinary.uploader
 
 from apps.users.models import User
 from apps.stores.models import Store
 from apps.categories.models import Category
 from apps.products.models import Product, ProductImage, Discount
-from apps.orders.models import Customer, Order, OrderItem, Payment
-from apps.returns.models import Return, Complaint
+from apps.orders.models import Customer
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -44,6 +45,29 @@ def p(price):
 
 def pick(lst):
     return random.choice(lst)
+
+
+def upload_stock_photo(seed, folder):
+    """
+    Fetches a real (non-dummy) stock photo from Picsum and uploads it to
+    Cloudinary, returning the public_id to store on a CloudinaryField.
+    `seed` keeps the same photo consistent across re-runs (e.g. category
+    name or product SKU). Returns None (and prints a warning) instead of
+    raising, so one failed image never breaks the whole seed run.
+    """
+    try:
+        source_url = f"https://picsum.photos/seed/{slugify(seed)}/600/600"
+        result = cloudinary.uploader.upload(
+            source_url,
+            folder=folder,
+            public_id=slugify(seed),
+            overwrite=False,
+            unique_filename=False,
+        )
+        return result.get('public_id')
+    except Exception as e:
+        print(f"  [!] image upload failed for '{seed}': {e}")
+        return None
 
 
 # ─── Data ───────────────────────────────────────────────────────────────────
@@ -240,9 +264,7 @@ class Command(BaseCommand):
       if options['clear']:
         self.stdout.write(self.style.WARNING('Clearing existing data...'))
 
-        # Order data (can still be hard deleted because it has no soft delete)
-        OrderItem.objects.all().delete()
-        Order.objects.all().delete()
+        # Customer data
         Customer.objects.all().delete()
 
         # Soft delete Products
@@ -273,359 +295,153 @@ class Command(BaseCommand):
 
         self.stdout.write(self.style.SUCCESS('Data cleared.'))
 
-        # ── 1. Store ──────────────────────────────────────────────────────────
-        store = Store.objects.first()
-        if not store:
-            self.stdout.write(self.style.ERROR('No store found! Run "python manage.py seed_store" first.'))
-            return
-        self.stdout.write(f'Using store: {store.name}')
+      # ── 1. Store ──────────────────────────────────────────────────────────
+      store = Store.objects.first()
+      if not store:
+          self.stdout.write(self.style.ERROR('No store found! Run "python manage.py seed_store" first.'))
+          return
+      self.stdout.write(f'Using store: {store.name}')
 
-        # ── 2. Admin user ─────────────────────────────────────────────────────
-        admin = User.objects.filter(role='admin').first()
-        if not admin:
-            self.stdout.write(self.style.ERROR('No admin user found! Run "python manage.py seed_store" first.'))
-            return
+      # ── 2. Admin user ─────────────────────────────────────────────────────
+      admin = User.objects.filter(role='admin').first()
+      if not admin:
+          self.stdout.write(self.style.ERROR('No admin user found! Run "python manage.py seed_store" first.'))
+          return
 
-        # ── 3. Customer Users ─────────────────────────────────────────────────
-        self.stdout.write('Creating customer users...')
-        user_objs = []
-        for idx, c in enumerate(CUSTOMERS):
-            user, created = User.objects.get_or_create(
-                email=c['email'],
-                defaults={
-                    'name': c['name'],
-                    'phone': c['phone'],
-                    'role': 'customer',
-                    'is_active': True,
-                }
-            )
-            if created:
-                user.set_password('Customer@123')
-                user.save()
-            user_objs.append(user)
-        self.stdout.write(self.style.SUCCESS(f'  {len(user_objs)} customer users ready'))
+      # ── 3. Customer Users ─────────────────────────────────────────────────
+      self.stdout.write('Creating customer users...')
+      user_objs = []
+      for idx, c in enumerate(CUSTOMERS):
+          user, created = User.objects.get_or_create(
+              email=c['email'],
+              defaults={
+                  'name': c['name'],
+                  'phone': c['phone'],
+                  'role': 'customer',
+                  'is_active': True,
+              }
+          )
+          if created:
+              user.set_password('Customer@123')
+              user.save()
+          user_objs.append(user)
+      self.stdout.write(self.style.SUCCESS(f'  {len(user_objs)} customer users ready'))
 
-        # ── 4. Categories ─────────────────────────────────────────────────────
-        self.stdout.write('Creating categories...')
-        category_objs = {}
-        for cat_data in CATEGORIES:
-            cat, _ = Category.objects.get_or_create(
-                name=cat_data['name'],
-                store=store,
-                defaults={'description': cat_data['description']}
-            )
-            category_objs[cat_data['name']] = cat
-        self.stdout.write(self.style.SUCCESS(f'  {len(category_objs)} categories ready'))
+      # ── 4. Categories ─────────────────────────────────────────────────────
+      self.stdout.write('Creating categories...')
+      category_objs = {}
+      cat_images_added = 0
+      for cat_data in CATEGORIES:
+          cat, created = Category.objects.get_or_create(
+              name=cat_data['name'],
+              store=store,
+              defaults={'description': cat_data['description']}
+          )
+          if not cat.image:
+              public_id = upload_stock_photo(cat_data['name'], folder='categories')
+              if public_id:
+                  cat.image = public_id
+                  cat.save(update_fields=['image'])
+                  cat_images_added += 1
+          category_objs[cat_data['name']] = cat
+      self.stdout.write(self.style.SUCCESS(f'  {len(category_objs)} categories ready ({cat_images_added} images uploaded)'))
 
-        # ── 5. Products ───────────────────────────────────────────────────────
-        self.stdout.write('Creating products...')
-        product_count = 0
-        all_products = []
+      # ── 5. Products ───────────────────────────────────────────────────────
+      self.stdout.write('Creating products...')
+      product_count = 0
+      prod_images_added = 0
+      all_products = []
 
-        for cat_data in CATEGORIES:
-            cat_obj = category_objs[cat_data['name']]
-            for prod_data in cat_data['products']:
-                prod, created = Product.objects.get_or_create(
-                    sku=prod_data['sku'],
-                    defaults={
-                        'store': store,
-                        'category': cat_obj,
-                        'name': prod_data['name'],
-                        'description': prod_data['description'],
-                        'price': p(prod_data['price']),
-                        'original_price': p(prod_data['original_price']),
-                        'stock': prod_data['stock'],
-                        'low_stock_threshold': 5,
-                        'is_active': True,
-                    }
-                )
-                if created:
-                    product_count += 1
-                all_products.append(prod)
+      for cat_data in CATEGORIES:
+          cat_obj = category_objs[cat_data['name']]
+          for prod_data in cat_data['products']:
+              prod, created = Product.objects.get_or_create(
+                  sku=prod_data['sku'],
+                  defaults={
+                      'store': store,
+                      'category': cat_obj,
+                      'name': prod_data['name'],
+                      'description': prod_data['description'],
+                      'price': p(prod_data['price']),
+                      'original_price': p(prod_data['original_price']),
+                      'stock': prod_data['stock'],
+                      'low_stock_threshold': 5,
+                      'is_active': True,
+                  }
+              )
+              if created:
+                  product_count += 1
+              if not prod.images.exists():
+                  public_id = upload_stock_photo(prod_data['sku'], folder='products')
+                  if public_id:
+                      ProductImage.objects.create(
+                          product=prod,
+                          image=public_id,
+                          is_primary=True,
+                      )
+                      prod_images_added += 1
+              all_products.append(prod)
 
-        self.stdout.write(self.style.SUCCESS(f'  {product_count} new products created ({len(all_products)} total)'))
+      self.stdout.write(self.style.SUCCESS(f'  {product_count} new products created ({len(all_products)} total, {prod_images_added} images uploaded)'))
 
-        # ── 6. Discounts ──────────────────────────────────────────────────────
-        self.stdout.write('Creating discount codes...')
-        now = timezone.now()
-        discount_count = 0
-        for d in DISCOUNTS:
-            _, created = Discount.objects.get_or_create(
-                code=d['code'],
-                defaults={
-                    'store': store,
-                    'type': d['type'],
-                    'value': p(d['value']),
-                    'min_order_amount': p(d['min_order_amount']),
-                    'start_date': now - timedelta(days=30),
-                    'end_date': now + timedelta(days=180),
-                    'is_active': True,
-                }
-            )
-            if created:
-                discount_count += 1
-        self.stdout.write(self.style.SUCCESS(f'  {discount_count} discount codes ready'))
+      # ── 6. Discounts ──────────────────────────────────────────────────────
+      self.stdout.write('Creating discount codes...')
+      now = timezone.now()
+      discount_count = 0
+      for d in DISCOUNTS:
+          _, created = Discount.objects.get_or_create(
+              code=d['code'],
+              defaults={
+                  'store': store,
+                  'type': d['type'],
+                  'value': p(d['value']),
+                  'min_order_amount': p(d['min_order_amount']),
+                  'start_date': now - timedelta(days=30),
+                  'end_date': now + timedelta(days=180),
+                  'is_active': True,
+              }
+          )
+          if created:
+              discount_count += 1
+      self.stdout.write(self.style.SUCCESS(f'  {discount_count} discount codes ready'))
 
-        # ── 7. Customer Profiles ──────────────────────────────────────────────
-        self.stdout.write('Creating customer profiles...')
-        customer_objs = []
-        addresses = [
-            'House 12, Street 4, F-10/2, Islamabad',
-            'Flat 3B, DHA Phase 5, Lahore',
-            'Shop 7, Saddar Market, Karachi',
-            'Plot 45, Gulshan-e-Iqbal Block 13, Karachi',
-            'House 88, G-9/3, Islamabad',
-        ]
-        for idx, user in enumerate(user_objs):
-            cdata = CUSTOMERS[idx]
-            cust, _ = Customer.objects.get_or_create(
-                user=user,
-                store=store,
-                defaults={
-                    'name': cdata['name'],
-                    'phone': cdata['phone'],
-                    'email': cdata['email'],
-                    'address': addresses[idx],
-                }
-            )
-            customer_objs.append(cust)
-        self.stdout.write(self.style.SUCCESS(f'  {len(customer_objs)} customer profiles ready'))
+      # ── 7. Customer Profiles ──────────────────────────────────────────────
+      self.stdout.write('Creating customer profiles...')
+      customer_objs = []
+      addresses = [
+          'House 12, Street 4, F-10/2, Islamabad',
+          'Flat 3B, DHA Phase 5, Lahore',
+          'Shop 7, Saddar Market, Karachi',
+          'Plot 45, Gulshan-e-Iqbal Block 13, Karachi',
+          'House 88, G-9/3, Islamabad',
+      ]
+      for idx, user in enumerate(user_objs):
+          cdata = CUSTOMERS[idx]
+          cust, _ = Customer.objects.get_or_create(
+              user=user,
+              store=store,
+              defaults={
+                  'name': cdata['name'],
+                  'phone': cdata['phone'],
+                  'email': cdata['email'],
+                  'address': addresses[idx],
+              }
+          )
+          customer_objs.append(cust)
+      self.stdout.write(self.style.SUCCESS(f'  {len(customer_objs)} customer profiles ready'))
 
-        # ── 8. Orders ─────────────────────────────────────────────────────────
-        self.stdout.write('Creating sample orders...')
 
-        ORDER_TEMPLATES = [
-            {
-                'customer_idx': 0,
-                'status': 'delivered',
-                'payment_status': 'paid',
-                'payment_method': 'COD',
-                'items': [
-                    ('SAM-S24U-BLK', 1),
-                    ('SNY-WH1000XM5', 1),
-                ],
-                'days_ago': 45,
-            },
-            {
-                'customer_idx': 1,
-                'status': 'shipped',
-                'payment_status': 'paid',
-                'payment_method': 'easypaisa',
-                'items': [
-                    ('DEL-XPS15-2024', 1),
-                    ('MOL-NB-A5-BLK', 2),
-                ],
-                'days_ago': 5,
-            },
-            {
-                'customer_idx': 2,
-                'status': 'confirmed',
-                'payment_status': 'pending',
-                'payment_method': 'COD',
-                'items': [
-                    ('GA-3PC-SUM001', 2),
-                    ('LML-PLZ-SET01', 1),
-                    ('DOV-SHP-700ML', 3),
-                ],
-                'days_ago': 2,
-            },
-            {
-                'customer_idx': 3,
-                'status': 'pending',
-                'payment_status': 'pending',
-                'payment_method': 'card',
-                'items': [
-                    ('NIK-AM270-WHT', 1),
-                    ('ADI-UB22-BLK', 1),
-                ],
-                'days_ago': 0,
-            },
-            {
-                'customer_idx': 4,
-                'status': 'delivered',
-                'payment_status': 'paid',
-                'payment_method': 'COD',
-                'items': [
-                    ('OMR-BPM-HEM', 1),
-                    ('CTR-MEN-60T', 2),
-                    ('HIM-ASH-60T', 1),
-                ],
-                'days_ago': 30,
-            },
-            {
-                'customer_idx': 0,
-                'status': 'cancelled',
-                'payment_status': 'refunded',
-                'payment_method': 'COD',
-                'items': [
-                    ('APL-15PM-NTT', 1),
-                ],
-                'days_ago': 20,
-            },
-            {
-                'customer_idx': 2,
-                'status': 'delivered',
-                'payment_status': 'paid',
-                'payment_method': 'easypaisa',
-                'items': [
-                    ('BK-ATOM-HAB', 1),
-                    ('BK-ALCH-PCO', 1),
-                    ('STD-CP-48SET', 2),
-                ],
-                'days_ago': 15,
-            },
-            {
-                'customer_idx': 1,
-                'status': 'confirmed',
-                'payment_status': 'paid',
-                'payment_method': 'card',
-                'items': [
-                    ('PMX-TDM100', 1),
-                    ('DCA-YGM-10MM', 2),
-                ],
-                'days_ago': 3,
-            },
-        ]
-
-        product_map = {p.sku: p for p in all_products}
-        order_count = 0
-        year = timezone.now().year
-
-        for tmpl in ORDER_TEMPLATES:
-            cust = customer_objs[tmpl['customer_idx']]
-
-            # Check if order already exists for this customer at this time
-            days_ago = tmpl['days_ago']
-            created_at = timezone.now() - timedelta(days=days_ago)
-
-            # Generate order number
-            order_count += 1
-            order_number = f'ORD-{year}-{order_count:05d}'
-
-            if Order.objects.filter(order_number=order_number).exists():
-                self.stdout.write(f'  Order {order_number} already exists, skipping.')
-                continue
-
-            # Calculate totals
-            items_data = []
-            total_amount = Decimal('0')
-            for sku, qty in tmpl['items']:
-                prod = product_map.get(sku)
-                if not prod:
-                    continue
-                line_total = prod.price * qty
-                total_amount += line_total
-                items_data.append({'product': prod, 'quantity': qty, 'price': prod.price, 'total': line_total})
-
-            if not items_data:
-                continue
-
-            order = Order.objects.create(
-                store=store,
-                customer=cust,
-                order_number=order_number,
-                total_amount=total_amount,
-                discount_amount=Decimal('0'),
-                status=tmpl['status'],
-                payment_method=tmpl['payment_method'],
-                shipping_address=cust.address or 'Pakistan',
-            )
-
-            # Backdate the order
-            Order.objects.filter(id=order.id).update(created_at=created_at)
-
-            for item in items_data:
-                OrderItem.objects.create(
-                    order=order,
-                    product=item['product'],
-                    product_name=item['product'].name,
-                    price=item['price'],
-                    quantity=item['quantity'],
-                    total_price=item['total'],
-                )
-
-            Payment.objects.create(
-                order=order,
-                method=tmpl['payment_method'],
-                status=tmpl['payment_status'],
-                amount=total_amount,
-                paid_at=created_at if tmpl['payment_status'] == 'paid' else None,
-            )
-
-        self.stdout.write(self.style.SUCCESS(f'  {order_count} orders processed'))
-
-        # ── 9. Returns ────────────────────────────────────────────────────────
-        self.stdout.write('Creating sample returns...')
-        delivered_orders = Order.objects.filter(status='delivered')
-        if delivered_orders.count() >= 2:
-            orders_list = list(delivered_orders)
-
-            Return.objects.get_or_create(
-                order=orders_list[0],
-                defaults={
-                    'customer': orders_list[0].customer,
-                    'reason': 'Product received was damaged. Screen had a crack on arrival.',
-                    'status': 'approved',
-                    'resolved_at': timezone.now() - timedelta(days=2),
-                }
-            )
-            Return.objects.get_or_create(
-                order=orders_list[1],
-                defaults={
-                    'customer': orders_list[1].customer,
-                    'reason': 'Wrong size delivered. Ordered L but received M.',
-                    'status': 'pending',
-                }
-            )
-        self.stdout.write(self.style.SUCCESS('  Returns created'))
-
-        # ── 10. Complaints ────────────────────────────────────────────────────
-        self.stdout.write('Creating sample complaints...')
-        if customer_objs:
-            Complaint.objects.get_or_create(
-                customer=customer_objs[0],
-                type='delivery',
-                defaults={
-                    'message': 'My order was supposed to arrive in 3 days but it has been 7 days and I have not received it yet.',
-                    'status': 'in_progress',
-                }
-            )
-            if Order.objects.exists():
-                Complaint.objects.get_or_create(
-                    customer=customer_objs[2],
-                    type='product',
-                    defaults={
-                        'order': Order.objects.filter(customer=customer_objs[2]).first(),
-                        'message': 'The product quality does not match the description on the website.',
-                        'status': 'open',
-                    }
-                )
-            Complaint.objects.get_or_create(
-                customer=customer_objs[4],
-                type='payment',
-                defaults={
-                    'message': 'I paid via Easypaisa but my order still shows payment pending.',
-                    'status': 'resolved',
-                    'response': 'We have verified your payment and updated your order. Thank you for your patience.',
-                    'resolved_by': admin,
-                }
-            )
-        self.stdout.write(self.style.SUCCESS('  Complaints created'))
-
-        # ── Final Summary ─────────────────────────────────────────────────────
-        self.stdout.write('')
-        self.stdout.write(self.style.SUCCESS('=' * 50))
-        self.stdout.write(self.style.SUCCESS('Seeding complete! Summary:'))
-        self.stdout.write(self.style.SUCCESS('=' * 50))
-        self.stdout.write(f'  Store:      {Store.objects.count()}')
-        self.stdout.write(f'  Users:      {User.objects.count()} ({User.objects.filter(role="customer").count()} customers)')
-        self.stdout.write(f'  Categories: {Category.objects.count()}')
-        self.stdout.write(f'  Products:   {Product.objects.count()}')
-        self.stdout.write(f'  Discounts:  {Discount.objects.count()}')
-        self.stdout.write(f'  Orders:     {Order.objects.count()}')
-        self.stdout.write(f'  Returns:    {Return.objects.count()}')
-        self.stdout.write(f'  Complaints: {Complaint.objects.count()}')
-        self.stdout.write('')
-        self.stdout.write('Test credentials:')
-        self.stdout.write('  Admin  → admin@store.com / Admin@12345')
-        self.stdout.write('  Customer → ayesha.siddiqui@gmail.com / Customer@123')
+      # ── Final Summary ─────────────────────────────────────────────────────
+      self.stdout.write('')
+      self.stdout.write(self.style.SUCCESS('=' * 50))
+      self.stdout.write(self.style.SUCCESS('Seeding complete! Summary:'))
+      self.stdout.write(self.style.SUCCESS('=' * 50))
+      self.stdout.write(f'  Store:      {Store.objects.count()}')
+      self.stdout.write(f'  Users:      {User.objects.count()} ({User.objects.filter(role="customer").count()} customers)')
+      self.stdout.write(f'  Categories: {Category.objects.count()}')
+      self.stdout.write(f'  Products:   {Product.objects.count()}')
+      self.stdout.write(f'  Discounts:  {Discount.objects.count()}')
+      self.stdout.write('')
+      self.stdout.write('Test credentials:')
+      self.stdout.write('  Admin  → admin@store.com / Admin@12345')
+      self.stdout.write('  Customer → ayesha.siddiqui@gmail.com / Customer@123')
