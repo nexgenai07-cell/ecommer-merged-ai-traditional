@@ -55,6 +55,55 @@ class Customer(models.Model):
     def __str__(self):
         return f"{self.name} ({self.phone})"
 
+# NEW (Address Book — Backend Change Request v2, Part 1): replaces the old
+# single-address-on-Customer system (customer.address/city/postal_code,
+# served by the now-deprecated CheckoutPrefillView / SaveAddressView). A
+# customer can now save multiple labelled addresses and pick one at
+# checkout via address_id, instead of only ever having one address on file.
+class Address(models.Model):
+    """A saved shipping address belonging to a Customer profile.
+
+    Exactly one Address per customer is ever is_default=True — enforced in
+    save() below, not just at the API layer, so this invariant holds no
+    matter which code path writes to the model.
+    """
+
+    customer = models.ForeignKey(
+        Customer,
+        on_delete=models.CASCADE,
+        related_name="addresses",
+    )
+
+    label = models.CharField(max_length=100)
+    shipping_address = models.TextField()
+    city = models.CharField(max_length=100)
+    postal_code = models.CharField(max_length=20, null=True, blank=True)
+    phone = models.CharField(max_length=20, null=True, blank=True)
+    is_default = models.BooleanField(default=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "addresses"
+        ordering = ["-is_default", "-created_at"]
+
+    def __str__(self):
+        return f"{self.label} ({self.customer.name})"
+
+    def save(self, *args, **kwargs):
+        # "Exactly one address is default at all times" (Part 1, item 5) —
+        # enforced here so it holds whether this address became the
+        # default via the dedicated set-default endpoint, or by being
+        # created/edited with is_default=True.
+        if self.is_default:
+            Address.objects.filter(
+                customer_id=self.customer_id,
+                is_default=True,
+            ).exclude(pk=self.pk).update(is_default=False)
+        super().save(*args, **kwargs)
+
+
 # Stores the main order information after checkout.
 class Order(models.Model):
     # Defines all possible order statuses.

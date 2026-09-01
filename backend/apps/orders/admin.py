@@ -2,8 +2,32 @@
 
 from django.contrib import admin
 
-from .models import Customer, Order, OrderItem, Payment
+from .models import Customer, Order, OrderItem, Payment, Address
 from apps.returns.models import Return, Complaint
+
+
+@admin.register(Address)
+class AddressAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "label",
+        "customer",
+        "city",
+        "is_default",
+        "created_at",
+    )
+
+    list_filter = (
+        "is_default",
+        "created_at",
+    )
+
+    search_fields = (
+        "label",
+        "customer__name",
+        "customer__phone",
+        "city",
+    )
 
 
 @admin.register(Customer)

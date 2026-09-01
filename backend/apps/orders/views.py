@@ -22,20 +22,17 @@ from apps.notifications.utils import (
     send_refund_confirmation_email,
 )
 
-from .models import Customer, Order, OrderItem, Payment
+from .models import Customer, Order, OrderItem, Payment, Address
 from .serializers import (
     OrderListSerializer,
     AdminOrderListSerializer,
     OrderDetailSerializer,
     CheckoutSerializer,
-    CheckoutPrefillSerializer,
-    SaveAddressSerializer,
     AdminOrderStatusSerializer,
 )
 
 from apps.cart.models import Cart
 from apps.products.models import Product, StockMovement
-from apps.stores.models import Store
 # FIX (B43): IsCustomer ab import ho rahi hai taake customer-only
 # endpoints par admin ka login access na kar sake (pehle sirf IsAdmin
 # import thi, IsCustomer kahin bhi use nahi ho rahi thi).
@@ -240,20 +237,52 @@ class CheckoutView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # FIX (F8/B18/B19): resolve the customer profile first so we can
-        # fall back to their previously saved address/city/postal_code/phone
-        # for any field the request didn't send. shipping_address and city
-        # are the only two that actually block checkout if still missing
-        # after the fallback — postal_code and phone stay optional (B18).
+        # FIX (B18/B19): resolve the customer profile first.
         customer = get_or_create_customer(
             request.user,
             store_id=cart.store_id,
         )
 
-        shipping_address = data.get("shipping_address") or (customer.address or "")
-        city = data.get("city") or (customer.city or "")
-        postal_code = data.get("postal_code") or (customer.postal_code or "")
-        contact_phone = data.get("phone") or (customer.phone or "")
+        # NEW (Backend Change Request v2, Part 1 — item 6): address
+        # resolution order is address_id -> manual fields on this request
+        # -> the customer's default Address Book entry. shipping_address
+        # and city are the only two that actually block checkout if still
+        # missing after this — postal_code and phone stay optional (B18).
+        address_id = data.get("address_id")
+        selected_address = None
+
+        if address_id:
+            selected_address = Address.objects.filter(
+                id=address_id, customer=customer
+            ).first()
+            if not selected_address:
+                return Response(
+                    {"error": "Address not found."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        if selected_address:
+            shipping_address = selected_address.shipping_address
+            city = selected_address.city
+            postal_code = selected_address.postal_code or ""
+            contact_phone = selected_address.phone or ""
+        else:
+            shipping_address = data.get("shipping_address") or ""
+            city = data.get("city") or ""
+            postal_code = data.get("postal_code") or ""
+            contact_phone = data.get("phone") or ""
+
+            if not shipping_address.strip() or not city.strip():
+                # Nothing typed manually either — fall back to whichever
+                # saved address is currently the default.
+                default_address = Address.objects.filter(
+                    customer=customer, is_default=True
+                ).first()
+                if default_address:
+                    shipping_address = default_address.shipping_address
+                    city = default_address.city
+                    postal_code = default_address.postal_code or ""
+                    contact_phone = default_address.phone or ""
 
         missing = []
         if not shipping_address.strip():
@@ -347,19 +376,6 @@ class CheckoutView(APIView):
                 notes=data.get("notes", ""),
             )
 
-            # FIX (B22): "Save Address" via checkout — write the resolved
-            # values back onto the customer profile so next time everything
-            # is prefilled (F8) and this bug can't recur.
-            if data.get("save_address"):
-                customer.address = shipping_address
-                customer.city = city
-                customer.postal_code = postal_code
-                if contact_phone:
-                    customer.phone = contact_phone
-                customer.save(
-                    update_fields=["address", "city", "postal_code", "phone", "updated_at"]
-                )
-
             for item in cart_items:
                 OrderItem.objects.create(
                     order=order,
@@ -404,60 +420,6 @@ class CheckoutView(APIView):
             OrderDetailSerializer(order).data,
             status=status.HTTP_201_CREATED,
         )
-
-# NEW (F8): lets the frontend prefill the checkout form with whatever the
-# customer already has saved, instead of asking them to retype everything.
-class CheckoutPrefillView(APIView):
-    """GET /api/v1/orders/checkout/prefill/"""
-    # FIX (B43): customer-only.
-    permission_classes = [permissions.IsAuthenticated, IsCustomer]
-
-    def get(self, request):
-        customer = Customer.objects.filter(user=request.user).first()
-
-        data = {
-            "shipping_address": customer.address if customer else "",
-            "city": customer.city if customer else "",
-            "postal_code": customer.postal_code if customer else "",
-            "phone": (customer.phone if customer else "") or request.user.phone or "",
-        }
-        return Response(CheckoutPrefillSerializer(data).data)
-
-
-# NEW (B22): "Save Address" as its own action, independent of checkout —
-# fixes it being non-functional by giving it a real endpoint to call.
-class SaveAddressView(APIView):
-    """PUT /api/v1/orders/save-address/"""
-    # FIX (B43): customer-only.
-    permission_classes = [permissions.IsAuthenticated, IsCustomer]
-
-    def put(self, request):
-        serializer = SaveAddressSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
-
-        store = Store.objects.first()
-        customer = get_or_create_customer(request.user, store_id=store.id if store else 1)
-
-        customer.address = data["shipping_address"]
-        customer.city = data["city"]
-        customer.postal_code = data.get("postal_code", customer.postal_code)
-        if data.get("phone"):
-            customer.phone = data["phone"]
-        customer.save(
-            update_fields=["address", "city", "postal_code", "phone", "updated_at"]
-        )
-
-        return Response(
-            {
-                "message": "Address saved.",
-                "shipping_address": customer.address,
-                "city": customer.city,
-                "postal_code": customer.postal_code,
-                "phone": customer.phone,
-            }
-        )
-
 
 # Returns all orders belonging to the logged-in customer.
 class OrderListView(generics.ListAPIView):

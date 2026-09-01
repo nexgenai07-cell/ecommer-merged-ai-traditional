@@ -10,6 +10,7 @@ from apps.orders.urls import (
     complaint_urlpatterns, admin_complaint_urlpatterns,
 )
 from apps.orders.customer_urls import admin_customer_urlpatterns
+from apps.orders.address_urls import address_urlpatterns
 from apps.ai.urls import audit_log_urlpatterns
 from apps.whatsapp.admin_urls import admin_whatsapp_urlpatterns
 
@@ -29,6 +30,7 @@ urlpatterns = [
     path('api/v1/cart/', include('apps.cart.urls')),
     path('api/v1/wishlist/', include((wishlist_urlpatterns, 'wishlist'))),
     path('api/v1/orders/', include('apps.orders.urls')),
+    path('api/v1/addresses/', include((address_urlpatterns, 'addresses'))),
     path('api/v1/admin/orders/', include((admin_order_urlpatterns, 'admin-orders'))),
     path('api/v1/returns/', include((return_urlpatterns, 'returns'))),
     path('api/v1/admin/returns/', include((admin_return_urlpatterns, 'admin-returns'))),

@@ -164,17 +164,30 @@ class OrderDetailSerializer(serializers.ModelSerializer):
 class CheckoutSerializer(serializers.Serializer):
     """POST /api/v1/orders/checkout/
 
-    FIX (B15/B18/B19/B22/F8): previously this only had shipping_address +
-    notes, so city/postal_code/phone had nowhere to go — the frontend could
-    send them but the backend silently dropped them, and there was zero
-    validation on any of it. Every field here is required=False because the
-    view falls back to the customer's last saved profile (Customer.city /
-    Customer.postal_code / Customer.phone) when a field is omitted — that's
-    what makes prefill (F8) and "returning customer doesn't retype
-    everything" actually work. shipping_address and city are the only two
-    that are truly mandatory to place an order, and that's enforced in
-    CheckoutView once the fallback has been applied, not here.
+    FIX (B15/B18/B19): shipping_address/city/postal_code/phone are kept
+    here (required=False) for one-off manual entry at checkout time.
+    shipping_address and city are the only two that are truly mandatory to
+    place an order, and that's enforced in CheckoutView once the address
+    resolution below has run, not here.
+
+    NEW (Backend Change Request v2, Part 1): address_id (optional) — pick
+    one of the customer's saved Address Book entries instead of typing the
+    address in manually. CheckoutView resolves the final
+    shipping_address/city/postal_code/phone in this order:
+      1. address_id, if provided (must belong to this customer)
+      2. shipping_address/city/... typed directly into this request
+      3. the customer's Address Book entry with is_default=True
+    If none of the three yield a shipping_address/city, checkout 400s —
+    same "no address available" rule as before.
+
+    REMOVED (Part 1): save_address. It used to write the single address
+    straight onto Customer.address/city/postal_code — that was the old
+    single-address behaviour the spec explicitly says to stop running in
+    parallel with the Address Book. Saving an address is now only ever
+    done explicitly via POST /api/v1/addresses/.
     """
+
+    address_id = serializers.IntegerField(required=False, allow_null=True)
 
     shipping_address = serializers.CharField(
         required=False,
@@ -198,9 +211,6 @@ class CheckoutSerializer(serializers.Serializer):
         allow_blank=True,
         max_length=20,
     )
-    # FIX (B22): when true, whatever address/city/postal_code/phone was
-    # used for this order also gets written back onto the Customer profile.
-    save_address = serializers.BooleanField(required=False, default=False)
 
     notes = serializers.CharField(
         required=False,
@@ -238,50 +248,6 @@ class CheckoutSerializer(serializers.Serializer):
     # was no server-side validation at all before, so malformed numbers
     # (letters, wrong length, missing country/area code) were accepted and
     # silently stored.
-    def validate_phone(self, value):
-        cleaned = re.sub(r'[\s-]', '', value)
-        if cleaned and not PHONE_RE.match(cleaned):
-            raise serializers.ValidationError(
-                "Enter a valid phone number, e.g. 03001234567 or +923001234567."
-            )
-        return cleaned
-
-# NEW (F8/B22): what GET /api/v1/orders/checkout/prefill/ returns, and the
-# body PUT /api/v1/orders/save-address/ accepts.
-class CheckoutPrefillSerializer(serializers.Serializer):
-    shipping_address = serializers.CharField(allow_blank=True, allow_null=True)
-    city = serializers.CharField(allow_blank=True, allow_null=True)
-    postal_code = serializers.CharField(allow_blank=True, allow_null=True)
-    phone = serializers.CharField(allow_blank=True, allow_null=True)
-
-
-class SaveAddressSerializer(serializers.Serializer):
-    """PUT /api/v1/orders/save-address/ — B22: a standalone way to update the
-    saved address, independent of going through checkout."""
-
-    shipping_address = serializers.CharField(max_length=500)
-    city = serializers.CharField(max_length=100)
-    postal_code = serializers.CharField(
-        required=False, allow_blank=True, max_length=20
-    )
-    phone = serializers.CharField(required=False, allow_blank=True, max_length=20)
-
-    def validate_shipping_address(self, value):
-        value = value.strip()
-        if len(value) < 8:
-            raise serializers.ValidationError(
-                "Shipping address looks too short — please enter a full address."
-            )
-        return value
-
-    def validate_postal_code(self, value):
-        value = value.strip()
-        if value and not POSTAL_CODE_RE.match(value):
-            raise serializers.ValidationError(
-                "Postal code should be 4-6 digits (leave blank if unknown)."
-            )
-        return value
-
     def validate_phone(self, value):
         cleaned = re.sub(r'[\s-]', '', value)
         if cleaned and not PHONE_RE.match(cleaned):
