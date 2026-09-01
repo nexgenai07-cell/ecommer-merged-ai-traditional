@@ -345,8 +345,24 @@ class Command(BaseCommand):
           cat, created = Category.objects.get_or_create(
               name=cat_data['name'],
               store=store,
-              defaults={'description': cat_data['description']}
+              defaults={
+                  'description': cat_data['description'],
+                  'is_active': True,
+                  'is_delete': False,
+              }
           )
+
+          # B-FIX: if the category already existed (e.g. a previous
+          # --clear run soft-deleted it), get_or_create() finds that
+          # same row by name+store and 'defaults' above is ignored.
+          # Without this, the category stays is_active=False /
+          # is_delete=True forever and disappears from the customer
+          # side even after images are re-added.
+          if not created and (not cat.is_active or cat.is_delete):
+              cat.is_active = True
+              cat.is_delete = False
+              cat.save(update_fields=['is_active', 'is_delete'])
+
           upload_result = upload_stock_photo(cat_data['name'], folder='categories')
           if upload_result:
               cat.image = upload_result
