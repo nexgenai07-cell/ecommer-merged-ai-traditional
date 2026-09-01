@@ -29,6 +29,7 @@ from django.db import transaction
 from requests import options
 
 import cloudinary.uploader
+from cloudinary import CloudinaryImage
 
 from apps.users.models import User
 from apps.stores.models import Store
@@ -50,10 +51,15 @@ def pick(lst):
 def upload_stock_photo(seed, folder):
     """
     Fetches a real (non-dummy) stock photo from Picsum and uploads it to
-    Cloudinary, returning the public_id to store on a CloudinaryField.
-    `seed` keeps the same photo consistent across re-runs (e.g. category
-    name or product SKU). Returns None (and prints a warning) instead of
-    raising, so one failed image never breaks the whole seed run.
+    Cloudinary. Returns a CloudinaryImage object (public_id + format +
+    version) — this is the object type CloudinaryField actually knows how
+    to save correctly. Passing just public_id, or a raw dict, produces a
+    broken URL / a DB error, because the field only special-cases
+    CloudinaryResource/CloudinaryImage instances.
+    `overwrite=True` + a stable public_id (from the seed) means re-running
+    this is safe and idempotent — it just refreshes/confirms the same asset.
+    Returns None (and prints a warning) instead of raising, so one failed
+    image never breaks the whole seed run.
     """
     try:
         source_url = f"https://picsum.photos/seed/{slugify(seed)}/600/600"
@@ -61,10 +67,14 @@ def upload_stock_photo(seed, folder):
             source_url,
             folder=folder,
             public_id=slugify(seed),
-            overwrite=False,
+            overwrite=True,
             unique_filename=False,
         )
-        return result.get('public_id')
+        return CloudinaryImage(
+            result['public_id'],
+            format=result.get('format'),
+            version=result.get('version'),
+        )
     except Exception as e:
         print(f"  [!] image upload failed for '{seed}': {e}")
         return None
@@ -337,12 +347,11 @@ class Command(BaseCommand):
               store=store,
               defaults={'description': cat_data['description']}
           )
-          if not cat.image:
-              public_id = upload_stock_photo(cat_data['name'], folder='categories')
-              if public_id:
-                  cat.image = public_id
-                  cat.save(update_fields=['image'])
-                  cat_images_added += 1
+          upload_result = upload_stock_photo(cat_data['name'], folder='categories')
+          if upload_result:
+              cat.image = upload_result
+              cat.save(update_fields=['image'])
+              cat_images_added += 1
           category_objs[cat_data['name']] = cat
       self.stdout.write(self.style.SUCCESS(f'  {len(category_objs)} categories ready ({cat_images_added} images uploaded)'))
 
@@ -371,15 +380,15 @@ class Command(BaseCommand):
               )
               if created:
                   product_count += 1
-              if not prod.images.exists():
-                  public_id = upload_stock_photo(prod_data['sku'], folder='products')
-                  if public_id:
-                      ProductImage.objects.create(
-                          product=prod,
-                          image=public_id,
-                          is_primary=True,
-                      )
-                      prod_images_added += 1
+              upload_result = upload_stock_photo(prod_data['sku'], folder='products')
+              if upload_result:
+                  prod.images.all().delete()
+                  ProductImage.objects.create(
+                      product=prod,
+                      image=upload_result,
+                      is_primary=True,
+                  )
+                  prod_images_added += 1
               all_products.append(prod)
 
       self.stdout.write(self.style.SUCCESS(f'  {product_count} new products created ({len(all_products)} total, {prod_images_added} images uploaded)'))
