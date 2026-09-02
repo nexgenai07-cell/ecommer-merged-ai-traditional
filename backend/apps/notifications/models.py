@@ -25,6 +25,15 @@ class Notification(models.Model):
         ("sms", "SMS"),
     ]
 
+    # ============================================================
+    # NEW: Reference type choices as per PDF Part 2 Item 3
+    # ============================================================
+    REFERENCE_TYPE_CHOICES = [
+        ("order", "Order"),
+        ("return", "Return"),
+        ("complaint", "Complaint"),
+    ]
+
     store = models.ForeignKey(
         "stores.Store",
         on_delete=models.CASCADE,
@@ -57,6 +66,24 @@ class Notification(models.Model):
         default="in_app",
     )
 
+    # ============================================================
+    # NEW FIELDS: Deep linking as per PDF Part 2 Item 3
+    # ============================================================
+    reference_type = models.CharField(
+        max_length=20,
+        choices=REFERENCE_TYPE_CHOICES,
+        null=True,
+        blank=True,
+        help_text="Type of entity this notification references: order, return, or complaint"
+    )
+
+    reference_id = models.CharField(
+        max_length=50,
+        null=True,
+        blank=True,
+        help_text="ID of the referenced entity (order_number, return_id, complaint_id)"
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -64,4 +91,7 @@ class Notification(models.Model):
         ordering = ["-created_at"]
 
     def __str__(self):
-        return f"{self.title} → {self.user.email if self.user else 'broadcast'}"
+        ref_info = ""
+        if self.reference_type and self.reference_id:
+            ref_info = f" [{self.reference_type}:{self.reference_id}]"
+        return f"{self.title}{ref_info} → {self.user.email if self.user else 'broadcast'}"

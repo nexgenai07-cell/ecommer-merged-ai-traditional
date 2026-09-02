@@ -175,6 +175,13 @@ class SendNotificationView(APIView):
         notif_type = request.data.get("type", "system")
         sent_via = request.data.get("sent_via", "in_app")
 
+        # ============================================================
+        # NEW: Accept reference_type and reference_id as optional fields
+        # as per PDF Part 2 Item 3
+        # ============================================================
+        reference_type = request.data.get("reference_type")
+        reference_id = request.data.get("reference_id")
+
         if not title or not message:
             return Response(
                 {"error": "title and message are required."},
@@ -193,6 +200,26 @@ class SendNotificationView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # ============================================================
+        # NEW: Validate reference_type if provided
+        # ============================================================
+        if reference_type and reference_type not in ["order", "return", "complaint"]:
+            return Response(
+                {
+                    "error": "Invalid 'reference_type'. Accepted values: order, return, complaint",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # If reference_type is provided, reference_id is also required
+        if reference_type and not reference_id:
+            return Response(
+                {
+                    "error": "reference_id is required when reference_type is provided",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         notification = Notification.objects.create(
             store=Store.objects.first(),
             user_id=user_id,
@@ -200,6 +227,8 @@ class SendNotificationView(APIView):
             message=message,
             type=notif_type,
             sent_via=sent_via,
+            reference_type=reference_type,
+            reference_id=reference_id,
         )
 
         return Response(
