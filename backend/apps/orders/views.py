@@ -28,6 +28,7 @@ from .serializers import (
     AdminOrderListSerializer,
     OrderDetailSerializer,
     CheckoutSerializer,
+    CustomerOrderCancelSerializer,
     AdminOrderStatusSerializer,
 )
 
@@ -509,6 +510,13 @@ class OrderCancelView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # NEW (Backend Change Request v2, Part 2 — Item 1 / Issue 3):
+        # reason is optional — request.data being empty (no body sent at
+        # all) still validates fine here, so this is purely additive.
+        cancel_serializer = CustomerOrderCancelSerializer(data=request.data)
+        cancel_serializer.is_valid(raise_exception=True)
+        reason = cancel_serializer.validated_data.get("reason", "").strip()
+
         with transaction.atomic():
             # FIX (stock race-condition): stock restoration now goes
             # through the shared, locked, audited helper instead of a
@@ -519,6 +527,8 @@ class OrderCancelView(APIView):
             restore_stock_for_order(order, user=request.user)
 
             order.status = "cancelled"
+            if reason:
+                order.cancellation_reason = reason
             order.save()
 
             # FIX (B29): refunded_at timestamp gives a real, checkable
@@ -538,7 +548,12 @@ class OrderCancelView(APIView):
         create_notification(
             user=request.user,
             title="Order Cancelled",
-            message=f"Your order #{order.order_number} has been cancelled.",
+            message=(
+                f"Your order #{order.order_number} has been cancelled. "
+                f"Reason: {reason}"
+                if reason
+                else f"Your order #{order.order_number} has been cancelled."
+            ),
             notification_type="order",
         )
 

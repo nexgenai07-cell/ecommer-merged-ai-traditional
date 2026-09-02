@@ -142,6 +142,7 @@ class OrderDetailSerializer(serializers.ModelSerializer):
             "contact_phone",
             "tracking_number",
             "notes",
+            "cancellation_reason",
             "created_at",
             "updated_at",
 
@@ -255,6 +256,17 @@ class CheckoutSerializer(serializers.Serializer):
                 "Enter a valid phone number, e.g. 03001234567 or +923001234567."
             )
         return cleaned
+
+# NEW (Backend Change Request v2, Part 2 — Item 1 / Issue 3): optional
+# reason on customer-initiated cancellation. Purely additive — sending no
+# body at all (reason simply absent) must keep working exactly as before.
+class CustomerOrderCancelSerializer(serializers.Serializer):
+    reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=1000,
+    )
+
 
 # Validates order status updates made by the admin.
 class AdminOrderStatusSerializer(serializers.Serializer):
