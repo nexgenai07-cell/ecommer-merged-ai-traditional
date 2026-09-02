@@ -2,6 +2,7 @@
 # (placed inside apps/orders to access Order model easily; imported by orders/urls.py)
 
 from django.utils import timezone
+from django.db.models import Q
 from rest_framework import status, permissions, generics
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -68,7 +69,7 @@ class CreateReturnView(APIView):
 
 class ReturnListView(generics.ListAPIView):
     """
-    GET /api/v1/returns/?ordering= — customer sees own, admin sees all
+    GET /api/v1/returns/ — customer sees own, admin sees all
 
     FIX (Postman testing — 09 Jul 2026): doc (API 61) expects
     {count, next, previous, results}. pagination_class wasn't attached
@@ -78,6 +79,23 @@ class ReturnListView(generics.ListAPIView):
     FIX (D1): 'ordering=created_at' / 'ordering=-created_at' now works
     (default stays -created_at, same as before, when 'ordering' is
     absent or not one of these two values).
+
+    NEW (Follow-up v9, item 1 — CRITICAL): 'status', 'search',
+    'start_date', 'end_date' ab sab combine ho kar filter karte hain.
+    Pehle sirf 'ordering' hi read hota tha — baaki 4 params silently
+    ignore ho rahe thay, isliye admin Returns page ko poori history
+    download kar k khud browser mein filter/search/date-range/sort
+    karna par raha tha. Same convention use ki hai jo pehle se
+    AdminOrderFilterView (orders/views.py) aur CreateComplaintView
+    (complaint_views.py) mein implement ho chuki hai — Returns endpoint
+    original v7 audit mein miss ho gaya tha, ab close kar diya.
+
+    NOTE for frontend: Return.STATUS_CHOICES mein "pending" naam ki
+    koi value nahi hai — asal values requested / approved / rejected /
+    completed hain. Naya return CreateReturnView mein status="requested"
+    ke sath banta hai, "pending" ke sath nahi. Agar ?status=pending
+    bheja gaya to filter theek kaam karega lekin hamesha 0 results
+    dega kyunke DB mein wo value kabhi exist hi nahi karti.
     """
     serializer_class = ReturnSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -90,7 +108,40 @@ class ReturnListView(generics.ListAPIView):
         else:
             qs = Return.objects.filter(customer__user=user)
 
-        ordering = self.request.query_params.get('ordering')
+        params = self.request.query_params
+
+        # Status filter — exact match (e.g. ?status=requested)
+        status_param = params.get('status')
+        if status_param:
+            qs = qs.filter(status=status_param)
+
+        # Date filters — return REQUEST date range (Return.created_at pe,
+        # order ki date pe nahi). start_date/end_date dono optional hain
+        # aur independently kaam karte hain (sirf ek bhi diya ja sakta h).
+        start_date = params.get('start_date')
+        if start_date:
+            qs = qs.filter(created_at__date__gte=start_date)
+
+        end_date = params.get('end_date')
+        if end_date:
+            qs = qs.filter(created_at__date__lte=end_date)
+
+        # Search — order number ("ORD-2026" jaisa doc ka example) aur
+        # return reason text, dono pe icontains match. Complaints ke
+        # search se yahan is liye simpler rakha (regex/ID-match nahi),
+        # kyunke Return ka koi alag reference-number format nahi hai —
+        # frontend order_number se hi search karta hai.
+        search = params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(order__order_number__icontains=search) |
+                Q(reason__icontains=search)
+            )
+
+        # 'ordering' — sirf whitelist ki gayi 2 values accept, warna
+        # invalid value pe DB error na aaye (jaisa AdminOrderFilterView
+        # mein already whitelist pattern hai).
+        ordering = params.get('ordering')
         if ordering in ('created_at', '-created_at'):
             return qs.order_by(ordering)
         return qs.order_by('-created_at')
