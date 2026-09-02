@@ -1,10 +1,12 @@
 from rest_framework import serializers
 from .models import Product, ProductImage, ProductHistory, StockMovement
 
+
 # Returns basic category information inside product responses.
 class CategorySerializer(serializers.Serializer):
     id = serializers.IntegerField()
     name = serializers.CharField()
+
 
 # Converts product image data into API response format.
 class ProductImageSerializer(serializers.ModelSerializer):
@@ -24,11 +26,19 @@ class ProductImageSerializer(serializers.ModelSerializer):
             return obj.image.url.replace("http://", "https://")
         return None
 
-# Used for the product listing API with essential product information.
+
+# ============================================================
+# UPDATED: ProductListSerializer with new stock fields
+# as per PDF Part 2 Item 5
+# ============================================================
 class ProductListSerializer(serializers.ModelSerializer):
     primary_image = serializers.SerializerMethodField()
-    in_stock = serializers.BooleanField(read_only=True)
     category = serializers.SerializerMethodField()
+
+    # ============================================================
+    # NEW: available_stock computed field
+    # ============================================================
+    available_stock = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -37,8 +47,13 @@ class ProductListSerializer(serializers.ModelSerializer):
             "name",
             "price",
             "original_price",
-            "stock",
-            "in_stock",
+            # ============================================================
+            # NEW: Replace single 'stock' with three fields
+            # ============================================================
+            "total_stock",
+            "reserved_stock",
+            "available_stock",  # computed: total_stock - reserved_stock
+            "in_stock",         # available_stock > 0
             "sku",
             "category",
             "primary_image",
@@ -57,37 +72,59 @@ class ProductListSerializer(serializers.ModelSerializer):
 
     # Returns the primary product image URL.
     def get_primary_image(self, obj):
-      images = list(obj.images.all())
+        images = list(obj.images.all())
 
-      primary = next(
-        (img for img in images if img.is_primary),
-        None,
-    )
+        primary = next(
+            (img for img in images if img.is_primary),
+            None,
+        )
 
-      img = primary or (images[0] if images else None)
+        img = primary or (images[0] if images else None)
 
-      if not img or not img.image:
-        return None
+        if not img or not img.image:
+            return None
 
-      return img.image.url.replace("http://", "https://")
+        return img.image.url.replace("http://", "https://")
 
-# Used for the Low Stock API to display products that need restocking.
+    # ============================================================
+    # NEW: available_stock = total_stock - reserved_stock
+    # ============================================================
+    def get_available_stock(self, obj):
+        return obj.total_stock - obj.reserved_stock
+
+
+# ============================================================
+# UPDATED: LowStockProductSerializer with new stock fields
+# ============================================================
 class LowStockProductSerializer(serializers.ModelSerializer):
+    available_stock = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
         fields = [
             "id",
             "name",
-            "stock",
+            "total_stock",
+            "reserved_stock",
+            "available_stock",
             "low_stock_threshold",
         ]
 
-# Used for displaying complete product information.
+    def get_available_stock(self, obj):
+        return obj.total_stock - obj.reserved_stock
+
+
+# ============================================================
+# UPDATED: ProductDetailSerializer with new stock fields
+# ============================================================
 class ProductDetailSerializer(serializers.ModelSerializer):
     images = ProductImageSerializer(many=True, read_only=True)
-    in_stock = serializers.BooleanField(read_only=True)
     category = serializers.SerializerMethodField()
+
+    # ============================================================
+    # NEW: available_stock computed field
+    # ============================================================
+    available_stock = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -97,7 +134,12 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             "description",
             "price",
             "original_price",
-            "stock",
+            # ============================================================
+            # NEW: Replace single 'stock' with three fields
+            # ============================================================
+            "total_stock",
+            "reserved_stock",
+            "available_stock",
             "in_stock",
             "sku",
             "category",
@@ -119,7 +161,16 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             "name": obj.category.name,
         }
 
-# Handles product creation and update requests.
+    # ============================================================
+    # NEW: available_stock = total_stock - reserved_stock
+    # ============================================================
+    def get_available_stock(self, obj):
+        return obj.total_stock - obj.reserved_stock
+
+
+# ============================================================
+# UPDATED: ProductCreateUpdateSerializer with new stock fields
+# ============================================================
 class ProductCreateUpdateSerializer(serializers.ModelSerializer):
     sku = serializers.CharField(required=False, allow_blank=True)
     category_id = serializers.IntegerField(write_only=True, required=False)
@@ -138,7 +189,11 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
             "description",
             "price",
             "original_price",
-            "stock",
+            # ============================================================
+            # NEW: total_stock and reserved_stock
+            # ============================================================
+            "total_stock",
+            "reserved_stock",
             "stock_to_add",
             "sku",
             "category",
@@ -177,6 +232,9 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
 
         validated_data.pop("stock_to_add", None)
 
+        # Ensure reserved_stock is 0 by default
+        validated_data.setdefault("reserved_stock", 0)
+
         return super().create(validated_data)
 
     # Prevents duplicate product names.
@@ -192,54 +250,75 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
             )
 
         return value
-    
+
     def validate(self, data):
-      price = data.get(
-        "price",
-        getattr(self.instance, "price", None),
-    )
-
-      original_price = data.get(
-        "original_price",
-        getattr(self.instance, "original_price", None),
-    )
-
-      if (
-        price is not None
-        and original_price is not None
-        and price > original_price
-    ):
-        raise serializers.ValidationError(
-            {
-                "price": (
-                    "Actual price cannot be greater than "
-                    "original price because this would create "
-                    "a negative discount."
-                )
-            }
+        price = data.get(
+            "price",
+            getattr(self.instance, "price", None),
         )
 
-      return data
+        original_price = data.get(
+            "original_price",
+            getattr(self.instance, "original_price", None),
+        )
+
+        if (
+            price is not None
+            and original_price is not None
+            and price > original_price
+        ):
+            raise serializers.ValidationError(
+                {
+                    "price": (
+                        "Actual price cannot be greater than "
+                        "original price because this would create "
+                        "a negative discount."
+                    )
+                }
+            )
+
+        # ============================================================
+        # NEW: Validate reserved_stock doesn't exceed total_stock
+        # ============================================================
+        total_stock = data.get("total_stock")
+        reserved_stock = data.get("reserved_stock", 0)
+
+        if total_stock is not None and reserved_stock > total_stock:
+            raise serializers.ValidationError(
+                {
+                    "reserved_stock": (
+                        "Reserved stock cannot exceed total stock."
+                    )
+                }
+            )
+
+        return data
 
     # Updates existing product information.
     def update(self, instance, validated_data):
-        # NOTE (stock race-condition fix): 'stock_to_add' on this endpoint
-        # is kept working for backward compatibility, but the frontend
-        # should no longer send it once a product already exists — stock
-        # changes after creation now go through the dedicated, atomic
-        # POST /api/v1/products/{id}/stock/adjust/ endpoint instead,
-        # which is safe under concurrent checkout/cancel activity. This
-        # PUT/update path is NOT safe for concurrent stock changes since
-        # it reads instance.stock in Python before saving.
+        # NOTE: 'stock_to_add' on this endpoint is kept working for backward
+        # compatibility, but the frontend should no longer send it once a
+        # product already exists — stock changes after creation now go through
+        # the dedicated, atomic POST /api/v1/products/{id}/stock/adjust/
+        # endpoint instead, which is safe under concurrent checkout/cancel
+        # activity. This PUT/update path is NOT safe for concurrent stock
+        # changes since it reads instance.stock in Python before saving.
         stock_to_add = validated_data.pop("stock_to_add", 0)
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
-        instance.stock += stock_to_add
+        # ============================================================
+        # NEW: stock_to_add now adds to total_stock only (not reserved)
+        # as per PDF Part 2 Item 5
+        # ============================================================
+        if stock_to_add:
+            instance.total_stock += stock_to_add
+
         instance.save()
 
         return instance
+
 
 # Returns product price and stock change history.
 class ProductHistorySerializer(serializers.ModelSerializer):

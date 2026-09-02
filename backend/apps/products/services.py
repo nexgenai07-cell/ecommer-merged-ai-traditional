@@ -15,6 +15,11 @@ def adjust_stock(
 ):
     """
     Atomically adjust product stock and record a StockMovement.
+
+    ============================================================
+    PDF Part 2 Item 5: Adjust Stock (API 33) delta operates on
+    total_stock ONLY. It never touches reserved_stock.
+    ============================================================
     """
 
     if delta == 0:
@@ -30,7 +35,10 @@ def adjust_stock(
             .get(pk=product.pk)
         )
      
-        previous_stock = product.stock # Stores the current stock before making any changes.
+        # ============================================================
+        # NEW: Use total_stock instead of stock
+        # ============================================================
+        previous_stock = product.total_stock
 
         if previous_stock + delta < 0:  # Prevents stock from becoming negative.
             raise ValueError(
@@ -39,30 +47,38 @@ def adjust_stock(
                 f"requested change: {delta}"
             )
 
-# Updates stock directly inside the database to avoid race conditions.
+        # ============================================================
+        # NEW: Update total_stock only - reserved_stock is never touched
+        # ============================================================
         Product.objects.filter(
             pk=product.pk
         ).update(
-            stock=F("stock") + delta
+            total_stock=F("total_stock") + delta
         )
 
         product.refresh_from_db() # Reloads the updated product from the database.
 
-# Saves a complete audit record for this stock adjustment.
+        # ============================================================
+        # NEW: Log with total_stock values
+        # ============================================================
         StockMovement.objects.create(
             product=product,
             changed_by=changed_by,
             old_stock=previous_stock,
-            new_stock=product.stock,
+            new_stock=product.total_stock,
             delta=delta,
             reason=reason,
             note=note,
         )
 
-# Returns updated stock information to the API.
+        # ============================================================
+        # NEW: Return updated stock information with all three fields
+        # ============================================================
         return {
             "id": product.id,
-            "stock": product.stock,
+            "total_stock": product.total_stock,
+            "reserved_stock": product.reserved_stock,
+            "available_stock": product.total_stock - product.reserved_stock,
             "previous_stock": previous_stock,
             "delta_applied": delta,
         }
