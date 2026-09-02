@@ -110,6 +110,9 @@ class AuditLogListView(generics.ListAPIView):
     setting. 'entity' and 'user' filter server-side; 'search' matches
     the log's action text (the model has no separate "description"
     field — 'action' is it, e.g. "create_product").
+
+    NEW (Follow-up v8, item 2.2): 'action' (create / update / delete) now
+    also filters, combined with 'entity' / 'user' / 'search'.
     """
     serializer_class = AuditLogSerializer
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
@@ -122,6 +125,18 @@ class AuditLogListView(generics.ListAPIView):
         entity = params.get('entity')
         if entity:
             qs = qs.filter(entity=entity)
+
+        # NEW (Follow-up v8, item 2.2): 'action' — powers the 3 stat-card
+        # counts (Create/Update/Delete) on the Audit Logs page. The model's
+        # 'action' field stores the raw tool name (e.g. "create_product",
+        # "update_order", "delete_category" — see ENTITY_MAP in
+        # apps/ai/audit.py), not a bare "create"/"update"/"delete", so this
+        # matches by prefix rather than exact equality. Only the 3
+        # documented values are accepted; anything else is ignored rather
+        # than silently returning zero rows.
+        action_param = params.get('action')
+        if action_param in ('create', 'update', 'delete'):
+            qs = qs.filter(action__startswith=f'{action_param}_')
 
         user_id = params.get('user')
         if user_id:

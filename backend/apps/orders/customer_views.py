@@ -1,8 +1,10 @@
 # PATH: apps/orders/customer_views.py
 
+import re
+
 from rest_framework import generics, permissions
 from django.db.models import Q, Count, Sum, Value, DecimalField
-from django.db.models.functions import Coalesce
+from django.db.models.functions import Coalesce, Replace
 from .models import Customer
 from .customer_serializers import CustomerAdminSerializer
 from apps.users.permissions import IsAdmin
@@ -77,7 +79,42 @@ class AdminCustomerListView(generics.ListAPIView):
 
         search = self.request.query_params.get('search')
         if search:
-            qs = qs.filter(Q(name__icontains=search) | Q(phone__icontains=search) | Q(email__icontains=search))
+            search_filter = Q(name__icontains=search) | Q(email__icontains=search) | Q(phone__icontains=search)
+
+            # NEW (Follow-up v8, item 3): phone search now tolerates
+            # formatting differences (spaces, dashes, a leading '+') so a
+            # WhatsApp-style plain-digit number (e.g. 923211234567)
+            # matches a customer whose phone was stored with punctuation
+            # (e.g. "+92 321 1234567"). Both sides are reduced to
+            # digits-only before comparing:
+            #   - qs is annotated with '_phone_digits', the stored phone
+            #     with '+', ' ', '-', '(', ')' stripped out via Django's
+            #     Replace(), so the comparison happens in the DB.
+            #   - the search term goes through the same strip in Python.
+            # Only applied when the search term has enough digits to be a
+            # plausible phone search (>=6) — otherwise a short numeric
+            # search (e.g. "92") would match almost every phone number's
+            # digit string and silently widen unrelated searches.
+            search_digits = re.sub(r'[\s\-()+]', '', search)
+            if len(re.sub(r'\D', '', search_digits)) >= 6:
+                qs = qs.annotate(
+                    _phone_digits=Replace(
+                        Replace(
+                            Replace(
+                                Replace(
+                                    Replace('phone', Value('+'), Value('')),
+                                    Value(' '), Value(''),
+                                ),
+                                Value('-'), Value(''),
+                            ),
+                            Value('('), Value(''),
+                        ),
+                        Value(')'), Value(''),
+                    )
+                )
+                search_filter |= Q(_phone_digits__icontains=search_digits)
+
+            qs = qs.filter(search_filter)
 
         # FIX (B57): "Pending" filter tha hi nahi is view mein — is liye
         # kaam nahi kar raha tha. Ab ?status=pending_payment (ya koi bhi

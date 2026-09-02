@@ -3,7 +3,7 @@ from rest_framework import viewsets, permissions, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
-from django.db.models import Q
+from django.db.models import Q, F
 
 from .services import adjust_stock as adjust_stock_service
 from .models import Product, ProductImage, ProductHistory
@@ -185,6 +185,9 @@ class ProductViewSet(viewsets.ModelViewSet):
           6. FIX (A1/E3): 'category_id' ab multiple values accept karta h
              — comma-separated (?category_id=5,8) aur repeated
              (?category_id=5&category_id=8) dono formats chalte hain.
+          7. NEW (Follow-up v8, item 1): 'status' param — out_of_stock /
+             low_stock / healthy — for the Inventory Alerts page. Combines
+             with every other filter above in a single request.
         """
         qs = self.get_queryset()
 
@@ -222,6 +225,24 @@ class ProductViewSet(viewsets.ModelViewSet):
                 qs = qs.filter(stock__gt=0)
             elif in_stock.lower() == 'false':
                 qs = qs.filter(stock__lte=0)
+
+        # NEW (Follow-up v8, item 1): 'status' — combined stock-health
+        # filter for the admin Inventory Alerts page. Separate from
+        # 'in_stock' above (that one only knows zero-vs-not-zero; this one
+        # also needs the per-product low_stock_threshold to tell "low" from
+        # "healthy" apart), so both params can keep working independently.
+        #   out_of_stock -> stock == 0
+        #   low_stock    -> stock > 0 AND stock <= low_stock_threshold
+        #   healthy      -> stock > low_stock_threshold
+        # Unknown/garbage values are ignored rather than erroring, same
+        # convention as 'ordering' below.
+        status_param = request.query_params.get('status')
+        if status_param == 'out_of_stock':
+            qs = qs.filter(stock=0)
+        elif status_param == 'low_stock':
+            qs = qs.filter(stock__gt=0, stock__lte=F('low_stock_threshold'))
+        elif status_param == 'healthy':
+            qs = qs.filter(stock__gt=F('low_stock_threshold'))
 
         # FIX: 'ordering' param ab handle ho raha hai (pehle ignore hota tha).
         # Sirf inhi fields pe ordering allow hai — kisi bhi arbitrary column

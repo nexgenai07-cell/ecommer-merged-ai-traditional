@@ -37,6 +37,9 @@ class CreateComplaintView(generics.ListCreateAPIView):
     field, so formats like "CMP-36", "CP-36", "#CP-36", or a bare "36"
     are all matched against the primary key — and/or the complaint's
     message text.
+
+    NEW (Follow-up v8, item 2.1): 'priority' (normal / urgent) now also
+    filters, combined with 'status' and 'search'.
     """
 
     serializer_class = ComplaintSerializer
@@ -60,6 +63,14 @@ class CreateComplaintView(generics.ListCreateAPIView):
         status_param = params.get("status")
         if status_param:
             qs = qs.filter(status=status_param)
+
+        # NEW (Follow-up v8, item 2.1): 'priority' was being sent by the
+        # frontend already but was never read here — silent no-op. Same
+        # convention as 'status' above (exact match, combines with it and
+        # with 'search').
+        priority_param = params.get("priority")
+        if priority_param:
+            qs = qs.filter(priority=priority_param)
 
         # FIX (A3): reference number format ka jhamela avoid karne k liye
         # regex se match kiya h — "CMP-36", "CP-36", "#CP-36", "#CMP36",
