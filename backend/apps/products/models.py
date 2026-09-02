@@ -3,6 +3,7 @@ import uuid
 
 from django.db import models
 from django.conf import settings
+from django.core.exceptions import ValidationError
 
 # Main product model that stores all product information.
 class Product(models.Model):
@@ -28,7 +29,26 @@ class Product(models.Model):
         null=True,
         blank=True,
     )
-    stock = models.PositiveIntegerField(default=0)
+
+    # ============================================================
+    # CHANGED: Single 'stock' field replaced with three fields
+    # as per PDF Part 2 Item 5 (Reserved Stock)
+    # ============================================================
+    total_stock = models.PositiveIntegerField(
+        default=0,
+        help_text="Total physical stock available"
+    )
+    reserved_stock = models.PositiveIntegerField(
+        default=0,
+        help_text="Stock reserved for pending payment orders"
+    )
+
+    # NOTE: available_stock is a computed property (total_stock - reserved_stock)
+    # NOT a database field
+
+    # Keep old field for backward compatibility during migration
+    # Will be removed after data migration
+    stock = models.PositiveIntegerField(default=0, help_text="DEPRECATED: Use total_stock instead")
 
     # Auto-generated if left blank
     sku = models.CharField(
@@ -52,20 +72,36 @@ class Product(models.Model):
     def __str__(self):
         return self.name
 
-
-# Returns the primary image selected for this product.
     @property
     def primary_image(self):
         return self.images.filter(is_primary=True).first()
 
-# Checks whether the product is currently available in stock.
+    # ============================================================
+    # UPDATED: in_stock now uses available_stock as per PDF Part 2 Item 5
+    # ============================================================
     @property
     def in_stock(self):
-        return self.stock > 0
+        return self.available_stock > 0
 
-# Automatically generates a unique SKU before saving a new product.
+    # ============================================================
+    # NEW: available_stock computed property as per PDF Part 2 Item 5
+    # available_stock = total_stock - reserved_stock
+    # ============================================================
+    @property
+    def available_stock(self):
+        return self.total_stock - self.reserved_stock
+
+    # ============================================================
+    # NEW: Validate that reserved_stock never exceeds total_stock
+    # ============================================================
+    def clean(self):
+        if self.reserved_stock > self.total_stock:
+            raise ValidationError({
+                'reserved_stock': 'Reserved stock cannot exceed total stock.'
+            })
+
     def save(self, *args, **kwargs):
-        # Generate SKU only if it is empty
+        # Auto-generate SKU if empty
         if not self.sku:
             while True:
                 sku = f"SKU-{uuid.uuid4().hex[:8].upper()}"
@@ -73,6 +109,8 @@ class Product(models.Model):
                     self.sku = sku
                     break
 
+        # Validate before saving
+        self.clean()
         super().save(*args, **kwargs)
 
 
@@ -95,6 +133,7 @@ class ProductImage(models.Model):
 
     def __str__(self):
         return f"Image for {self.product.name}"
+
 
 # Keeps a history of product price and stock changes.
 class ProductHistory(models.Model):
@@ -130,11 +169,14 @@ class StockMovement(models.Model):
         ('other', 'Other'),
         # Internal/system-triggered reasons (not exposed via the manual
         # adjust endpoint's serializer choices):
-        ('order_placed', 'Order Placed (checkout)'),
-        ('order_cancelled', 'Order Cancelled (stock restored)'),
-        # FIX (B59): stock deduction ab checkout pe nahi, payment confirm
-        # hone par hoti hai — ye reason us waqt use hota hai.
-        ('order_confirmed', 'Order Payment Confirmed (stock deducted)'),
+        ('order_placed', 'Order Placed (reserved)'),
+        ('order_cancelled', 'Order Cancelled (released)'),
+        ('order_confirmed', 'Order Payment Confirmed (deducted)'),
+        # NEW: QR specific reasons
+        ('qr_approved', 'QR Payment Approved'),
+        ('qr_rejected', 'QR Payment Rejected'),
+        ('qr_timeout', 'QR Payment Timeout'),
+        ('stripe_timeout', 'Stripe Payment Timeout'),
     ]
 
     product = models.ForeignKey(
@@ -163,6 +205,7 @@ class StockMovement(models.Model):
     def __str__(self):
         return f"{self.product.name}: {self.old_stock} -> {self.new_stock} ({self.reason})"
 
+
 # Stores discount coupons created by the admin.
 class Discount(models.Model):
     TYPE_CHOICES = [
@@ -188,6 +231,7 @@ class Discount(models.Model):
     def __str__(self):
         return self.code
 
+
 # Links products with discount coupons (many-to-many relationship).
 class ProductDiscount(models.Model):
     discount   = models.ForeignKey(Discount, on_delete=models.CASCADE, related_name='product_discounts')
@@ -197,6 +241,7 @@ class ProductDiscount(models.Model):
     class Meta:
         db_table = 'product_discounts'
         unique_together = ['discount', 'product']
+
 
 # Stores daily sales statistics for each product.
 class ProductStats(models.Model):

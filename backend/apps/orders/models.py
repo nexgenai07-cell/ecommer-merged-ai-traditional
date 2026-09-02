@@ -10,7 +10,7 @@ class Customer(models.Model):
 
     FIX: user ab optional hai — guest checkout allow karne k liye.
     Anonymous customer bhi order place kar sakta hai (name + phone dekar),
-    us waqt user=None save hoga. Jab wahi customer login kar k order karega,
+    us waqt user=None save hoga. Jab wahi customer login k kar order karega,
     normal tarah user set hoga.
     """
 
@@ -54,6 +54,7 @@ class Customer(models.Model):
 # Returns customer's name and phone number.
     def __str__(self):
         return f"{self.name} ({self.phone})"
+
 
 # NEW (Address Book — Backend Change Request v2, Part 1): replaces the old
 # single-address-on-Customer system (customer.address/city/postal_code,
@@ -199,6 +200,7 @@ class Order(models.Model):
     def __str__(self):
         return self.order_number
 
+
 # Stores every product purchased in an order.
 # Each row represents one product inside an order.
 class OrderItem(models.Model):
@@ -226,15 +228,30 @@ class OrderItem(models.Model):
     def __str__(self):
         return f"{self.quantity} x {self.product_name}"
 
+
 # Stores payment information for each order.
 # One payment record exists for one order.
 class Payment(models.Model):
-    # Defines different payment statuses.
+    # UPDATED: New status choices as per PDF Part 3
+    # Exactly these five values: pending | under_review | paid | rejected | refunded
     STATUS_CHOICES = [
         ("pending", "Pending"),
+        ("under_review", "Under Review"),      # NEW - QR proof uploaded, waiting admin
         ("paid", "Paid"),
-        ("failed", "Failed"),
+        ("rejected", "Rejected"),              # NEW - QR proof rejected
         ("refunded", "Refunded"),
+    ]
+
+    # NEW: Payment method choices as per PDF Part 3
+    METHOD_CHOICES = [
+        ("stripe", "Stripe"),
+        ("qr", "QR"),
+    ]
+
+    # NEW: Refund method choices as per PDF Part 2 Item 2
+    REFUND_METHOD_CHOICES = [
+        ("manual", "Manual"),
+        ("automatic", "Automatic"),
     ]
 
     order = models.OneToOneField(
@@ -274,11 +291,78 @@ class Payment(models.Model):
         blank=True,
     )
 
+    # ============================================================
+    # NEW FIELDS as per Backend Change Request v2 (PDF)
+    # ============================================================
+
+    # Part 3: QR Payment Method
+    payment_method = models.CharField(
+        max_length=10,
+        choices=METHOD_CHOICES,
+        default="stripe",
+        help_text="Payment method used: stripe or qr"
+    )
+
+    # Part 2 Item 2: Manual refund proof for QR-paid orders
+    refund_method = models.CharField(
+        max_length=10,
+        choices=REFUND_METHOD_CHOICES,
+        null=True,
+        blank=True,
+        help_text="manual for QR orders, automatic for Stripe orders"
+    )
+
+    refund_transaction_reference = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text="Required when refund_method is manual"
+    )
+
+    # Part 3.1: QR Proof Upload fields
+    qr_screenshot_url = models.TextField(
+        null=True,
+        blank=True,
+        help_text="URL of uploaded QR payment screenshot"
+    )
+
+    qr_transaction_id = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text="Transaction ID provided by customer"
+    )
+
+    qr_submitted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When proof was uploaded (moves to under_review)"
+    )
+
+    qr_reject_reason = models.TextField(
+        null=True,
+        blank=True,
+        help_text="Reason given when admin rejects QR proof"
+    )
+
+    qr_image_hash = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        help_text="SHA-256 hash of screenshot for duplicate detection"
+    )
+
+    # Part 3.6: Duplicate warning flag
+    qr_duplicate_warning = models.BooleanField(
+        default=False,
+        help_text="Set to True if duplicate proof detected"
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = "payments"
-# Returns payment information using order number.
+
     def __str__(self):
         return f"Payment for {self.order.order_number}"
