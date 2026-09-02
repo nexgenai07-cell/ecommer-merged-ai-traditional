@@ -129,10 +129,14 @@ class Complaint(models.Model):
         blank=True,
     )
 
+    # ============================================================
+    # DEPRECATED: 'response' field - ab messages system use karenge
+    # Keep for backward compatibility, but not used for new flow
+    # ============================================================
     response = models.TextField(
         null=True,
         blank=True,
-        help_text="Admin response to the customer complaint",
+        help_text="DEPRECATED: Use ComplaintMessage system instead",
     )
 
     resolved_by = models.ForeignKey(
@@ -147,11 +151,6 @@ class Complaint(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-    # FIX: Meta/clean/save/__str__ pehle module-level par (Complaint class
-    # ke bahar) likhe hue the — is wajah se ye Complaint model ka hissa
-    # bante hi nahi the: db_table/ordering apply nahi hoti thi, order<->
-    # customer validation kabhi chalti nahi thi, aur save() override kaam
-    # nahi karta tha. Ab sahi tarah class ke andar indent kar diya.
     class Meta:
         db_table = "complaints"
         ordering = ["-created_at"]
@@ -169,3 +168,50 @@ class Complaint(models.Model):
 
     def __str__(self):
         return f"Complaint by {self.customer.name} [{self.status}]"
+
+
+# ============================================================
+# NEW: Complaint Message Model as per PDF Part 2 Item 4
+# ============================================================
+class ComplaintMessage(models.Model):
+    """
+    Individual messages in a complaint thread.
+    Both customer and admin can send messages.
+    Sending a message NEVER changes complaint status.
+    """
+
+    SENDER_CHOICES = [
+        ("customer", "Customer"),
+        ("admin", "Admin"),
+    ]
+
+    complaint = models.ForeignKey(
+        Complaint,
+        on_delete=models.CASCADE,
+        related_name="messages",
+    )
+
+    sender = models.CharField(
+        max_length=20,
+        choices=SENDER_CHOICES,
+        help_text="Who sent this message: customer or admin"
+    )
+
+    sender_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        help_text="User who sent this message (admin user or customer's user)"
+    )
+
+    message = models.TextField()
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "complaint_messages"
+        ordering = ["created_at"]  # Chronological order
+
+    def __str__(self):
+        return f"Message #{self.id} on Complaint #{self.complaint_id} from {self.sender}"
