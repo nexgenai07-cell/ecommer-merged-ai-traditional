@@ -23,6 +23,11 @@ def _get_customer(request):
 # existing one — this is always an INSERT, never an UPDATE).
 class AddressListCreateView(generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated, IsCustomer]
+    # NOTE: locked spec response shape for GET is exactly
+    # { "results": [...] } — no count/next/previous. Without this, the
+    # global DEFAULT_PAGINATION_CLASS (StandardResultsPagination) would
+    # apply and add count/next/previous, which the spec doesn't ask for.
+    pagination_class = None
 
     def get_queryset(self):
         return Address.objects.filter(customer=_get_customer(self.request))
@@ -31,6 +36,10 @@ class AddressListCreateView(generics.ListCreateAPIView):
         if self.request.method == "POST":
             return AddressWriteSerializer
         return AddressSerializer
+
+    def list(self, request, *args, **kwargs):
+        serializer = self.get_serializer(self.get_queryset(), many=True)
+        return Response({"results": serializer.data})
 
     def perform_create(self, serializer):
         serializer.save(customer=_get_customer(self.request))

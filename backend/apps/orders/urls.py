@@ -18,7 +18,7 @@ from .return_views import (
 )
 from .complaint_views import (
     CreateComplaintView, ComplaintDetailView,
-    AdminComplaintStatusUpdateView, AdminComplaintRespondView,
+    AdminComplaintStatusUpdateView, ComplaintMessageListCreateView,
 )
 
 # Customer-facing order URLs (mounted at /api/v1/orders/)
@@ -54,9 +54,14 @@ admin_return_urlpatterns = [
 complaint_urlpatterns = [
     path('', CreateComplaintView.as_view(), name='complaint-create-list'),
     path('<int:pk>/', ComplaintDetailView.as_view(), name='complaint-detail'),
+    # NEW (Backend Change Request v2, Part 2 — Item 4): replaces the
+    # removed PUT /api/v1/admin/complaints/{id}/respond/. Same path for
+    # both customer and admin — permission is enforced inside the view
+    # (owning customer OR any admin), matching the spec's "Allowed for
+    # the complaint's owning customer OR any admin."
+    path('<int:pk>/messages/', ComplaintMessageListCreateView.as_view(), name='complaint-messages'),
 ]
 
 admin_complaint_urlpatterns = [
     path('<int:pk>/status/', AdminComplaintStatusUpdateView.as_view(), name='admin-complaint-status'),
-    path('<int:pk>/respond/', AdminComplaintRespondView.as_view(), name='admin-complaint-respond'),
 ]

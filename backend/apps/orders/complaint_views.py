@@ -7,15 +7,18 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db.models import Q
 import re
 
-from apps.returns.models import Complaint
+from apps.returns.models import Complaint, ComplaintMessage
 from apps.returns.complaint_serializers import (
     ComplaintSerializer,
     CreateComplaintSerializer,
     AdminComplaintStatusSerializer,
-    AdminComplaintRespondSerializer,
+    ComplaintMessageSerializer,
+    CreateComplaintMessageSerializer,
 )
 from .models import Order, Customer
 from apps.users.permissions import IsAdmin
+from apps.users.models import User
+from apps.notifications.utils import create_notification
 from core.pagination import StandardResultsPagination
 
 # Handles both:
@@ -180,40 +183,117 @@ class AdminComplaintStatusUpdateView(APIView):
 
         return Response({"message": "Complaint status updated."})
 
-# Allows admin to reply to customer complaints.
-# Finds the complaint to respond to.
-# Validates the admin's response.
-# Saves the admin's reply.
-class AdminComplaintRespondView(APIView):
+# NEW (Backend Change Request v2, Part 2 — Item 4 / Issue 7):
+# AdminComplaintRespondView (PUT .../respond/) is REMOVED per spec — it
+# used to auto-set status to "resolved" on every reply, which is exactly
+# the bug being fixed here. Replaced by the two views below.
+#
+# NOTE for whoever maintains the "response"/"resolved_by" fields still on
+# the Complaint model: nothing writes to them anymore (respond/ was the
+# only writer). Left on the model rather than migrated out, since dropping
+# columns wasn't asked for here and old complaints may still have historic
+# data in them worth keeping readable.
+#
+# RESTORED (Sep 2026 cross-check): this whole Item 4 implementation had
+# been reverted back to the old respond/ endpoint in a later round of
+# work (looks like it was built on an older base) — putting it back here.
+
+
+def _notify_other_party(complaint, sender):
     """
-    PUT /api/v1/admin/complaints/{id}/respond/
+    FLOW: called from ComplaintMessageListCreateView.create() right after
+    a message is saved. Sends exactly ONE notification to "the other
+    party", per spec.
 
-    FIX (Postman testing — 09 Jul 2026): doc (API 68) expects only
-    {"message": "Response sent.", "status": "resolved"} — the full
-    ComplaintSerializer(complaint).data object was being returned
-    before, which doesn't match.
+    DESIGN NOTE (flagging this — spec doesn't define multi-admin
+    behaviour): this project has no per-complaint "assigned admin" concept
+    (Complaint.resolved_by is only ever set by the old respond/ flow,
+    which no longer runs). So "the admin party" resolves to: whichever
+    admin already resolved_by-owns this complaint if set, else just the
+    first admin account in the system. That keeps this at exactly one
+    notification row, matching the spec's wording literally, instead of
+    fanning out to every admin (which the spec doesn't ask for and would
+    read as more than "exactly ONE"). If there end up being multiple
+    admins who all need to see new customer messages, this needs a real
+    "assigned admin" field — let me know and I'll add it.
     """
+    if sender == "customer":
+        target_user = complaint.resolved_by or User.objects.filter(role="admin").first()
+        if not target_user:
+            return
+    else:
+        target_user = complaint.customer.user
 
-    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+    create_notification(
+        user=target_user,
+        title=f"New reply on complaint #{complaint.id}",
+        message=(
+            f"New reply on complaint #{complaint.id}."
+            if sender == "admin"
+            else f"New customer reply on complaint #{complaint.id}."
+        ),
+        notification_type="system",
+        reference_type="complaint",
+        reference_id=complaint.id,
+    )
 
-    def put(self, request, pk):
+
+# GET  /api/v1/complaints/{id}/messages/  -> full thread, chronological, both roles
+# POST /api/v1/complaints/{id}/messages/  -> {"message": "string"}
+# Allowed for the complaint's owning customer OR any admin. Posting a
+# message NEVER changes status — status stays exclusively on
+# AdminComplaintStatusUpdateView (above), explicit-only, per spec.
+class ComplaintMessageListCreateView(generics.ListCreateAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    pagination_class = None  # spec response shape is a flat {"results": [...]}, no count/next/previous
+
+    def _get_complaint(self):
+        user = self.request.user
         try:
-            complaint = Complaint.objects.get(id=pk)
+            if user.role == "admin":
+                return Complaint.objects.get(id=self.kwargs["pk"])
+            return Complaint.objects.get(id=self.kwargs["pk"], customer__user=user)
         except Complaint.DoesNotExist:
-            return Response(
-                {"error": "Complaint not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+            return None
 
-        serializer = AdminComplaintRespondSerializer(data=request.data)
+    def get_queryset(self):
+        complaint = self._get_complaint()
+        if complaint is None:
+            return ComplaintMessage.objects.none()
+        return ComplaintMessage.objects.filter(complaint=complaint).order_by("created_at")
+
+    def list(self, request, *args, **kwargs):
+        complaint = self._get_complaint()
+        if complaint is None:
+            return Response({"error": "Complaint not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = ComplaintMessageSerializer(self.get_queryset(), many=True)
+        return Response({"results": serializer.data})
+
+    def create(self, request, *args, **kwargs):
+        complaint = self._get_complaint()
+        if complaint is None:
+            return Response({"error": "Complaint not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = CreateComplaintMessageSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        complaint.response = serializer.validated_data["response"]
-        complaint.resolved_by = request.user
-        complaint.status = "resolved"
-        complaint.save()
+        # NOTE: this project's ComplaintMessage.sender is a real stored
+        # CharField (not a derived property), so it has to be set
+        # explicitly here from the requesting user's role.
+        sender = "admin" if request.user.role == "admin" else "customer"
 
-        return Response({
-            "message": "Response sent.",
-            "status": complaint.status,
-        })
+        complaint_message = ComplaintMessage.objects.create(
+            complaint=complaint,
+            sender=sender,
+            sender_user=request.user,
+            message=serializer.validated_data["message"],
+        )
+
+        # Exactly one notification to the other party — never touches status.
+        _notify_other_party(complaint, complaint_message.sender)
+
+        return Response(
+            ComplaintMessageSerializer(complaint_message).data,
+            status=status.HTTP_201_CREATED,
+        )

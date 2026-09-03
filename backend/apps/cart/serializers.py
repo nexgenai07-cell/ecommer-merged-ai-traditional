@@ -15,16 +15,27 @@ class CartProductSerializer(serializers.ModelSerializer):
     separate flat fields (product_name, product_price, ...) instead.
     Frontend code written against the documented shape (item.product.name,
     item.product.price, etc.) would get "undefined" for all of these.
+
+    FIX (Cross-check, Sep 2026 — PDF Part 2 Item 5): 'stock' was the
+    deprecated single-field, which nothing in the codebase updates
+    anymore (checkout/confirm/cancel only ever touch total_stock/
+    reserved_stock now), so it was frozen/meaningless here. Spec names
+    "Cart items" explicitly among the endpoints that must move to
+    total_stock/reserved_stock/available_stock.
     """
     primary_image = serializers.SerializerMethodField()
+    available_stock = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
-        fields = ['id', 'name', 'price', 'primary_image', 'stock']
+        fields = ['id', 'name', 'price', 'primary_image', 'total_stock', 'reserved_stock', 'available_stock']
 
     def get_primary_image(self, obj):
         img = obj.primary_image
         return img.image.url if img and img.image else None
+
+    def get_available_stock(self, obj):
+        return obj.total_stock - obj.reserved_stock
 
 
 class CartItemSerializer(serializers.ModelSerializer):
@@ -97,9 +108,14 @@ class AddToCartSerializer(serializers.Serializer):
         except Product.DoesNotExist:
             raise serializers.ValidationError({'product_id': 'Product not found.'})
 
-        if product.stock < data['quantity']:
+        # FIX (Cross-check, Sep 2026 — PDF Part 2 Item 5): was checking
+        # product.stock, the deprecated field nothing updates anymore —
+        # this validation was effectively broken (comparing against a
+        # frozen/stale number) for every real product. available_stock
+        # (total_stock - reserved_stock) is what checkout itself checks.
+        if product.available_stock < data['quantity']:
             raise serializers.ValidationError({
-                'quantity': f'Only {product.stock} units available in stock.'
+                'quantity': f'Only {product.available_stock} units available in stock.'
             })
 
         data['product'] = product
@@ -111,9 +127,11 @@ class UpdateCartItemSerializer(serializers.Serializer):
 
     def validate_quantity(self, value):
         cart_item = self.context.get('cart_item')
-        if value > 0 and cart_item and value > cart_item.product.stock:
+        # FIX (Cross-check, Sep 2026 — PDF Part 2 Item 5): same stock ->
+        # available_stock fix as AddToCartSerializer above.
+        if value > 0 and cart_item and value > cart_item.product.available_stock:
             raise serializers.ValidationError(
-                f'Only {cart_item.product.stock} units available in stock.'
+                f'Only {cart_item.product.available_stock} units available in stock.'
             )
         return value
 

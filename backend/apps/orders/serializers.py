@@ -52,9 +52,18 @@ class OrderItemSerializer(serializers.ModelSerializer):
             return image.url.replace("http://", "https://")
         return str(image)
 
+
 # Converts payment details into API response.
 # Used when returning complete order information.
 class PaymentSerializer(serializers.ModelSerializer):
+    # FIX (Cross-check, Sep 2026): spec locks this field's JSON name as
+    # "method" (referenced throughout the PDF as "payment.method", e.g.
+    # "the order's payment.method == 'qr'", "payment.method: 'qr'") — the
+    # model field is still payment_method internally (source=), only the
+    # serialized key changes, so no migration/internal-logic changes are
+    # needed.
+    method = serializers.CharField(source="payment_method")
+
     class Meta:
         model = Payment
         fields = [
@@ -63,7 +72,14 @@ class PaymentSerializer(serializers.ModelSerializer):
             "status",
             "amount",
             "paid_at",
+            # ============================================================
+            # NEW: Payment method fields
+            # ============================================================
+            "method",
+            "refund_method",
+            "refund_transaction_reference",
         ]
+
 
 # Returns a lightweight order summary for customer order history.
 class OrderListSerializer(serializers.ModelSerializer):
@@ -86,6 +102,7 @@ class OrderListSerializer(serializers.ModelSerializer):
 # Counts how many products belong to this order.
     def get_item_count(self, obj):
         return obj.items.count()
+
 
 # Returns order summary with customer information for admin dashboard.
 class AdminOrderListSerializer(serializers.ModelSerializer):
@@ -114,6 +131,7 @@ class AdminOrderListSerializer(serializers.ModelSerializer):
             "name": obj.customer.name,
             "phone": obj.customer.phone,
         }
+
 
 # Returns complete order details including customer, items and payment.
 class OrderDetailSerializer(serializers.ModelSerializer):
@@ -161,7 +179,11 @@ class OrderDetailSerializer(serializers.ModelSerializer):
             "phone": obj.customer.phone,
         }
 
-# Validates checkout request before creating an order.
+
+# ============================================================
+# UPDATED: CheckoutSerializer with payment_method field
+# as per PDF Part 3
+# ============================================================
 class CheckoutSerializer(serializers.Serializer):
     """POST /api/v1/orders/checkout/
 
@@ -186,6 +208,10 @@ class CheckoutSerializer(serializers.Serializer):
     single-address behaviour the spec explicitly says to stop running in
     parallel with the Address Book. Saving an address is now only ever
     done explicitly via POST /api/v1/addresses/.
+
+    ============================================================
+    NEW (PDF Part 3): payment_method field
+    ============================================================
     """
 
     address_id = serializers.IntegerField(required=False, allow_null=True)
@@ -216,6 +242,15 @@ class CheckoutSerializer(serializers.Serializer):
     notes = serializers.CharField(
         required=False,
         allow_blank=True,
+    )
+
+    # ============================================================
+    # NEW: payment_method field (PDF Part 3)
+    # ============================================================
+    payment_method = serializers.ChoiceField(
+        choices=["stripe", "qr"],
+        required=True,
+        help_text="Payment method: stripe or qr"
     )
 
     # FIX (B19): city/address get real validation instead of none.
@@ -257,6 +292,7 @@ class CheckoutSerializer(serializers.Serializer):
             )
         return cleaned
 
+
 # NEW (Backend Change Request v2, Part 2 — Item 1 / Issue 3): optional
 # reason on customer-initiated cancellation. Purely additive — sending no
 # body at all (reason simply absent) must keep working exactly as before.
@@ -296,6 +332,22 @@ class AdminOrderStatusSerializer(serializers.Serializer):
         required=False,
         allow_blank=True,
         max_length=1000,
+    )
+
+    # NEW (Backend Change Request v2, Part 2 — Item 2 / Issue 5): manual
+    # refund proof for QR-paid orders. Both optional at the field level —
+    # only actually required when this cancellation is for a QR-paid
+    # order, which needs the order's payment.payment_method to check, so
+    # that part of the validation happens in AdminOrderStatusUpdateView
+    # (has the order loaded already) rather than here.
+    refund_method = serializers.ChoiceField(
+        choices=["manual", "automatic"],
+        required=False,
+    )
+    refund_transaction_reference = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=255,
     )
 
     def validate(self, attrs):

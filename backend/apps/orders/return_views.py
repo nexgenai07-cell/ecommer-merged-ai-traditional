@@ -14,6 +14,7 @@ from .models import Order
 # admin login se accessible na ho.
 from apps.users.permissions import IsAdmin, IsCustomer
 from core.pagination import StandardResultsPagination
+from apps.notifications.utils import create_notification
 
 # Allows customers to submit a return request for an order.
 # Only logged-in customers can request returns.
@@ -183,6 +184,34 @@ class AdminReturnStatusUpdateView(APIView):
         return_request.status = serializer.validated_data['status']
         return_request.resolved_at = timezone.now()
         return_request.save()
+
+        # NEW (Cross-check, Sep 2026 — PDF Part 2 Item 3): "return status
+        # change" is one of the three automatic notification triggers the
+        # spec explicitly names ("order status change, return status
+        # change, complaint message"), but no notification was ever being
+        # sent here at all — the customer had no way of knowing their
+        # return was approved/rejected/completed, and there was nothing
+        # for reference_type="return" to attach to anywhere in the app.
+        # reference_id is the Return's own id (per spec: "the
+        # order_number / return id / complaint id as a string"), not the
+        # order_number, to distinguish it from an order notification.
+        status_messages = {
+            "approved": f"Your return request for order #{return_request.order.order_number} has been approved.",
+            "rejected": f"Your return request for order #{return_request.order.order_number} has been rejected.",
+            "completed": f"Your return for order #{return_request.order.order_number} has been completed.",
+        }
+        create_notification(
+            user=return_request.customer.user if return_request.customer else return_request.order.customer.user,
+            store=return_request.order.store,
+            title="Return Status Updated",
+            message=status_messages.get(
+                return_request.status,
+                f"Your return request for order #{return_request.order.order_number} has been updated.",
+            ),
+            notification_type="order",
+            reference_type="return",
+            reference_id=return_request.id,
+        )
 
         return Response({
             'message': 'Return status updated.',

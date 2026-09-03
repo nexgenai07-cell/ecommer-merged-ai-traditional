@@ -169,8 +169,23 @@ def confirm_stock_for_order(order):
                 note=note,
             )
 
+    # BUG FIX (cross-check, Sep 2026): every caller of this function
+    # (CreatePaymentIntentView free-order path, StripeWebhookView,
+    # AdminQRPaymentApproveView) calls order.save() for the status change
+    # BEFORE calling confirm_stock_for_order(order) — so setting
+    # order.stock_deducted = True here without its own order.save() never
+    # actually persisted to the DB. stock_deducted stayed False forever
+    # in the database, which broke two things: (1) the idempotency guard
+    # at the top of this function and reserve_stock_for_order (a retried
+    # Stripe webhook or duplicate approve call could double-deduct
+    # total_stock), and (2) release_reserved_stock_for_order's branch
+    # selection — a later cancellation of an already-confirmed order
+    # would incorrectly take the "not stock_deducted" branch (only
+    # decrementing reserved_stock, already 0) instead of restoring
+    # total_stock, permanently losing those units. Saving explicitly here
+    # fixes it for all three call sites at once.
     order.stock_deducted = True
-
+    order.save(update_fields=["stock_deducted"])
 
 def release_reserved_stock_for_order(order):
     """
@@ -476,10 +491,21 @@ class CheckoutView(APIView):
             # ============================================================
             reserve_stock_for_order(order)
 
+            # FIX (Cross-check, Sep 2026): payment_method was being
+            # validated by CheckoutSerializer but never actually passed
+            # into Payment.objects.create() below — every order silently
+            # defaulted to the model's payment_method="stripe", even when
+            # the customer picked "qr" at checkout. That broke the whole
+            # QR flow at its root: QRProofUploadView/AdminQRPayment* views
+            # all check payment.payment_method == "qr" and would reject a
+            # QR order that the DB actually still thought was "stripe".
+            payment_method = data["payment_method"]
+
             Payment.objects.create(
                 order=order,
                 status="pending",
                 amount=total_amount,
+                payment_method=payment_method,
             )
 
             cart.items.all().delete()
@@ -501,8 +527,27 @@ class CheckoutView(APIView):
         # exceptions.
         send_order_confirmation_email(order)
 
+        response_data = OrderDetailSerializer(order).data
+
+        # NEW (Cross-check, Sep 2026 — Part 3): these two fields were
+        # missing from the checkout response entirely for QR orders.
+        # qr_image_url is static/config-driven (one image per gateway,
+        # NOT generated per transaction, per spec) — set
+        # QR_PAYMENT_IMAGE_URL in settings.py or the environment; falls
+        # back to an empty string (never crashes checkout) if unset, but
+        # the frontend won't have anything to show, so this needs a real
+        # value configured before QR goes live.
+        if payment_method == "qr":
+            response_data["qr_image_url"] = getattr(
+                settings, "QR_PAYMENT_IMAGE_URL", ""
+            )
+            # payment_reference = the order_number, to be written in the
+            # bank transfer note (per spec, Part 3) — same value the
+            # customer needs to reference when they upload proof.
+            response_data["payment_reference"] = order.order_number
+
         return Response(
-            OrderDetailSerializer(order).data,
+            response_data,
             status=status.HTTP_201_CREATED,
         )
 
@@ -755,6 +800,27 @@ class AdminOrderStatusUpdateView(APIView):
                 "cancellation_reason", ""
             ).strip()
 
+            # NEW (Backend Change Request v2, Part 2 — Item 2 / Issue 5):
+            # for a QR-paid order being cancelled, refund_transaction_reference
+            # is mandatory — reject with 400 before touching anything if
+            # it's missing. Stripe orders are untouched (refund stays
+            # automatic, this field is never required/sent for them).
+            order_payment = getattr(order, "payment", None)
+            is_qr_order = bool(order_payment and order_payment.payment_method == "qr")
+            refund_transaction_reference = serializer.validated_data.get(
+                "refund_transaction_reference", ""
+            ).strip()
+
+            if is_qr_order and not refund_transaction_reference:
+                return Response(
+                    {
+                        "refund_transaction_reference": (
+                            "This field is required when cancelling a QR-paid order."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
             # FIX (B27): surface in-stock alternatives for any item that
             # was out of stock, so the admin can pass them on to the
             # customer instead of just saying "sorry, cancelled".
@@ -770,6 +836,15 @@ class AdminOrderStatusUpdateView(APIView):
                     was_paid_before_cancel = order.payment.status == "paid"
                     order.payment.status = "refunded"
                     order.payment.refunded_at = timezone.now()
+                    # NEW (Item 2): QR orders get refund_method="manual"
+                    # (the only valid value per spec for this case) plus
+                    # the admin-supplied reference, stored on the payment
+                    # so every future response for this order includes
+                    # them. Stripe orders are left alone — refund_method
+                    # stays null, refund is automatic, exactly as before.
+                    if is_qr_order:
+                        order.payment.refund_method = "manual"
+                        order.payment.refund_transaction_reference = refund_transaction_reference
                     order.payment.save()
 
         order.status = new_status

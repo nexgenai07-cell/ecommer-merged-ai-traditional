@@ -120,45 +120,55 @@ class ProductViewSet(viewsets.ModelViewSet):
             status=status.HTTP_201_CREATED,
         )
 
-    def update(self, request, *args, **kwargs):
-        instance = self.get_object()
+        def update(self, request, *args, **kwargs):
+            instance = self.get_object()
 
-        old_price = instance.price
-        old_stock = instance.stock
+            old_price = instance.price
+            # BUG FIX (cross-check, Sep 2026 — PDF Part 2 Item 5): this used
+            # to read/compare instance.stock, the DEPRECATED field that
+            # nothing else in the app writes to anymore (stock changes go
+            # through total_stock). Since instance.stock never changes,
+            # `instance.stock != old_stock` below was always False, so a
+            # ProductHistory row was NEVER created when an admin adjusted
+            # stock via this endpoint (stock_to_add) — silently breaking the
+            # audit trail for this path even though total_stock really did
+            # change. Reading/comparing total_stock instead fixes it. Also
+            # dropped the dead `data["stock"] = ...` line — "stock" isn't in
+            # ProductCreateUpdateSerializer.Meta.fields, so it was silently
+            # ignored anyway; the serializer's own update() already applies
+            # stock_to_add to total_stock correctly.
+            old_stock = instance.total_stock
 
-        # Copy request data because request.data is immutable
-        data = request.data.copy()
+            # Copy request data because request.data is immutable
+            data = request.data.copy()
 
-        # Amount to add to existing stock
-        stock_to_add = int(data.get("stock_to_add", 0) or 0)
+            # Amount to add to existing stock
+            stock_to_add = int(data.get("stock_to_add", 0) or 0)
 
-        if stock_to_add > 0:
-            data["stock"] = old_stock + stock_to_add
-
-        serializer = self.get_serializer(
-            instance,
-            data=data,
-            partial=kwargs.pop("partial", False),
-        )
-
-        serializer.is_valid(raise_exception=True)
-        self.perform_update(serializer)
-
-        instance.refresh_from_db()
-
-        if instance.price != old_price or instance.stock != old_stock:
-            ProductHistory.objects.create(
-                product=instance,
-                changed_by=request.user,
-                old_price=old_price,
-                new_price=instance.price,
-                old_stock=old_stock,
-                new_stock=instance.stock,
-                reason=f"Added {stock_to_add} units" if stock_to_add > 0 else "Product updated",
+            serializer = self.get_serializer(
+                instance,
+                data=data,
+                partial=kwargs.pop("partial", False),
             )
 
-        return Response(serializer.data)
+            serializer.is_valid(raise_exception=True)
+            self.perform_update(serializer)
 
+            instance.refresh_from_db()
+
+            if instance.price != old_price or instance.total_stock != old_stock:
+                ProductHistory.objects.create(
+                    product=instance,
+                    changed_by=request.user,
+                    old_price=old_price,
+                    new_price=instance.price,
+                    old_stock=old_stock,
+                    new_stock=instance.total_stock,
+                    reason=f"Added {stock_to_add} units" if stock_to_add > 0 else "Product updated",
+                )
+
+            return Response(serializer.data)
+        
     @action(detail=False, methods=['get'], url_path='search')
     def search(self, request):
         """
@@ -216,33 +226,44 @@ class ProductViewSet(viewsets.ModelViewSet):
         if max_price:
             qs = qs.filter(price__lte=max_price)
 
-        # FIX (A1): 'false' ab explicitly handle ho raha h — pehle sirf
-        # 'true' check hota tha, is liye in_stock=false kabhi filter hi
-        # nahi karta tha aur count poore catalog ka aata tha.
+        # FIX (Cross-check, Sep 2026 — PDF Part 2 Item 5): this filter was
+        # still reading the deprecated 'stock' field, which nothing in the
+        # codebase writes to anymore (checkout/confirm/cancel/reinstate
+        # all only touch total_stock/reserved_stock now), so 'stock' sits
+        # frozen at whatever it was on creation and this filter was
+        # effectively broken for every real product. available_stock
+        # isn't a DB column, so it's expressed with F() instead.
         in_stock = request.query_params.get('in_stock')
         if in_stock is not None:
             if in_stock.lower() == 'true':
-                qs = qs.filter(stock__gt=0)
+                qs = qs.filter(total_stock__gt=F('reserved_stock'))
             elif in_stock.lower() == 'false':
-                qs = qs.filter(stock__lte=0)
+                qs = qs.filter(total_stock__lte=F('reserved_stock'))
 
         # NEW (Follow-up v8, item 1): 'status' — combined stock-health
         # filter for the admin Inventory Alerts page. Separate from
         # 'in_stock' above (that one only knows zero-vs-not-zero; this one
         # also needs the per-product low_stock_threshold to tell "low" from
         # "healthy" apart), so both params can keep working independently.
-        #   out_of_stock -> stock == 0
-        #   low_stock    -> stock > 0 AND stock <= low_stock_threshold
-        #   healthy      -> stock > low_stock_threshold
+        #   out_of_stock -> available_stock == 0
+        #   low_stock    -> available_stock > 0 AND available_stock <= low_stock_threshold
+        #   healthy      -> available_stock > low_stock_threshold
         # Unknown/garbage values are ignored rather than erroring, same
         # convention as 'ordering' below.
+        # FIX (Cross-check, Sep 2026 — PDF Part 2 Item 5): same 'stock' ->
+        # available_stock (total_stock - reserved_stock) fix as in_stock
+        # above.
         status_param = request.query_params.get('status')
         if status_param == 'out_of_stock':
-            qs = qs.filter(stock=0)
+            qs = qs.filter(total_stock__lte=F('reserved_stock'))
         elif status_param == 'low_stock':
-            qs = qs.filter(stock__gt=0, stock__lte=F('low_stock_threshold'))
+            qs = qs.annotate(
+                _available_stock=F('total_stock') - F('reserved_stock')
+            ).filter(_available_stock__gt=0, _available_stock__lte=F('low_stock_threshold'))
         elif status_param == 'healthy':
-            qs = qs.filter(stock__gt=F('low_stock_threshold'))
+            qs = qs.annotate(
+                _available_stock=F('total_stock') - F('reserved_stock')
+            ).filter(_available_stock__gt=F('low_stock_threshold'))
 
         # FIX: 'ordering' param ab handle ho raha hai (pehle ignore hota tha).
         # Sirf inhi fields pe ordering allow hai — kisi bhi arbitrary column
@@ -285,8 +306,13 @@ class ProductViewSet(viewsets.ModelViewSet):
             is_delete=False,
         )
 
-        # Compare stock vs threshold in Python (clear and simple for small catalogs)
-        low_stock_products = [p for p in qs if p.stock <= p.low_stock_threshold]
+        # FIX (Cross-check, Sep 2026 — PDF Part 2 Item 5): was comparing
+        # p.stock (the deprecated field, frozen since nothing updates it
+        # anymore) against the threshold, so this endpoint was comparing
+        # stale/zero data instead of real stock. Uses available_stock
+        # (total_stock - reserved_stock), same as everywhere else post
+        # Reserved Stock change.
+        low_stock_products = [p for p in qs if p.available_stock <= p.low_stock_threshold]
         serializer = LowStockProductSerializer(low_stock_products, many=True)
         return Response(serializer.data)
 

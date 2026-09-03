@@ -2,7 +2,7 @@
 
 from rest_framework import serializers
 from apps.orders.models import Order
-from .models import Complaint
+from .models import Complaint, ComplaintMessage
 
 
 class ComplaintSerializer(serializers.ModelSerializer):
@@ -115,5 +115,27 @@ class AdminComplaintStatusSerializer(serializers.Serializer):
     )
 
 
-class AdminComplaintRespondSerializer(serializers.Serializer):
-    response = serializers.CharField()
+# NEW (Backend Change Request v2, Part 2 — Item 4 / Issue 7):
+# AdminComplaintRespondSerializer removed along with PUT
+# /api/v1/admin/complaints/{id}/respond/ — replaced by the two below.
+#
+# GET /api/v1/complaints/{id}/messages/ response shape, per spec:
+# { "id", "sender": "customer"|"admin", "message", "created_at" }
+class ComplaintMessageSerializer(serializers.ModelSerializer):
+    sender = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = ComplaintMessage
+        fields = ["id", "sender", "message", "created_at"]
+        read_only_fields = fields
+
+
+# POST /api/v1/complaints/{id}/messages/ request body: {"message": "string"}
+class CreateComplaintMessageSerializer(serializers.Serializer):
+    message = serializers.CharField()
+
+    def validate_message(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError("Message cannot be blank.")
+        return value

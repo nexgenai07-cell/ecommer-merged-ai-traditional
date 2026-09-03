@@ -7,7 +7,14 @@ from apps.products.models import Product
 
 class WishlistProductSerializer(serializers.ModelSerializer):
     primary_image = serializers.SerializerMethodField()
+    # in_stock is a model property already redefined as available_stock > 0
+    # (see products/models.py Product.in_stock) — no change needed here.
     in_stock = serializers.ReadOnlyField()
+    # NEW (Cross-check, Sep 2026 — PDF Part 2 Item 5): 'stock' was the
+    # deprecated single field, frozen since nothing updates it anymore.
+    # Spec names "Wishlist items" explicitly among the endpoints that
+    # must move to total_stock/reserved_stock/available_stock.
+    available_stock = serializers.SerializerMethodField()
     # FIX: 'category' was returning just the raw category ID (e.g. 3) instead
     # of its name. Frontend does product.category?.name, which needs an
     # object/string with a .name — StringRelatedField sends the category's
@@ -18,6 +25,9 @@ class WishlistProductSerializer(serializers.ModelSerializer):
         if obj.category:
             return {"id": obj.category.id, "name": obj.category.name}
         return None
+
+    def get_available_stock(self, obj):
+        return obj.total_stock - obj.reserved_stock
 
     class Meta:
         model = Product
@@ -30,7 +40,9 @@ class WishlistProductSerializer(serializers.ModelSerializer):
                                 # badge (PriceDisplay component).
             "primary_image",
             "in_stock",
-            "stock",
+            "total_stock",
+            "reserved_stock",
+            "available_stock",
             "category",
         ]
 

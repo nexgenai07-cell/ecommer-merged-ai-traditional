@@ -11,7 +11,30 @@ logger = logging.getLogger(__name__)
 
 # FIX (B2): default sent_via updated from "web" to "in_app" to match
 # the new Notification.SENT_VIA_CHOICES (in_app/email/sms).
-def create_notification(user, title, message, notification_type, store=None, sent_via="in_app"):
+#
+# FIX (Cross-check, Sep 2026 — PDF Part 2 Item 3): reference_type/
+# reference_id were added to the Notification model and to every caller
+# of this function (checkout, cancel, admin status update, reinstate,
+# complaints, QR payment flows, the stale-payment cron job) but were
+# never added to this function's signature. Every one of those callers
+# passes reference_type=/reference_id= as keyword arguments, so every
+# single automatic notification in the app was raising
+# "TypeError: create_notification() got an unexpected keyword argument
+# 'reference_type'" at runtime — breaking checkout, cancellation, order
+# status updates, reinstate, complaint replies, and all QR payment
+# notifications. Adding the two parameters here (optional, default
+# None, per spec: "POST /api/v1/notifications/send/ ... default null if
+# omitted") and storing them on the created row fixes this.
+def create_notification(
+    user,
+    title,
+    message,
+    notification_type,
+    store=None,
+    sent_via="in_app",
+    reference_type=None,
+    reference_id=None,
+):
     if store is None:
         store = Store.objects.first()
 
@@ -22,6 +45,8 @@ def create_notification(user, title, message, notification_type, store=None, sen
         message=message,
         type=notification_type,
         sent_via=sent_via,
+        reference_type=reference_type,
+        reference_id=str(reference_id) if reference_id is not None else None,
     )
 
 

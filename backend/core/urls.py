@@ -13,6 +13,7 @@ from apps.orders.customer_urls import admin_customer_urlpatterns
 from apps.orders.address_urls import address_urlpatterns
 from apps.ai.urls import audit_log_urlpatterns
 from apps.whatsapp.admin_urls import admin_whatsapp_urlpatterns
+from apps.payments.urls import admin_payment_urlpatterns
 
 urlpatterns = [
     path('admin/', admin.site.urls), #gives all urls from users
@@ -38,6 +39,7 @@ urlpatterns = [
     path('api/v1/admin/complaints/', include((admin_complaint_urlpatterns, 'admin-complaints'))),
     path('api/v1/admin/customers/', include((admin_customer_urlpatterns, 'admin-customers'))),
     path("api/v1/payments/", include("apps.payments.urls")),
+    path("api/v1/admin/payments/", include((admin_payment_urlpatterns, 'admin-payments'))),
 
     # Notifications
     path('api/v1/notifications/', include('apps.notifications.urls')),

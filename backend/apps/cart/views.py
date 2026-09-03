@@ -73,9 +73,11 @@ class AddToCartView(APIView):
 
         if not created:
             new_quantity = cart_item.quantity + quantity
-            if new_quantity > product.stock:
+            # FIX (Cross-check, Sep 2026 — PDF Part 2 Item 5): same
+            # stock -> available_stock fix as AddToCartSerializer.
+            if new_quantity > product.available_stock:
                 return Response(
-                    {'error': f'Only {product.stock} units available in stock.'},
+                    {'error': f'Only {product.available_stock} units available in stock.'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
             cart_item.quantity = new_quantity
