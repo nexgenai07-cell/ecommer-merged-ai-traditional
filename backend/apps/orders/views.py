@@ -22,7 +22,7 @@ from apps.notifications.utils import (
     send_refund_confirmation_email,
 )
 
-from .models import Customer, Order, OrderItem, Payment
+from .models import Address, Customer, Order, OrderItem, Payment
 from .serializers import (
     OrderListSerializer,
     AdminOrderListSerializer,
@@ -36,8 +36,7 @@ from .serializers import (
 from apps.cart.models import Cart
 from apps.products.models import Product, StockMovement
 from apps.stores.models import Store
-from apps.users.permissions import IsAdmin
-
+from apps.users.permissions import IsAdmin, IsCustomer
 
 def generate_order_number(): # Generates a unique order number for every new order.
     year = timezone.now().year
@@ -262,15 +261,13 @@ def restore_stock_for_order(order, user=None):
 # StripeWebhookView's payment_intent.succeeded handler.
 def deduct_stock_for_order(order, user=None):
     """
-    Mirrors restore_stock_for_order's locked + audited pattern. Idempotent
-    via order.stock_deducted — safe to call twice (e.g. a retried/duplicate
-    Stripe webhook event) without double-deducting.
+    Transition 2: Payment confirmed.
 
-    Stock can legitimately have moved between checkout and payment
-    confirmation (other customers checking out, manual admin adjustments),
-    so this clamps at 0 instead of going negative and logs a shortfall
-    note for an admin to follow up on, rather than raising and breaking
-    the payment flow for a customer who has already paid.
+    reserved_stock -= quantity
+    total_stock -= quantity
+
+    This is idempotent through order.stock_deducted, so a duplicate
+    Stripe webhook cannot deduct stock twice.
     """
     if order.stock_deducted:
         return
@@ -281,7 +278,9 @@ def deduct_stock_for_order(order, user=None):
     if product_ids:
         locked_products = {
             p.id: p
-            for p in Product.objects.select_for_update().filter(id__in=product_ids)
+            for p in Product.objects.select_for_update().filter(
+                id__in=product_ids
+            )
         }
 
         for item in items:
@@ -289,29 +288,39 @@ def deduct_stock_for_order(order, user=None):
             if not product:
                 continue
 
-            old_stock = product.stock
-            new_stock = max(old_stock - item.quantity, 0)
+            old_total = product.total_stock
+            old_reserved = product.reserved_stock
 
-            product.stock = new_stock
-            product.save(update_fields=["stock"])
+            # The quantity was reserved during checkout.
+            # Now payment is confirmed, so it becomes permanently sold.
+            new_total = max(old_total - item.quantity, 0)
+            new_reserved = max(old_reserved - item.quantity, 0)
 
-            shortfall = item.quantity - (old_stock - new_stock)
-            note = f"Order {order.order_number} payment confirmed"
-            if shortfall > 0:
-                note += f" (WARNING: {shortfall} short of stock — oversold, admin follow-up needed)"
+            product.total_stock = new_total
+            product.reserved_stock = new_reserved
+
+            product.save(
+                update_fields=[
+                    "total_stock",
+                    "reserved_stock",
+                ]
+            )
 
             StockMovement.objects.create(
                 product=product,
                 changed_by=user,
-                old_stock=old_stock,
-                new_stock=new_stock,
-                delta=new_stock - old_stock,
+                old_stock=old_total,
+                new_stock=new_total,
+                delta=new_total - old_total,
                 reason="order_confirmed",
-                note=note,
+                note=(
+                    f"Order {order.order_number} payment confirmed - "
+                    f"deducted {item.quantity} units"
+                ),
             )
 
     order.stock_deducted = True
-    
+    order.save(update_fields=["stock_deducted"])
 # Backward-compatible name used by older payment code.
 # Stock confirmation now uses the same safe deduction helper.
 def confirm_stock_for_order(order, user=None):
@@ -326,14 +335,13 @@ def suggest_alternatives_for_order(order):
 
     for item in order.items.select_related("product", "product__category").all():
         product = item.product
-        if not product or product.stock > 0:
+        if not product or product.available_stock > 0:
             continue
 
         alternatives_qs = Product.objects.filter(
-            is_active=True,
-            is_delete=False,
-            stock__gt=0,
-        ).exclude(id=product.id)
+    is_delete=False,
+    total_stock__gt=0,
+).exclude(id=product.id)
 
         if product.category_id:
             alternatives_qs = alternatives_qs.filter(category_id=product.category_id)
@@ -348,11 +356,15 @@ def suggest_alternatives_for_order(order):
     return suggestions
 
 # Handles checkout by creating an order, validating stock and creating payment.
+# Handles checkout by creating an order, validating stock and creating payment.
 class CheckoutView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+    # FIX (B43): only customers can checkout.
+    # Admin users must not be allowed to create customer orders.
+    permission_classes = [permissions.IsAuthenticated, IsCustomer]
 
-# Validates cart, creates order, and creates a pending payment. Stock is
-# intentionally NOT deducted here anymore (see FIX B59 below).
+    # Validates cart, creates order, and creates a pending payment.
+    # Stock is reserved at checkout but is only deducted from total_stock
+    # after payment is actually confirmed.
     def post(self, request):
         serializer = CheckoutSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -366,24 +378,70 @@ class CheckoutView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # FIX (F8/B18/B19): resolve the customer profile first so we can
-        # fall back to their previously saved address/city/postal_code/phone
-        # for any field the request didn't send. shipping_address and city
-        # are the only two that actually block checkout if still missing
-        # after the fallback — postal_code and phone stay optional (B18).
+        # Resolve the customer profile first.
         customer = get_or_create_customer(
             request.user,
             store_id=cart.store_id,
         )
 
-        shipping_address = data.get("shipping_address") or (customer.address or "")
-        city = data.get("city") or (customer.city or "")
-        postal_code = data.get("postal_code") or (customer.postal_code or "")
-        contact_phone = data.get("phone") or (customer.phone or "")
+        # ============================================================
+        # ADDRESS RESOLUTION
+        # Priority:
+        # 1. address_id from Address Book
+        # 2. manually supplied address fields
+        # 3. customer's default Address Book address
+        # ============================================================
 
+        address_id = data.get("address_id")
+        selected_address = None
+
+        if address_id:
+            selected_address = Address.objects.filter(
+                id=address_id,
+                customer=customer,
+            ).first()
+
+            if not selected_address:
+                return Response(
+                    {"error": "Address not found."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        if selected_address:
+            # Customer selected an existing Address Book entry.
+            shipping_address = selected_address.shipping_address
+            city = selected_address.city
+            postal_code = selected_address.postal_code or ""
+            contact_phone = selected_address.phone or ""
+
+        else:
+            # No address_id: use manually supplied checkout fields.
+            shipping_address = data.get("shipping_address") or ""
+            city = data.get("city") or ""
+            postal_code = data.get("postal_code") or ""
+            contact_phone = data.get("phone") or ""
+
+            # If manual shipping address/city is incomplete,
+            # fall back to the customer's default saved address.
+            if not shipping_address.strip() or not city.strip():
+                default_address = Address.objects.filter(
+                    customer=customer,
+                    is_default=True,
+                ).first()
+
+                if default_address:
+                    shipping_address = default_address.shipping_address
+                    city = default_address.city
+                    postal_code = default_address.postal_code or ""
+                    contact_phone = default_address.phone or ""
+
+        # shipping_address and city are required.
+        # postal_code and phone remain optional.
         missing = []
+
         if not shipping_address.strip():
             missing.append("shipping_address")
+
         if not city.strip():
             missing.append("city")
 
@@ -404,18 +462,19 @@ class CheckoutView(APIView):
                 cart.items.select_related("product").all()
             )
 
-            product_ids = [item.product_id for item in cart_items]
+            product_ids = [
+                item.product_id
+                for item in cart_items
+                if item.product_id
+            ]
 
-            # Lock the actual Product rows while we check availability, so
-            # two concurrent checkouts reading the same product don't both
-            # see stale stock numbers. NOTE (B59): this only *checks*
-            # availability now — it does not decrement stock. Real
-            # deduction happens later, only once payment is confirmed (see
-            # deduct_stock_for_order), so an abandoned/never-paid order can
-            # no longer hold stock hostage.
+            # Lock Product rows so concurrent checkouts cannot both
+            # read the same stale stock values.
             locked_products = {
                 p.id: p
-                for p in Product.objects.select_for_update().filter(id__in=product_ids)
+                for p in Product.objects.select_for_update().filter(
+                    id__in=product_ids
+                )
             }
 
             out_of_stock = []
@@ -423,19 +482,35 @@ class CheckoutView(APIView):
             for item in cart_items:
                 product = locked_products.get(item.product_id)
 
-                if not product or product.stock < item.quantity:
-                    out_of_stock.append(item.product.name if item.product else "Unknown product")
+                # Available stock = total stock minus already reserved stock.
+                available = (
+                    product.total_stock - product.reserved_stock
+                    if product
+                    else 0
+                )
+
+                if not product or available < item.quantity:
+                    out_of_stock.append(
+                        item.product.name
+                        if item.product
+                        else "Unknown product"
+                    )
 
             if out_of_stock:
                 return Response(
                     {
                         "error": (
                             "These items are no longer available "
-                            f"in the requested quantity: {', '.join(out_of_stock)}"
+                            f"in the requested quantity: "
+                            f"{', '.join(out_of_stock)}"
                         )
                     },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+
+            # ============================================================
+            # CALCULATE ORDER TOTAL
+            # ============================================================
 
             subtotal = sum(
                 item.product.price * item.quantity
@@ -459,6 +534,10 @@ class CheckoutView(APIView):
 
             total_amount = subtotal - discount_amount
 
+            # ============================================================
+            # CREATE ORDER
+            # ============================================================
+
             order = Order.objects.create(
                 store_id=cart.store_id,
                 customer=customer,
@@ -473,18 +552,9 @@ class CheckoutView(APIView):
                 notes=data.get("notes", ""),
             )
 
-            # FIX (B22): "Save Address" via checkout — write the resolved
-            # values back onto the customer profile so next time everything
-            # is prefilled (F8) and this bug can't recur.
-            if data.get("save_address"):
-                customer.address = shipping_address
-                customer.city = city
-                customer.postal_code = postal_code
-                if contact_phone:
-                    customer.phone = contact_phone
-                customer.save(
-                    update_fields=["address", "city", "postal_code", "phone", "updated_at"]
-                )
+            # ============================================================
+            # CREATE ORDER ITEMS
+            # ============================================================
 
             for item in cart_items:
                 OrderItem.objects.create(
@@ -495,44 +565,82 @@ class CheckoutView(APIView):
                     quantity=item.quantity,
                     total_price=item.product.price * item.quantity,
                 )
-                # FIX (B59): stock is deliberately NOT touched here anymore.
-                # It used to be decremented right at checkout (while the
-                # order was still "pending_payment"), which meant an order
-                # nobody ever paid for was still holding real inventory
-                # hostage. Deduction now happens in deduct_stock_for_order,
-                # triggered only from payments/views.py once money has
-                # actually moved (free-order branch or Stripe webhook).
+
+            # ============================================================
+            # RESERVE STOCK
+            #
+            # Checkout:
+            # reserved_stock += quantity
+            # total_stock remains unchanged.
+            #
+            # Actual total_stock deduction happens only after payment
+            # confirmation.
+            # ============================================================
+
+            reserve_stock_for_order(order)
+
+            # ============================================================
+            # CREATE PAYMENT
+            # ============================================================
+
+            payment_method = data["payment_method"]
 
             Payment.objects.create(
                 order=order,
                 status="pending",
                 amount=total_amount,
+                payment_method=payment_method,
             )
+
+            # ============================================================
+            # CLEAR CART
+            # ============================================================
 
             cart.items.all().delete()
             cart.coupon = None
             cart.save()
 
+        # ================================================================
+        # NOTIFICATION
+        # ================================================================
+
         create_notification(
-    user=request.user,
-    title="Order placed",
-    message=f"Your order {order.order_number} has been placed and is awaiting payment.",
-    notification_type="order",
-    reference_type="order",
-    reference_id=order.order_number,
-)
-
-        # FIX (F14): actual email confirmation, not just an in-app
-        # notification. Failure here must never break checkout for the
-        # customer — send_order_confirmation_email swallows/logs its own
-        # exceptions.
-        send_order_confirmation_email(order)
-
-        return Response(
-            OrderDetailSerializer(order).data,
-            status=status.HTTP_201_CREATED,
+            user=request.user,
+            title="Order placed",
+            message=(
+                f"Your order {order.order_number} has been placed "
+                "and is awaiting payment."
+            ),
+            notification_type="order",
+            reference_type="order",
+            reference_id=order.order_number,
         )
 
+        # ================================================================
+        # EMAIL
+        # ================================================================
+
+        # Email failures must not break checkout.
+        send_order_confirmation_email(order)
+
+        # ================================================================
+        # RESPONSE
+        # ================================================================
+
+        response_data = OrderDetailSerializer(order).data
+
+        # QR payment requires the configured static QR image URL.
+        if payment_method == "qr":
+            response_data["qr_image_url"] = getattr(
+                settings,
+                "QR_PAYMENT_IMAGE_URL",
+                "",
+            )
+
+        return Response(
+            response_data,
+            status=status.HTTP_201_CREATED,
+        )
 # NEW (F8): lets the frontend prefill the checkout form with whatever the
 # customer already has saved, instead of asking them to retype everything.
 class CheckoutPrefillView(APIView):
