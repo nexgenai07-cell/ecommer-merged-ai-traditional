@@ -1,7 +1,7 @@
 import logging
 
+import requests
 from django.conf import settings
-from django.core.mail import send_mail
 
 from .models import Notification
 from apps.stores.models import Store
@@ -84,13 +84,24 @@ def create_notification(
         return None
 
 
-# FIX (F14): customer previously got zero confirmation that their order was
-# even placed — only an in-app Notification row was created, no actual
-# email. This sends a real transactional email via the already-configured
-# Gmail SMTP backend. Wrapped so a failed/unconfigured email backend can
-# never break checkout itself — the order must still succeed even if the
-# email fails to send, so we log and swallow the exception instead of
-# raising.
+# FIX (Cross-check, checkout crash — Sep 2026), UPDATED: this used to send
+# via send_mail() on the SMTP backend (Gmail). Railway logs showed that
+# path failing with "OSError: Network is unreachable" — Railway's outbound
+# network cannot reach Gmail's SMTP host at all — and the socket connect
+# attempt was blocking this request's own thread for 60+ seconds before
+# erroring out, long enough for the ASGI server (Daphne) to force-kill the
+# whole connection before any response could reach the client. The
+# try/except here was never the problem (it always correctly caught and
+# logged the SMTP failure) — the request was already dead by the time this
+# exception fired.
+#
+# apps/users/email_service.py already sends email through Resend's HTTP
+# API (over HTTPS/443, not SMTP) for email verification, and that path
+# already works in this same Railway environment. Switching this function
+# to the same Resend API call fixes the "unreachable" host entirely — and
+# even if Resend itself were ever slow, requests.post(..., timeout=10)
+# bounds it to 10 seconds instead of the 60+ second SMTP hang, so it can
+# no longer be the thing that trips Daphne's connection kill.
 def send_order_confirmation_email(order):
     customer = order.customer
     to_email = customer.email if customer else None
@@ -124,17 +135,27 @@ def send_order_confirmation_email(order):
     ]
 
     message = "\n".join(lines)
+    html_message = f"<html><body><pre>{message}</pre></body></html>"
 
     try:
-        send_mail(
-            subject=subject,
-            message=message,
-            from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None) or settings.EMAIL_HOST_USER,
-            recipient_list=[to_email],
-            fail_silently=False,
+        response = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {settings.RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": settings.RESEND_FROM_EMAIL,
+                "to": [to_email],
+                "subject": subject,
+                "text": message,
+                "html": html_message,
+            },
+            timeout=10,
         )
+        response.raise_for_status()
         return True
-    except Exception:
+    except requests.RequestException:
         logger.exception(
             "send_order_confirmation_email: failed to send email for order %s",
             order.order_number,
@@ -144,6 +165,12 @@ def send_order_confirmation_email(order):
 
 # FIX (B29): sends the customer a clear confirmation that their refund was
 # processed, instead of leaving them to guess from a silent status change.
+#
+# FIX (Cross-check, checkout crash — Sep 2026), UPDATED: switched to
+# Resend's HTTP API for the same reason as send_order_confirmation_email
+# above — Gmail SMTP is unreachable from Railway and can hang long enough
+# to trip the ASGI server's connection timeout on whatever request
+# triggered this (order cancel / admin status update).
 def send_refund_confirmation_email(order):
     customer = order.customer
     to_email = customer.email if customer else None
@@ -159,17 +186,27 @@ def send_refund_confirmation_email(order):
         "If you paid by card, please allow a few business days for the refund "
         "to reflect in your account."
     )
+    html_message = f"<html><body><pre>{message}</pre></body></html>"
 
     try:
-        send_mail(
-            subject=subject,
-            message=message,
-            from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None) or settings.EMAIL_HOST_USER,
-            recipient_list=[to_email],
-            fail_silently=False,
+        response = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {settings.RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": settings.RESEND_FROM_EMAIL,
+                "to": [to_email],
+                "subject": subject,
+                "text": message,
+                "html": html_message,
+            },
+            timeout=10,
         )
+        response.raise_for_status()
         return True
-    except Exception:
+    except requests.RequestException:
         logger.exception(
             "send_refund_confirmation_email: failed to send email for order %s",
             order.order_number,
