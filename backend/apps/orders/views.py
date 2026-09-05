@@ -637,9 +637,25 @@ class CheckoutView(APIView):
         # ================================================================
         # EMAIL
         # ================================================================
+        # FIX (Cross-check, checkout crash — Sep 2026): order + payment are
+        # already committed above, and the notification call right before
+        # this is already safely wrapped — but this email call was NOT,
+        # despite the comment here claiming it "must not break checkout".
+        # Gmail SMTP calls made from inside the request/response cycle can
+        # throw (auth/timeout/network) or hang, and since this line ran
+        # AFTER the order was already saved, an unhandled exception (or a
+        # hang that trips the platform's own timeout) here is exactly what
+        # dropped the connection with zero response headers while the order
+        # still shows up in the DB. Wrapping it, like create_notification
+        # above, is what actually makes the comment true.
 
-        # Email failures must not break checkout.
-        send_order_confirmation_email(order)
+        try:
+            send_order_confirmation_email(order)
+        except Exception:
+            logger.exception(
+                "CheckoutView: send_order_confirmation_email failed for order %s",
+                order.order_number,
+            )
 
         # ================================================================
         # RESPONSE
