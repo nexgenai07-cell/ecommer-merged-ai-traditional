@@ -1,11 +1,15 @@
 # PATH: apps/orders/views.py
 
+import logging
+
 import stripe
 from django.conf import settings
 import random
 import string
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
+
+logger = logging.getLogger(__name__)
 
 from django.db.models import Q
 from django.db import transaction
@@ -347,7 +351,7 @@ def suggest_alternatives_for_order(order):
             alternatives_qs = alternatives_qs.filter(category_id=product.category_id)
 
         alternatives = list(
-            alternatives_qs.values("id", "name", "price", "stock")[:3]
+            alternatives_qs.values("id", "name", "price", "total_stock")[:3]
         )
 
         if alternatives:
@@ -603,18 +607,32 @@ class CheckoutView(APIView):
         # ================================================================
         # NOTIFICATION
         # ================================================================
+        # FIX (Cross-check, checkout crash — Sep 2026): order + payment are
+        # already committed above by this point. A notification is a
+        # non-critical side effect and must never be allowed to break the
+        # checkout response — so this is wrapped in try/except, and this
+        # order's own store is passed explicitly instead of relying on
+        # create_notification()'s Store.objects.first() fallback (which
+        # could pick the wrong store, or be None and crash).
 
-        create_notification(
-            user=request.user,
-            title="Order placed",
-            message=(
-                f"Your order {order.order_number} has been placed "
-                "and is awaiting payment."
-            ),
-            notification_type="order",
-            reference_type="order",
-            reference_id=order.order_number,
-        )
+        try:
+            create_notification(
+                user=request.user,
+                title="Order placed",
+                message=(
+                    f"Your order {order.order_number} has been placed "
+                    "and is awaiting payment."
+                ),
+                notification_type="order",
+                reference_type="order",
+                reference_id=order.order_number,
+                store=order.store,
+            )
+        except Exception:
+            logger.exception(
+                "CheckoutView: create_notification failed for order %s",
+                order.order_number,
+            )
 
         # ================================================================
         # EMAIL
@@ -779,13 +797,15 @@ class OrderCancelView(APIView):
             )
 
         with transaction.atomic():
-            # FIX (stock race-condition): stock restoration now goes
-            # through the shared, locked, audited helper instead of a
-            # plain read-modify-save loop. FIX (B59): the helper itself is
-            # now a no-op if this order never had stock deducted in the
-            # first place (i.e. it was still unpaid), so cancelling an
-            # unpaid order no longer incorrectly adds phantom stock back.
-            restore_stock_for_order(order, user=request.user)
+            # FIX (Cross-check, Sep 2026): this used to call the old,
+            # dead restore_stock_for_order() helper, which operates on a
+            # plain product.stock field that no longer exists on this
+            # schema (Product now uses total_stock/reserved_stock) — it
+            # would either crash or silently leave stock accounting wrong.
+            # release_reserved_stock_for_order() is the correct helper for
+            # Transition 3 (order cancelled) under the reserved-stock
+            # system.
+            release_reserved_stock_for_order(order)
 
             order.status = "cancelled"
             order.save()
@@ -929,11 +949,12 @@ class AdminOrderStatusUpdateView(APIView):
             suggested_alternatives = suggest_alternatives_for_order(order)
 
             with transaction.atomic():
-                # FIX (stock race-condition + B59): same shared, locked,
-                # audited helper as the customer-facing cancel view — and
-                # it's a no-op if this order's stock was never deducted
-                # (i.e. it was cancelled before payment was ever confirmed).
-                restore_stock_for_order(order, user=request.user)
+                # FIX (Cross-check, Sep 2026): same fix as the customer-
+                # facing cancel view — release_reserved_stock_for_order()
+                # is the correct helper here, not the dead old-schema
+                # restore_stock_for_order() (product.stock no longer
+                # exists on this schema).
+                release_reserved_stock_for_order(order)
 
                 if hasattr(order, "payment"):
                     was_paid_before_cancel = order.payment.status == "paid"
