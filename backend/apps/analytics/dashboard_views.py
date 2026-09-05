@@ -568,19 +568,38 @@ class CustomerGrowthView(APIView):
 
 
 class InventoryAlertsView(APIView):
-    """GET /api/v1/analytics/inventory/alerts/ — active products at/below their low stock threshold"""
+    """GET /api/v1/analytics/inventory/alerts/ — active products at/below their available-stock threshold"""
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
 
     def get(self, request):
+        # FIX (Cross-check, Sep 2026 — Inventory Alerts follow-up to v2
+        # Item 5): this endpoint was missed when API 28/29/30/38 moved from
+        # a single "stock" field to total_stock/reserved_stock/
+        # available_stock. It kept using the old flat p.stock field (and
+        # compared against total_stock, not available_stock), so a product
+        # that was fully stocked on paper but mostly reserved by pending
+        # orders never showed up here, while the page's own math made
+        # everything look "Out of Stock" once the frontend started
+        # expecting available_stock instead. available_stock is computed
+        # the same way as API 38 (total_stock - reserved_stock) — same
+        # underlying fields, no second/duplicate stock number.
         products = Product.objects.filter(
     is_active=True,
     is_delete=False,
     )
-        alerts = [
-            {'product_id': p.id, 'name': p.name, 'stock': p.stock, 'threshold': p.low_stock_threshold}
-            for p in products if p.stock <= p.low_stock_threshold
-        ]
+        alerts = []
+        for p in products:
+            available_stock = p.total_stock - p.reserved_stock
+            if available_stock <= p.low_stock_threshold:
+                alerts.append({
+                    'product_id': p.id,
+                    'name': p.name,
+                    'total_stock': p.total_stock,
+                    'reserved_stock': p.reserved_stock,
+                    'available_stock': available_stock,
+                    'low_stock_threshold': p.low_stock_threshold,
+                })
         return Response(alerts)
 
 

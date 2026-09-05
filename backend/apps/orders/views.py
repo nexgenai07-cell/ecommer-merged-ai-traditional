@@ -678,12 +678,20 @@ class CheckoutView(APIView):
         response_data = OrderDetailSerializer(order).data
 
         # QR payment requires the configured static QR image URL.
+        # FIX (Cross-check, Sep 2026 — frontend report on ORD-2026-00062):
+        # "payment_reference" was specced (v2 doc, Part 3) alongside
+        # qr_image_url for QR checkouts, but only qr_image_url was ever
+        # added here — payment_reference was missing from the response
+        # entirely. Per spec its value is just the order's own
+        # order_number (the string customers write in the bank transfer
+        # note), not a separately generated code.
         if payment_method == "qr":
             response_data["qr_image_url"] = getattr(
                 settings,
                 "QR_PAYMENT_IMAGE_URL",
                 "",
             )
+            response_data["payment_reference"] = order.order_number
 
         return Response(
             response_data,

@@ -3,6 +3,7 @@ from django.urls import path
 from .views import (
     CreatePaymentIntentView,
     StripeWebhookView,
+    QRProofUploadView,
     AdminQRPaymentApproveView,
     AdminQRPaymentRejectView,
 )
@@ -19,6 +20,18 @@ urlpatterns = [
         "stripe/webhook/",
         StripeWebhookView.as_view(),
         name="stripe-webhook",
+    ),
+    # FIX (Cross-check, Sep 2026 — 404 on POST /api/v1/payments/qr/proof/):
+    # QRProofUploadView was already fully implemented in views.py (proof
+    # upload, duplicate-hash detection, status -> under_review, customer
+    # notification) but was never wired up to a URL — this endpoint simply
+    # didn't exist in urlconf, hence the 404. CreatePaymentIntentView above
+    # already points QR customers at this exact path (see its "QR payments
+    # do not require Stripe..." message), so no other code changes needed.
+    path(
+        "qr/proof/",
+        QRProofUploadView.as_view(),
+        name="qr-proof-upload",
     ),
 ]
 
