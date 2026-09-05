@@ -1,6 +1,7 @@
 # PATH: apps/orders/views.py
 
 import logging
+import threading
 
 import stripe
 from django.conf import settings
@@ -637,25 +638,38 @@ class CheckoutView(APIView):
         # ================================================================
         # EMAIL
         # ================================================================
-        # FIX (Cross-check, checkout crash — Sep 2026): order + payment are
-        # already committed above, and the notification call right before
-        # this is already safely wrapped — but this email call was NOT,
-        # despite the comment here claiming it "must not break checkout".
-        # Gmail SMTP calls made from inside the request/response cycle can
-        # throw (auth/timeout/network) or hang, and since this line ran
-        # AFTER the order was already saved, an unhandled exception (or a
-        # hang that trips the platform's own timeout) here is exactly what
-        # dropped the connection with zero response headers while the order
-        # still shows up in the DB. Wrapping it, like create_notification
-        # above, is what actually makes the comment true.
+        # FIX (Cross-check, checkout crash — Sep 2026), UPDATED after
+        # Railway logs confirmed the real failure mode: this was never a
+        # normal Python exception — send_order_confirmation_email() already
+        # catches and logs its own errors internally (see the "failed to
+        # send email" log line in apps/notifications/utils.py), so it never
+        # raised anything for a try/except here to catch.
+        #
+        # The real problem is a genuine BLOCKING network hang: Railway's
+        # outbound network can't reach Gmail's SMTP host at all (OSError:
+        # Network is unreachable), and the socket connect attempt blocks
+        # this request's own thread for 60+ seconds before it errors out.
+        # Daphne (the ASGI server) has its own per-request timeout and
+        # force-kills the whole connection once it decides the request
+        # "took too long to shut down" — and it does this BEFORE the SMTP
+        # call ever returns, which is exactly why the order saves but the
+        # client gets zero response headers, and why the "failed to send
+        # email" log line only appears several seconds AFTER Daphne's kill
+        # warning (the OS thread was still stuck inside socket.connect()
+        # when Daphne gave up on it).
+        #
+        # Fix: never let this request's own thread block on it. Fire the
+        # email in a separate background thread and return the checkout
+        # response immediately, regardless of whether the email eventually
+        # succeeds, hangs, or errors — send_order_confirmation_email's own
+        # internal error handling still applies, this just takes it off
+        # the response's critical path entirely.
 
-        try:
-            send_order_confirmation_email(order)
-        except Exception:
-            logger.exception(
-                "CheckoutView: send_order_confirmation_email failed for order %s",
-                order.order_number,
-            )
+        threading.Thread(
+            target=send_order_confirmation_email,
+            args=(order,),
+            daemon=True,
+        ).start()
 
         # ================================================================
         # RESPONSE
