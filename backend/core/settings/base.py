@@ -89,7 +89,14 @@ INSTALLED_APPS = [
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
+
+    # NEW — Cloudinary must be registered BEFORE django.contrib.staticfiles
+    # so it can correctly hook into the storage system. django-cloudinary-storage
+    # provides the MediaCloudinaryStorage backend used below; 'cloudinary' is
+    # the underlying SDK app.
+    'cloudinary_storage',
     'django.contrib.staticfiles',
+    'cloudinary',
 
     'rest_framework',
     'rest_framework_simplejwt',
@@ -345,6 +352,31 @@ STATICFILES_STORAGE = (
 
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+
+# -------------------------------------------------
+# CLOUDINARY (media file storage — persists across Railway
+# deploys/restarts, unlike local disk which is ephemeral there)
+# -------------------------------------------------
+CLOUDINARY_STORAGE = {
+    'CLOUD_NAME': os.getenv('CLOUDINARY_CLOUD_NAME'),
+    'API_KEY': os.getenv('CLOUDINARY_API_KEY'),
+    'API_SECRET': os.getenv('CLOUDINARY_API_SECRET'),
+}
+
+# Only switch Django's default file storage to Cloudinary when it's
+# actually configured (keeps local dev working without Cloudinary creds).
+if os.getenv('CLOUDINARY_CLOUD_NAME'):
+    DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
+else:
+    warnings.warn(
+        "CLOUDINARY_CLOUD_NAME not set — falling back to local "
+        "FileSystemStorage for media uploads. On Railway this storage is "
+        "ephemeral and uploaded files (e.g. QR payment proofs) will be "
+        "lost on restart/redeploy. Set CLOUDINARY_CLOUD_NAME, "
+        "CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET in production.",
+        RuntimeWarning,
+    )
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # -------------------------------------------------
