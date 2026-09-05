@@ -9,31 +9,15 @@ from apps.stores.models import Store
 logger = logging.getLogger(__name__)
 
 
-# FIX (B2): default sent_via updated from "web" to "in_app" to match
-# the new Notification.SENT_VIA_CHOICES (in_app/email/sms).
-#
-# FIX (Cross-check, Sep 2026 — PDF Part 2 Item 3): reference_type/
-# reference_id were added to the Notification model and to every caller
-# of this function (checkout, cancel, admin status update, reinstate,
-# complaints, QR payment flows, the stale-payment cron job) but were
-# never added to this function's signature. Every one of those callers
-# passes reference_type=/reference_id= as keyword arguments, so every
-# single automatic notification in the app was raising
-# "TypeError: create_notification() got an unexpected keyword argument
-# 'reference_type'" at runtime — breaking checkout, cancellation, order
-# status updates, reinstate, complaint replies, and all QR payment
-# notifications. Adding the two parameters here (optional, default
-# None, per spec: "POST /api/v1/notifications/send/ ... default null if
-# omitted") and storing them on the created row fixes this.
 def create_notification(
     user,
     title,
     message,
     notification_type,
+    reference_type,
+    reference_id,
     store=None,
-    sent_via="in_app",
-    reference_type=None,
-    reference_id=None,
+    sent_via="web",
 ):
     if store is None:
         store = Store.objects.first()
@@ -44,19 +28,12 @@ def create_notification(
         title=title,
         message=message,
         type=notification_type,
-        sent_via=sent_via,
         reference_type=reference_type,
-        reference_id=str(reference_id) if reference_id is not None else None,
+        reference_id=str(reference_id),
+        sent_via=sent_via,
     )
 
 
-# FIX (F14): customer previously got zero confirmation that their order was
-# even placed — only an in-app Notification row was created, no actual
-# email. This sends a real transactional email via the already-configured
-# Gmail SMTP backend. Wrapped so a failed/unconfigured email backend can
-# never break checkout itself — the order must still succeed even if the
-# email fails to send, so we log and swallow the exception instead of
-# raising.
 def send_order_confirmation_email(order):
     customer = order.customer
     to_email = customer.email if customer else None
@@ -79,7 +56,9 @@ def send_order_confirmation_email(order):
     ]
 
     for item in order.items.all():
-        lines.append(f"  - {item.quantity} x {item.product_name} — Rs. {item.total_price}")
+        lines.append(
+            f"  - {item.quantity} x {item.product_name} — Rs. {item.total_price}"
+        )
 
     lines += [
         "",
@@ -89,13 +68,14 @@ def send_order_confirmation_email(order):
         "We'll notify you again once your order is confirmed and shipped.",
     ]
 
-    message = "\n".join(lines)
-
     try:
         send_mail(
             subject=subject,
-            message=message,
-            from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None) or settings.EMAIL_HOST_USER,
+            message="\n".join(lines),
+            from_email=(
+                getattr(settings, "DEFAULT_FROM_EMAIL", None)
+                or settings.EMAIL_HOST_USER
+            ),
             recipient_list=[to_email],
             fail_silently=False,
         )
@@ -108,8 +88,6 @@ def send_order_confirmation_email(order):
         return False
 
 
-# FIX (B29): sends the customer a clear confirmation that their refund was
-# processed, instead of leaving them to guess from a silent status change.
 def send_refund_confirmation_email(order):
     customer = order.customer
     to_email = customer.email if customer else None
@@ -130,7 +108,10 @@ def send_refund_confirmation_email(order):
         send_mail(
             subject=subject,
             message=message,
-            from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None) or settings.EMAIL_HOST_USER,
+            from_email=(
+                getattr(settings, "DEFAULT_FROM_EMAIL", None)
+                or settings.EMAIL_HOST_USER
+            ),
             recipient_list=[to_email],
             fail_silently=False,
         )

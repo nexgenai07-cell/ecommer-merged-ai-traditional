@@ -1,16 +1,10 @@
-# PATH: apps/returns/models.py
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.conf import settings
 
 
 class Return(models.Model):
-    """
-    Customer return requests for delivered orders.
-    Only delivered orders can have return requests.
-    customer field added for direct link without going through order.
-    resolved_at tracks when the return was completed.
-    """
+    """Customer return request linked to a delivered order."""
 
     STATUS_CHOICES = [
         ("requested", "Requested"),
@@ -31,7 +25,7 @@ class Return(models.Model):
         related_name="returns",
         null=True,
         blank=True,
-        help_text="Direct link to customer — auto-filled from order on save",
+        help_text="Auto-filled from the linked order.",
     )
 
     reason = models.TextField()
@@ -45,7 +39,7 @@ class Return(models.Model):
     resolved_at = models.DateTimeField(
         null=True,
         blank=True,
-        help_text="Timestamp when status changed to approved/rejected/completed",
+        help_text="Time the return was approved, rejected, or completed.",
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -58,16 +52,16 @@ class Return(models.Model):
     def __str__(self):
         return f"Return for {self.order.order_number}"
 
+    # Ensures customer is always linked to the same customer as the order.
     def save(self, *args, **kwargs):
         if not self.customer and self.order:
             self.customer = self.order.customer
+
         super().save(*args, **kwargs)
 
 
 class Complaint(models.Model):
-    """
-    Customer complaints linked to orders or general issues.
-    """
+    """Customer complaint, optionally linked to an order."""
 
     STATUS_CHOICES = [
         ("open", "Open"),
@@ -129,14 +123,10 @@ class Complaint(models.Model):
         blank=True,
     )
 
-    # ============================================================
-    # DEPRECATED: 'response' field - ab messages system use karenge
-    # Keep for backward compatibility, but not used for new flow
-    # ============================================================
     response = models.TextField(
         null=True,
         blank=True,
-        help_text="DEPRECATED: Use ComplaintMessage system instead",
+        help_text="Legacy admin response to the customer.",
     )
 
     resolved_by = models.ForeignKey(
@@ -145,7 +135,7 @@ class Complaint(models.Model):
         null=True,
         blank=True,
         related_name="resolved_complaints",
-        help_text="Admin who resolved this complaint",
+        help_text="Admin who resolved the complaint.",
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -155,13 +145,18 @@ class Complaint(models.Model):
         db_table = "complaints"
         ordering = ["-created_at"]
 
+    # Prevents associating an order with a different customer.
     def clean(self):
-        if self.order and self.customer:
-            if self.order.customer_id != self.customer_id:
-                raise ValidationError(
-                    "Selected order does not belong to this customer."
-                )
+        if (
+            self.order
+            and self.customer
+            and self.order.customer_id != self.customer_id
+        ):
+            raise ValidationError(
+                "Selected order does not belong to this customer."
+            )
 
+    # Runs ownership validation before persisting the complaint.
     def save(self, *args, **kwargs):
         self.full_clean()
         super().save(*args, **kwargs)
@@ -170,20 +165,8 @@ class Complaint(models.Model):
         return f"Complaint by {self.customer.name} [{self.status}]"
 
 
-# ============================================================
-# NEW: Complaint Message Model as per PDF Part 2 Item 4
-# ============================================================
 class ComplaintMessage(models.Model):
-    """
-    Individual messages in a complaint thread.
-    Both customer and admin can send messages.
-    Sending a message NEVER changes complaint status.
-    """
-
-    SENDER_CHOICES = [
-        ("customer", "Customer"),
-        ("admin", "Admin"),
-    ]
+    """One private message in a complaint thread."""
 
     complaint = models.ForeignKey(
         Complaint,
@@ -191,27 +174,15 @@ class ComplaintMessage(models.Model):
         related_name="messages",
     )
 
-    sender = models.CharField(
-        max_length=20,
-        choices=SENDER_CHOICES,
-        help_text="Who sent this message: customer or admin"
-    )
-
-    sender_user = models.ForeignKey(
+    sender = models.ForeignKey(
         settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        help_text="User who sent this message (admin user or customer's user)"
+        on_delete=models.CASCADE,
+        related_name="complaint_messages",
     )
 
     message = models.TextField()
-
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = "complaint_messages"
-        ordering = ["created_at"]  # Chronological order
-
-    def __str__(self):
-        return f"Message #{self.id} on Complaint #{self.complaint_id} from {self.sender}"
+        ordering = ["created_at"]

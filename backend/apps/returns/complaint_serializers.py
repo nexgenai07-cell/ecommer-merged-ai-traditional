@@ -139,3 +139,8 @@ class CreateComplaintMessageSerializer(serializers.Serializer):
         if not value:
             raise serializers.ValidationError("Message cannot be blank.")
         return value
+    
+# Validates the text submitted by an admin through the legacy
+# complaint response endpoint.
+class AdminComplaintRespondSerializer(serializers.Serializer):
+    response = serializers.CharField()

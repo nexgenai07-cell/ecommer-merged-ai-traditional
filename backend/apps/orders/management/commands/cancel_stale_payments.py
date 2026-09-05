@@ -39,7 +39,6 @@ from datetime import timedelta
 
 from apps.orders.models import Order
 from apps.orders.views import release_reserved_stock_for_order
-from apps.notifications.utils import create_notification
 
 STRIPE_TIMEOUT = timedelta(minutes=30)
 QR_TIMEOUT = timedelta(hours=24)
@@ -69,15 +68,7 @@ def _cancel_order_for_timeout(order, reason):
     # Existing cancellation notification — same one customer-initiated
     # and admin-initiated cancellation already send, so the customer
     # sees a consistent message regardless of who/what cancelled it.
-    create_notification(
-        user=locked_order.customer.user,
-        store=locked_order.store,
-        title="Order Cancelled",
-        message=f"Your order #{locked_order.order_number} has been cancelled. Reason: {reason}",
-        notification_type="order",
-        reference_type="order",
-        reference_id=locked_order.order_number,
-    )
+    
     return True
 
 

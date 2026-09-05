@@ -1,7 +1,3 @@
-# PATH: apps/notifications/views.py
-
-from collections import OrderedDict
-
 from django.db.models import Q
 from rest_framework import viewsets, permissions, mixins, status
 from rest_framework.decorators import action
@@ -25,197 +21,103 @@ class NotificationViewSet(
     GET  /api/v1/notifications/{id}/             -> retrieve a single notification
     PUT  /api/v1/notifications/{id}/read/        -> mark one as read
     POST /api/v1/notifications/mark-all-read/    -> mark all of the user's unread notifications as read
-
-    FIX (E2): this view previously had no 'type' / 'is_read' filters and
-    the list response was missing the mandatory 'unread_count' field.
-    Both are now implemented per the v7 spec (section E2.1):
-      - 'type'    -> order / promotion / system
-      - 'is_read' -> true / false
-      - 'unread_count' -> ALWAYS the user's total unread count across
-        their ENTIRE notification history, not just the current page or
-        the current filter. This is why it's computed from
-        get_base_queryset() (visibility only, no type/is_read filters
-        applied) rather than from get_queryset() (which has the
-        filters). Computing it from the filtered/paginated queryset
-        would give the wrong number whenever a filter or a page other
-        than the first is active - which is exactly the bug the
-        frontend team flagged.
     """
 
     serializer_class = NotificationSerializer
     permission_classes = [permissions.IsAuthenticated]
     pagination_class = StandardResultsPagination
 
+    # Returns every notification visible to the logged-in user.
+    # This intentionally does not apply type/is_read filters because list()
+    # uses it to calculate the total unread count correctly.
     def get_base_queryset(self):
-        """
-        Every notification visible to the current user - their own
-        (user=request.user) plus any store-wide broadcast notifications
-        (user=null). No type/is_read filtering here; this is the
-        baseline used both for unread_count and for retrieve/mark-read
-        (so query params on other endpoints don't accidentally narrow
-        what a single notification lookup can find).
-        """
         return Notification.objects.filter(
             Q(user=self.request.user) | Q(user__isnull=True)
         ).order_by("-created_at")
 
+    # Applies optional notification-list filters:
+    # ?type=order|promotion|system
+    # ?is_read=true|false
     def get_queryset(self):
-        qs = self.get_base_queryset()
+        queryset = self.get_base_queryset()
 
-        # Only the list action applies type/is_read filtering - retrieve,
-        # mark_read and mark_all_read all rely on the unfiltered base
-        # queryset via get_base_queryset() directly (see below), but
-        # DRF's generic mixins call get_queryset() too, so we still
-        # guard here in case a stray ?type=/&is_read= is present on a
-        # detail request.
-        if self.action != "list":
-            return qs
+        notification_type = self.request.query_params.get("type")
+        if notification_type in {"order", "promotion", "system"}:
+            queryset = queryset.filter(type=notification_type)
 
-        params = self.request.query_params
+        is_read = self.request.query_params.get("is_read")
+        if is_read == "true":
+            queryset = queryset.filter(is_read=True)
+        elif is_read == "false":
+            queryset = queryset.filter(is_read=False)
 
-        notif_type = params.get("type")
-        if notif_type:
-            qs = qs.filter(type=notif_type)
+        return queryset
 
-        is_read = params.get("is_read")
-        if is_read is not None:
-            if is_read.lower() == "true":
-                qs = qs.filter(is_read=True)
-            elif is_read.lower() == "false":
-                qs = qs.filter(is_read=False)
-
-        return qs
-
+    # Returns paginated notifications plus the user's total unread count.
+    # unread_count is calculated before filters/pagination are applied.
     def list(self, request, *args, **kwargs):
-        # unread_count = total unread across the user's ENTIRE history,
-        # deliberately computed from get_base_queryset() (no type/is_read
-        # filters), NOT from the filtered/paginated queryset below.
+        queryset = self.filter_queryset(self.get_queryset())
         unread_count = self.get_base_queryset().filter(is_read=False).count()
 
-        queryset = self.filter_queryset(self.get_queryset())
         page = self.paginate_queryset(queryset)
-
         if page is not None:
             serializer = self.get_serializer(page, many=True)
-            paginated = self.get_paginated_response(serializer.data)
-            ordered = OrderedDict()
-            ordered["count"] = paginated.data["count"]
-            ordered["next"] = paginated.data["next"]
-            ordered["previous"] = paginated.data["previous"]
-            ordered["unread_count"] = unread_count
-            ordered["results"] = paginated.data["results"]
-            return Response(ordered)
+            response = self.get_paginated_response(serializer.data)
+            response.data["unread_count"] = unread_count
+            return response
 
         serializer = self.get_serializer(queryset, many=True)
-        return Response(OrderedDict([
-            ("count", queryset.count()),
-            ("next", None),
-            ("previous", None),
-            ("unread_count", unread_count),
-            ("results", serializer.data),
-        ]))
+        return Response(
+            {
+                "unread_count": unread_count,
+                "results": serializer.data,
+            }
+        )
 
+    # Marks one notification as read.
     @action(detail=True, methods=["put"], url_path="read")
     def mark_read(self, request, pk=None):
         notification = self.get_object()
         notification.is_read = True
-        notification.save()
+        notification.save(update_fields=["is_read"])
         return Response(NotificationSerializer(notification).data)
 
+    # Marks all unread notifications visible to the current user as read.
     @action(detail=False, methods=["post"], url_path="mark-all-read")
     def mark_all_read(self, request):
-        """
-        FIX (E2.4 - NEW endpoint, did not exist before): replaces the
-        frontend firing one PUT /notifications/{id}/read/ per unread
-        notification. Only ever touches the logged-in user's own
-        unread notifications (get_base_queryset() is already scoped to
-        this user + broadcast notifications - never another user's
-        personal notifications).
-
-        NOTE for the frontend team: broadcast notifications (user=null,
-        shown to every customer) share a single is_read flag on the
-        model - there's no per-user read state for them. So marking a
-        broadcast notification read here marks it read for everyone,
-        not just the calling user. This matches the existing behavior
-        of the single mark-read endpoint (E2.3) - it isn't a new issue
-        introduced by this endpoint - but flagging it since "mark all
-        as read" makes it more likely to be hit. If per-user read state
-        on broadcast notifications is actually needed, that requires a
-        model change (a join table), which is out of scope for this
-        round - let us know if you want that as a separate item.
-        """
-        updated_count = (
-            self.get_base_queryset()
-            .filter(is_read=False)
-            .update(is_read=True)
+        updated_count = self.get_base_queryset().filter(is_read=False).update(
+            is_read=True
         )
         return Response(
-            {"marked_count": updated_count},
-            status=status.HTTP_200_OK,
+            {
+                "message": "All notifications marked as read.",
+                "updated_count": updated_count,
+            }
         )
 
 
 class SendNotificationView(APIView):
-    """
-    POST /api/v1/notifications/send/
-
-    Admin-only endpoint to manually create/send a notification.
-    """
+    """Admin-only endpoint for manually creating a notification."""
 
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
-    # FIX (B2): final, confirmed sent_via values - kept in sync with
-    # Notification.SENT_VIA_CHOICES on the model.
-    ALLOWED_SENT_VIA = {"in_app", "email", "sms"}
-
+    # Validates and creates a manually sent notification with deep-link data.
     def post(self, request):
         user_id = request.data.get("user")
         title = request.data.get("title")
         message = request.data.get("message")
         notif_type = request.data.get("type", "system")
-        sent_via = request.data.get("sent_via", "in_app")
-
-        # ============================================================
-        # NEW: Accept reference_type and reference_id as optional fields
-        # as per PDF Part 2 Item 3
-        # ============================================================
         reference_type = request.data.get("reference_type")
         reference_id = request.data.get("reference_id")
+        sent_via = request.data.get("sent_via", "web")
 
-        if not title or not message:
-            return Response(
-                {"error": "title and message are required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # FIX (B2): previously any string was accepted here and saved
-        # as-is (model 'choices' aren't enforced by .create(), only by
-        # full_clean()) - an invalid sent_via would silently save bad
-        # data instead of erroring. Now validated explicitly.
-        if sent_via not in self.ALLOWED_SENT_VIA:
+        if not title or not message or not reference_type or reference_id is None:
             return Response(
                 {
-                    "error": f"Invalid 'sent_via'. Accepted values: {sorted(self.ALLOWED_SENT_VIA)}",
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # ============================================================
-        # NEW: Validate reference_type if provided
-        # ============================================================
-        if reference_type and reference_type not in ["order", "return", "complaint"]:
-            return Response(
-                {
-                    "error": "Invalid 'reference_type'. Accepted values: order, return, complaint",
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # If reference_type is provided, reference_id is also required
-        if reference_type and not reference_id:
-            return Response(
-                {
-                    "error": "reference_id is required when reference_type is provided",
+                    "error": (
+                        "title, message, reference_type and reference_id "
+                        "are required."
+                    )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -226,9 +128,9 @@ class SendNotificationView(APIView):
             title=title,
             message=message,
             type=notif_type,
-            sent_via=sent_via,
             reference_type=reference_type,
-            reference_id=reference_id,
+            reference_id=str(reference_id),
+            sent_via=sent_via,
         )
 
         return Response(

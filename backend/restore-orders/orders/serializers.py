@@ -52,18 +52,9 @@ class OrderItemSerializer(serializers.ModelSerializer):
             return image.url.replace("http://", "https://")
         return str(image)
 
-
 # Converts payment details into API response.
 # Used when returning complete order information.
 class PaymentSerializer(serializers.ModelSerializer):
-    # FIX (Cross-check, Sep 2026): spec locks this field's JSON name as
-    # "method" (referenced throughout the PDF as "payment.method", e.g.
-    # "the order's payment.method == 'qr'", "payment.method: 'qr'") — the
-    # model field is still payment_method internally (source=), only the
-    # serialized key changes, so no migration/internal-logic changes are
-    # needed.
-    method = serializers.CharField(source="payment_method")
-
     class Meta:
         model = Payment
         fields = [
@@ -72,14 +63,7 @@ class PaymentSerializer(serializers.ModelSerializer):
             "status",
             "amount",
             "paid_at",
-            # ============================================================
-            # NEW: Payment method fields
-            # ============================================================
-            "method",
-            "refund_method",
-            "refund_transaction_reference",
         ]
-
 
 # Returns a lightweight order summary for customer order history.
 class OrderListSerializer(serializers.ModelSerializer):
@@ -102,7 +86,6 @@ class OrderListSerializer(serializers.ModelSerializer):
 # Counts how many products belong to this order.
     def get_item_count(self, obj):
         return obj.items.count()
-
 
 # Returns order summary with customer information for admin dashboard.
 class AdminOrderListSerializer(serializers.ModelSerializer):
@@ -132,7 +115,6 @@ class AdminOrderListSerializer(serializers.ModelSerializer):
             "phone": obj.customer.phone,
         }
 
-
 # Returns complete order details including customer, items and payment.
 class OrderDetailSerializer(serializers.ModelSerializer):
     customer = serializers.SerializerMethodField()
@@ -160,7 +142,6 @@ class OrderDetailSerializer(serializers.ModelSerializer):
             "contact_phone",
             "tracking_number",
             "notes",
-            "cancellation_reason",
             "created_at",
             "updated_at",
 
@@ -179,42 +160,21 @@ class OrderDetailSerializer(serializers.ModelSerializer):
             "phone": obj.customer.phone,
         }
 
-
-# ============================================================
-# UPDATED: CheckoutSerializer with payment_method field
-# as per PDF Part 3
-# ============================================================
+# Validates checkout request before creating an order.
 class CheckoutSerializer(serializers.Serializer):
     """POST /api/v1/orders/checkout/
 
-    FIX (B15/B18/B19): shipping_address/city/postal_code/phone are kept
-    here (required=False) for one-off manual entry at checkout time.
-    shipping_address and city are the only two that are truly mandatory to
-    place an order, and that's enforced in CheckoutView once the address
-    resolution below has run, not here.
-
-    NEW (Backend Change Request v2, Part 1): address_id (optional) — pick
-    one of the customer's saved Address Book entries instead of typing the
-    address in manually. CheckoutView resolves the final
-    shipping_address/city/postal_code/phone in this order:
-      1. address_id, if provided (must belong to this customer)
-      2. shipping_address/city/... typed directly into this request
-      3. the customer's Address Book entry with is_default=True
-    If none of the three yield a shipping_address/city, checkout 400s —
-    same "no address available" rule as before.
-
-    REMOVED (Part 1): save_address. It used to write the single address
-    straight onto Customer.address/city/postal_code — that was the old
-    single-address behaviour the spec explicitly says to stop running in
-    parallel with the Address Book. Saving an address is now only ever
-    done explicitly via POST /api/v1/addresses/.
-
-    ============================================================
-    NEW (PDF Part 3): payment_method field
-    ============================================================
+    FIX (B15/B18/B19/B22/F8): previously this only had shipping_address +
+    notes, so city/postal_code/phone had nowhere to go — the frontend could
+    send them but the backend silently dropped them, and there was zero
+    validation on any of it. Every field here is required=False because the
+    view falls back to the customer's last saved profile (Customer.city /
+    Customer.postal_code / Customer.phone) when a field is omitted — that's
+    what makes prefill (F8) and "returning customer doesn't retype
+    everything" actually work. shipping_address and city are the only two
+    that are truly mandatory to place an order, and that's enforced in
+    CheckoutView once the fallback has been applied, not here.
     """
-
-    address_id = serializers.IntegerField(required=False, allow_null=True)
 
     shipping_address = serializers.CharField(
         required=False,
@@ -238,19 +198,13 @@ class CheckoutSerializer(serializers.Serializer):
         allow_blank=True,
         max_length=20,
     )
+    # FIX (B22): when true, whatever address/city/postal_code/phone was
+    # used for this order also gets written back onto the Customer profile.
+    save_address = serializers.BooleanField(required=False, default=False)
 
     notes = serializers.CharField(
         required=False,
         allow_blank=True,
-    )
-
-    # ============================================================
-    # NEW: payment_method field (PDF Part 3)
-    # ============================================================
-    payment_method = serializers.ChoiceField(
-        choices=["stripe", "qr"],
-        required=True,
-        help_text="Payment method: stripe or qr"
     )
 
     # FIX (B19): city/address get real validation instead of none.
@@ -292,17 +246,49 @@ class CheckoutSerializer(serializers.Serializer):
             )
         return cleaned
 
+# NEW (F8/B22): what GET /api/v1/orders/checkout/prefill/ returns, and the
+# body PUT /api/v1/orders/save-address/ accepts.
+class CheckoutPrefillSerializer(serializers.Serializer):
+    shipping_address = serializers.CharField(allow_blank=True, allow_null=True)
+    city = serializers.CharField(allow_blank=True, allow_null=True)
+    postal_code = serializers.CharField(allow_blank=True, allow_null=True)
+    phone = serializers.CharField(allow_blank=True, allow_null=True)
 
-# NEW (Backend Change Request v2, Part 2 — Item 1 / Issue 3): optional
-# reason on customer-initiated cancellation. Purely additive — sending no
-# body at all (reason simply absent) must keep working exactly as before.
-class CustomerOrderCancelSerializer(serializers.Serializer):
-    reason = serializers.CharField(
-        required=False,
-        allow_blank=True,
-        max_length=1000,
+
+class SaveAddressSerializer(serializers.Serializer):
+    """PUT /api/v1/orders/save-address/ — B22: a standalone way to update the
+    saved address, independent of going through checkout."""
+
+    shipping_address = serializers.CharField(max_length=500)
+    city = serializers.CharField(max_length=100)
+    postal_code = serializers.CharField(
+        required=False, allow_blank=True, max_length=20
     )
+    phone = serializers.CharField(required=False, allow_blank=True, max_length=20)
 
+    def validate_shipping_address(self, value):
+        value = value.strip()
+        if len(value) < 8:
+            raise serializers.ValidationError(
+                "Shipping address looks too short — please enter a full address."
+            )
+        return value
+
+    def validate_postal_code(self, value):
+        value = value.strip()
+        if value and not POSTAL_CODE_RE.match(value):
+            raise serializers.ValidationError(
+                "Postal code should be 4-6 digits (leave blank if unknown)."
+            )
+        return value
+
+    def validate_phone(self, value):
+        cleaned = re.sub(r'[\s-]', '', value)
+        if cleaned and not PHONE_RE.match(cleaned):
+            raise serializers.ValidationError(
+                "Enter a valid phone number, e.g. 03001234567 or +923001234567."
+            )
+        return cleaned
 
 # Validates order status updates made by the admin.
 class AdminOrderStatusSerializer(serializers.Serializer):
@@ -334,60 +320,9 @@ class AdminOrderStatusSerializer(serializers.Serializer):
         max_length=1000,
     )
 
-    # NEW (Backend Change Request v2, Part 2 — Item 2 / Issue 5): manual
-    # refund proof for QR-paid orders. Both optional at the field level —
-    # only actually required when this cancellation is for a QR-paid
-    # order, which needs the order's payment.payment_method to check, so
-    # that part of the validation happens in AdminOrderStatusUpdateView
-    # (has the order loaded already) rather than here.
-    refund_method = serializers.ChoiceField(
-        choices=["manual", "automatic"],
-        required=False,
-    )
-    refund_transaction_reference = serializers.CharField(
-        required=False,
-        allow_blank=True,
-        max_length=255,
-    )
-
     def validate(self, attrs):
         if attrs.get("status") == "cancelled" and not attrs.get("cancellation_reason", "").strip():
             raise serializers.ValidationError(
                 {"cancellation_reason": "Please provide a reason for cancelling this order."}
             )
         return attrs
-
-# Serializes saved checkout details returned by the prefill endpoint.
-class CheckoutPrefillSerializer(serializers.Serializer):
-    shipping_address = serializers.CharField(
-        allow_blank=True,
-        allow_null=True,
-    )
-    city = serializers.CharField(
-        allow_blank=True,
-        allow_null=True,
-    )
-    postal_code = serializers.CharField(
-        allow_blank=True,
-        allow_null=True,
-    )
-    phone = serializers.CharField(
-        allow_blank=True,
-        allow_null=True,
-    )
-
-
-# Validates the customer's saved-address update request.
-class SaveAddressSerializer(serializers.Serializer):
-    shipping_address = serializers.CharField(max_length=500)
-    city = serializers.CharField(max_length=100)
-    postal_code = serializers.CharField(
-        required=False,
-        allow_blank=True,
-        max_length=20,
-    )
-    phone = serializers.CharField(
-        required=False,
-        allow_blank=True,
-        max_length=20,
-    )

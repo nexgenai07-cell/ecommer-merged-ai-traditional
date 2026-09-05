@@ -187,15 +187,19 @@ class StripeWebhookView(APIView):
                     confirm_stock_for_order(order)
 
                     # Notification
+                    # Notification: Stripe payment confirmed
                     create_notification(
-                        user=order.customer.user,
-                        store=order.store,
-                        title="Order Confirmed",
-                        message=f"Your order #{order.order_number} has been confirmed and payment received.",
-                        notification_type="order",
-                        reference_type="order",
-                        reference_id=order.order_number,
-                    )
+    user=order.customer.user,
+    store=order.store,
+    title="Payment confirmed",
+    message=(
+        f"Payment for order {order.order_number} has been confirmed. "
+        "Your order is now being processed."
+    ),
+    notification_type="order",
+    reference_type="order",
+    reference_id=order.order_number,
+)
 
             except Order.DoesNotExist:
                 pass

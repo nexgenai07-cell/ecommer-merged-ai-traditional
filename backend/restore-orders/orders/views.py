@@ -184,11 +184,6 @@ def deduct_stock_for_order(order, user=None):
             )
 
     order.stock_deducted = True
-    
-# Backward-compatible name used by older payment code.
-# Stock confirmation now uses the same safe deduction helper.
-def confirm_stock_for_order(order, user=None):
-    return deduct_stock_for_order(order, user=user)
 
 
 # NEW (B27): when an admin cancels an order, suggest in-stock alternatives
@@ -387,13 +382,11 @@ class CheckoutView(APIView):
             cart.save()
 
         create_notification(
-    user=request.user,
-    title="Order placed",
-    message=f"Your order {order.order_number} has been placed and is awaiting payment.",
-    notification_type="order",
-    reference_type="order",
-    reference_id=order.order_number,
-)
+            user=request.user,
+            title="Order Created",
+            message=f"Your order #{order.order_number} has been created and is awaiting payment.",
+            notification_type="order",
+        )
 
         # FIX (F14): actual email confirmation, not just an in-app
         # notification. Failure here must never break checkout for the
@@ -570,13 +563,11 @@ class OrderCancelView(APIView):
         # customer had nothing confirming the cancellation actually
         # registered on their side.
         create_notification(
-    user=request.user,
-    title="Order cancelled",
-    message=f"Your order {order.order_number} has been cancelled.",
-    notification_type="order",
-    reference_type="order",
-    reference_id=order.order_number,
-)
+            user=request.user,
+            title="Order Cancelled",
+            message=f"Your order #{order.order_number} has been cancelled.",
+            notification_type="order",
+        )
 
         if was_paid:
             send_refund_confirmation_email(order)
@@ -719,28 +710,27 @@ class AdminOrderStatusUpdateView(APIView):
         order.save()
 
         status_titles = {
-    "pending_payment": "Awaiting Payment",
-    "confirmed": "Order confirmed",
-    "shipped": "Order shipped",
-    "out_for_delivery": "Out for delivery",
-    "delivered": "Order delivered",
-    "cancelled": "Order cancelled",
-}
+            "pending_payment": "Awaiting Payment",
+            "confirmed": "Order Confirmed",
+            "shipped": "Order Shipped",
+            "out_for_delivery": "Out for Delivery",
+            "delivered": "Order Delivered",
+            "cancelled": "Order Cancelled",
+        }
 
         status_messages = {
-    "pending_payment": f"Your order {order.order_number} is awaiting payment.",
-    "confirmed": f"Order {order.order_number} has been confirmed.",
-    "shipped": f"Order {order.order_number} has been shipped.",
-    "out_for_delivery": f"Order {order.order_number} is out for delivery.",
-    "delivered": f"Order {order.order_number} has been delivered.",
-    "cancelled": (
-        f"Order {order.order_number} has been cancelled. "
-        f"Reason: {order.cancellation_reason}."
-        if order.cancellation_reason
-        else f"Order {order.order_number} has been cancelled."
-    ),
-}
-
+            "pending_payment": f"Your order #{order.order_number} is awaiting payment.",
+            "confirmed": f"Your order #{order.order_number} has been confirmed.",
+            "shipped": f"Your order #{order.order_number} has been shipped.",
+            "out_for_delivery": f"Your order #{order.order_number} is out for delivery.",
+            "delivered": f"Your order #{order.order_number} has been delivered.",
+            "cancelled": (
+                f"Your order #{order.order_number} has been cancelled. "
+                f"Reason: {order.cancellation_reason}"
+                if order.cancellation_reason
+                else f"Your order #{order.order_number} has been cancelled."
+            ),
+        }
 
         # FIX (B28): this notification already existed and already fires
         # correctly on every admin status change (including cancellation)
@@ -749,11 +739,12 @@ class AdminOrderStatusUpdateView(APIView):
         create_notification(
             user=order.customer.user,
             store=order.store,
-            title=status_titles[new_status],
-            message=status_messages[new_status],
+            title=status_titles.get(new_status, "Order Update"),
+            message=status_messages.get(
+                new_status,
+                f"Your order #{order.order_number} has been updated.",
+            ),
             notification_type="order",
-            reference_type="order",
-            reference_id=order.order_number,
         )
 
         if new_status == "cancelled" and was_paid_before_cancel:
