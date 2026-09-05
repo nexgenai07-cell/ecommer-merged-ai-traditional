@@ -64,6 +64,16 @@ class PaymentSerializer(serializers.ModelSerializer):
     # needed.
     method = serializers.CharField(source="payment_method")
 
+    # FIX (Cross-check, Sep 2026 — frontend report on ORD-2026-00063):
+    # screenshot_url was already saved correctly on Payment.qr_screenshot_url
+    # at proof-upload time (confirmed working — it's already returned by
+    # GET /api/v1/admin/payments/qr/pending/), it just was never exposed on
+    # this serializer, so it never reached the customer or admin Order
+    # Detail responses. SerializerMethodField (not a plain CharField) so a
+    # None value comes through as JSON null instead of the literal string
+    # "None".
+    screenshot_url = serializers.SerializerMethodField()
+
     class Meta:
         model = Payment
         fields = [
@@ -78,7 +88,11 @@ class PaymentSerializer(serializers.ModelSerializer):
             "method",
             "refund_method",
             "refund_transaction_reference",
+            "screenshot_url",
         ]
+
+    def get_screenshot_url(self, obj):
+        return obj.qr_screenshot_url or None
 
 
 # Returns a lightweight order summary for customer order history.
