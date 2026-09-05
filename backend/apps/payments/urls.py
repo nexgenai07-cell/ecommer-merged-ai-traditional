@@ -4,6 +4,7 @@ from .views import (
     CreatePaymentIntentView,
     StripeWebhookView,
     QRProofUploadView,
+    AdminQRPaymentPendingView,
     AdminQRPaymentApproveView,
     AdminQRPaymentRejectView,
 )
@@ -38,6 +39,18 @@ urlpatterns = [
 
 # Mount these at /api/v1/admin/payments/
 admin_payment_urlpatterns = [
+    # FIX (Cross-check, Sep 2026 — 404 on GET /api/v1/admin/payments/qr/pending/):
+    # same root cause as the qr/proof/ 404 above — AdminQRPaymentPendingView
+    # is already fully implemented in views.py (paginated queue of
+    # under_review QR payments) but was never wired up to a URL. Listed
+    # before the dynamic qr/<order_number>/... patterns below purely for
+    # readability (static path); it doesn't affect matching, since those
+    # patterns only match paths ending in /approve/ or /reject/.
+    path(
+        "qr/pending/",
+        AdminQRPaymentPendingView.as_view(),
+        name="admin-qr-payment-pending",
+    ),
     path(
         "qr/<str:order_number>/approve/",
         AdminQRPaymentApproveView.as_view(),
