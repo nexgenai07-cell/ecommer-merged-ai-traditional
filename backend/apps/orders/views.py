@@ -68,6 +68,133 @@ def get_or_create_customer(user, store_id=1):
     )
     return customer
 
+def reserve_stock_for_order(order):
+    """
+    Transition 1: Checkout (API 55), order created as pending_payment
+    reserved_stock += qty, total_stock unchanged
+    """
+    if order.stock_deducted:
+        return
+
+    items = list(order.items.select_related("product").all())
+    product_ids = [item.product_id for item in items if item.product_id]
+
+    if product_ids:
+        locked_products = {
+            p.id: p
+            for p in Product.objects.select_for_update().filter(id__in=product_ids)
+        }
+
+        for item in items:
+            product = locked_products.get(item.product_id)
+            if not product:
+                continue
+
+            old_reserved = product.reserved_stock
+            new_reserved = old_reserved + item.quantity
+
+            if new_reserved > product.total_stock:
+                raise Exception(
+                    f"Cannot reserve {item.quantity} units for product {product.name}. "
+                    f"Available stock: {product.total_stock - old_reserved}"
+                )
+
+            product.reserved_stock = new_reserved
+            product.save(update_fields=["reserved_stock"])
+
+            StockMovement.objects.create(
+                product=product,
+                changed_by=None,
+                old_stock=product.total_stock,
+                new_stock=product.total_stock,
+                delta=0,
+                reason="order_placed",
+                note=f"Order {order.order_number} - reserved {item.quantity} units",
+            )
+
+
+def release_reserved_stock_for_order(order):
+    """
+    Transition 3: Order cancelled (customer API 58, admin API 63)
+    OR payment timeout.
+
+    If payment was never confirmed:
+        reserved_stock -= qty
+        total_stock unchanged
+
+    If payment was confirmed:
+        total_stock += qty
+        reserved_stock -= qty
+    """
+    if not order.stock_deducted:
+        items = list(order.items.select_related("product").all())
+        product_ids = [item.product_id for item in items if item.product_id]
+
+        if product_ids:
+            locked_products = {
+                p.id: p
+                for p in Product.objects.select_for_update().filter(id__in=product_ids)
+            }
+
+            for item in items:
+                product = locked_products.get(item.product_id)
+                if not product:
+                    continue
+
+                old_reserved = product.reserved_stock
+                new_reserved = max(old_reserved - item.quantity, 0)
+
+                product.reserved_stock = new_reserved
+                product.save(update_fields=["reserved_stock"])
+
+                StockMovement.objects.create(
+                    product=product,
+                    changed_by=None,
+                    old_stock=product.total_stock,
+                    new_stock=product.total_stock,
+                    delta=0,
+                    reason="order_cancelled",
+                    note=f"Order {order.order_number} - released {item.quantity} units",
+                )
+
+        return
+
+    items = list(order.items.select_related("product").all())
+    product_ids = [item.product_id for item in items if item.product_id]
+
+    if product_ids:
+        locked_products = {
+            p.id: p
+            for p in Product.objects.select_for_update().filter(id__in=product_ids)
+        }
+
+        for item in items:
+            product = locked_products.get(item.product_id)
+            if not product:
+                continue
+
+            old_total = product.total_stock
+            new_total = old_total + item.quantity
+
+            old_reserved = product.reserved_stock
+            new_reserved = max(old_reserved - item.quantity, 0)
+
+            product.total_stock = new_total
+            product.reserved_stock = new_reserved
+            product.save(update_fields=["total_stock", "reserved_stock"])
+
+            StockMovement.objects.create(
+                product=product,
+                changed_by=None,
+                old_stock=old_total,
+                new_stock=new_total,
+                delta=item.quantity,
+                reason="order_cancelled",
+                note=f"Order {order.order_number} cancelled - restored {item.quantity} units",
+            )
+
+    order.stock_deducted = False
+
 # Restores stock for all products when an order is cancelled.
 def restore_stock_for_order(order, user=None):
     """
