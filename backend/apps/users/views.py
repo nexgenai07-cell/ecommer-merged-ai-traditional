@@ -219,7 +219,7 @@ class LoginView(APIView):
             )
         else:
             refresh.set_exp(
-                lifetime=timedelta(days=7)
+                lifetime=timedelta(days=1)
             )
 
         access = refresh.access_token
