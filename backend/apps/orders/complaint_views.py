@@ -100,13 +100,14 @@ class ComplaintDetailView(generics.RetrieveAPIView):
 
 
 class ComplaintMessageView(APIView):
-    """POST /api/v1/complaints/{id}/messages/"""
+    """GET / POST /api/v1/complaints/{id}/messages/"""
 
     permission_classes = [permissions.IsAuthenticated]
 
-    # Adds one private complaint-thread message and creates exactly one
-    # notification for the party that did not send that message.
-    def post(self, request, pk):
+    # Shared lookup + access check used by both GET and POST, so a
+    # customer can only see/reply to their own complaint and an admin
+    # can see/reply to any complaint.
+    def _get_complaint_for_user(self, request, pk):
         try:
             complaint = Complaint.objects.select_related(
                 "customer__user",
@@ -115,7 +116,7 @@ class ComplaintMessageView(APIView):
                 "resolved_by",
             ).get(id=pk)
         except Complaint.DoesNotExist:
-            return Response(
+            return None, Response(
                 {"error": "Complaint not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
@@ -126,10 +127,47 @@ class ComplaintMessageView(APIView):
             not sender_is_admin
             and complaint.customer.user_id != request.user.id
         ):
-            return Response(
+            return None, Response(
                 {"error": "Complaint not found."},
                 status=status.HTTP_404_NOT_FOUND,
             )
+
+        return complaint, None
+
+    # GET /api/v1/complaints/{id}/messages/
+    # Returns the full message thread, chronological, visible to both
+    # roles (customer and admin) — API 72.1.
+    def get(self, request, pk):
+        complaint, error_response = self._get_complaint_for_user(request, pk)
+        if error_response:
+            return error_response
+
+        messages = complaint.messages.select_related("sender").order_by(
+            "created_at"
+        )
+
+        results = [
+            {
+                "id": msg.id,
+                "complaint": complaint.id,
+                "sender": msg.sender_id,
+                "sender_role": "admin" if msg.sender.role == "admin" else "customer",
+                "message": msg.message,
+                "created_at": msg.created_at,
+            }
+            for msg in messages
+        ]
+
+        return Response({"results": results})
+
+    # Adds one private complaint-thread message and creates exactly one
+    # notification for the party that did not send that message.
+    def post(self, request, pk):
+        complaint, error_response = self._get_complaint_for_user(request, pk)
+        if error_response:
+            return error_response
+
+        sender_is_admin = request.user.role == "admin"
 
         message = request.data.get("message")
 
