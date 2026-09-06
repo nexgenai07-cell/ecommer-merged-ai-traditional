@@ -216,7 +216,7 @@ class ProductViewSet(viewsets.ModelViewSet):
         for raw in category_id_values:
             category_ids.extend([v.strip() for v in raw.split(',') if v.strip()])
         if category_ids:
-            qs = qs.filter(category_id__in=category_ids)
+            qs = qs.filter(category_id__in=category_ids).distinct()
 
         min_price = request.query_params.get('min_price')
         if min_price:
