@@ -96,9 +96,54 @@ class PaymentSerializer(serializers.ModelSerializer):
 
 
 # Returns a lightweight order summary for customer order history.
-class OrderListSerializer(serializers.ModelSerializer):
-    """Lightweight — used for order history list (My Orders, API 53)"""
+class OrderListItemSerializer(serializers.ModelSerializer):
+    """
+    Lightweight item preview used by the customer order-history list.
+    Returns only the product name and primary product image.
+    """
 
+    product_image = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OrderItem
+        fields = [
+            "product_name",
+            "product_image",
+        ]
+
+    def get_product_image(self, obj):
+        product = obj.product
+
+        # Product may have been deleted after the order was placed.
+        # product_name is still preserved on OrderItem.
+        if not product:
+            return None
+
+        img = (
+            product.images.filter(is_primary=True).first()
+            or product.images.first()
+        )
+
+        if not img or not img.image:
+            return None
+
+        image = img.image
+
+        if hasattr(image, "url"):
+            return image.url.replace("http://", "https://")
+
+        return str(image)
+
+
+class OrderListSerializer(serializers.ModelSerializer):
+    """
+    Lightweight serializer for customer order history (My Orders).
+
+    items contains only the first 3 OrderItems for thumbnail preview.
+    item_count contains the real total number of items in the order.
+    """
+
+    items = serializers.SerializerMethodField()
     item_count = serializers.SerializerMethodField()
 
     class Meta:
@@ -111,13 +156,22 @@ class OrderListSerializer(serializers.ModelSerializer):
             "status",
             "item_count",
             "created_at",
+            "items",
         ]
-        
-# Counts how many products belong to this order.
+
+    def get_items(self, obj):
+        # Only the first 3 items are needed for the My Orders preview.
+        items = list(obj.items.all()[:3])
+
+        return OrderListItemSerializer(
+            items,
+            many=True,
+            context=self.context,
+        ).data
+
     def get_item_count(self, obj):
+        # IMPORTANT: this is the real total, NOT len(items).
         return obj.items.count()
-
-
 # Returns order summary with customer information for admin dashboard.
 class AdminOrderListSerializer(serializers.ModelSerializer):
     """
