@@ -1,5 +1,5 @@
 # PATH: apps/cart/views.py
-
+import uuid
 from rest_framework import status, permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -17,28 +17,50 @@ from apps.stores.models import Store
 
 def get_or_create_cart_for_request(request):
     """
-    FIX: ab user aur session_key dono support karta hai.
-    - Logged-in user: cart unke account se link hota hai (jaisa pehle tha).
-    - Anonymous: request header 'X-Session-Key' se session_key liya jata hai
-      (frontend/WhatsApp ye header bhejega jo chat session ka session_key hoga).
-    Agar dono missing hon, error raise hota hai.
+    Returns:
+        (cart, session_key, is_new_session)
 
-    NOTE: Do not revert this back to IsAuthenticated-only / user-based lookup.
-    Anonymous/guest carts (WhatsApp flow) depend on the X-Session-Key path.
+    Authenticated:
+        Uses the user's account cart.
+
+    Anonymous:
+        Uses X-Cart-Session when provided.
+        If no session key is provided, generates a new one.
     """
     store = Store.objects.first()
 
+    # Authenticated user -> account cart
     if request.user and request.user.is_authenticated:
-        cart, _ = Cart.objects.get_or_create(user=request.user, store=store)
-        return cart
+        cart, _ = Cart.objects.get_or_create(
+            user=request.user,
+            store=store,
+        )
+        return cart, None, False
 
-    session_key = request.headers.get('X-Session-Key')
+    # Guest -> accept the required cart header.
+    # Keep X-Session-Key as backward compatibility for existing flows.
+    session_key = (
+        request.headers.get("X-Cart-Session")
+        or request.headers.get("X-Session-Key")
+    )
+
+    is_new_session = False
+
     if not session_key:
-        return None
+        session_key = uuid.uuid4().hex
+        is_new_session = True
 
-    cart, _ = Cart.objects.get_or_create(session_key=session_key, store=store)
-    return cart
+    cart, created = Cart.objects.get_or_create(
+        session_key=session_key,
+        store=store,
+    )
 
+    # If a key was supplied but the cart didn't exist, this is still
+    # the first cart request for that guest session.
+    if created:
+        is_new_session = True
+
+    return cart, session_key, is_new_session
 
 class CartView(APIView):
     """GET /api/v1/cart/"""
@@ -46,11 +68,16 @@ class CartView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
-        cart = get_or_create_cart_for_request(request)
-        if cart is None:
-            return Response({'error': 'Login required or X-Session-Key header missing.'}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(CartSerializer(cart).data)
+       cart, session_key, is_new_session = get_or_create_cart_for_request(request)
 
+       data = CartSerializer(cart).data
+
+    # Guest cart session key must be returned so frontend
+    # can store it in localStorage and send it on future requests.
+       if session_key:
+        data["cart_session"] = session_key
+
+       return Response(data)
 
 class AddToCartView(APIView):
     """POST /api/v1/cart/add/"""
@@ -62,44 +89,38 @@ class AddToCartView(APIView):
         product = serializer.validated_data['product']
         quantity = serializer.validated_data['quantity']
 
-        cart = get_or_create_cart_for_request(request)
-        if cart is None:
-            return Response({'error': 'Login required or X-Session-Key header missing.'}, status=status.HTTP_400_BAD_REQUEST)
-
+        cart, session_key, is_new_session = get_or_create_cart_for_request(request)
         cart_item, created = CartItem.objects.get_or_create(
             cart=cart, product=product,
             defaults={'quantity': quantity}
         )
 
         if not created:
-            new_quantity = cart_item.quantity + quantity
-            # FIX (Cross-check, Sep 2026 — PDF Part 2 Item 5): same
-            # stock -> available_stock fix as AddToCartSerializer.
-            if new_quantity > product.available_stock:
-                return Response(
-                    {'error': f'Only {product.available_stock} units available in stock.'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            cart_item.quantity = new_quantity
-            cart_item.save()
+          new_quantity = cart_item.quantity + quantity
+          cart_item.quantity = min(new_quantity, product.available_stock)
+          cart_item.save()
 
         # FIX: was returning the ENTIRE cart object. Doc (API 33) says the
         # response should be { "message": "...", "cart_total_items": N } —
         # "cart_total_items" is what the frontend uses to update the cart
         # icon badge, and it did not exist anywhere in the old response.
-        cart_total_items = cart.items.aggregate(total=Sum('quantity'))['total'] or 0
-        return Response({
-            'message': 'Product added to cart.',
-            'cart_total_items': cart_total_items,
-        }, status=status.HTTP_200_OK)
+          cart_total_items = cart.items.aggregate(total=Sum('quantity'))['total'] or 0
+          response_data = {
+    'message': 'Product added to cart.',
+    'cart_total_items': cart_total_items,
+}
 
+        if session_key:
+           response_data['cart_session'] = session_key
+
+        return Response(response_data, status=status.HTTP_200_OK)
 
 class UpdateCartItemView(APIView):
     """PUT /api/v1/cart/update/{item_id}/"""
     permission_classes = [permissions.AllowAny]
 
     def put(self, request, item_id):
-        cart = get_or_create_cart_for_request(request)
+        cart, session_key, is_new_session = get_or_create_cart_for_request(request)
         if cart is None:
             return Response({'error': 'Login required or X-Session-Key header missing.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -134,7 +155,7 @@ class RemoveCartItemView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def delete(self, request, item_id):
-        cart = get_or_create_cart_for_request(request)
+        cart, session_key, is_new_session = get_or_create_cart_for_request(request)
         if cart is None:
             return Response({'error': 'Login required or X-Session-Key header missing.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -154,7 +175,7 @@ class ClearCartView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def delete(self, request):
-        cart = get_or_create_cart_for_request(request)
+        cart, session_key, is_new_session = get_or_create_cart_for_request(request)
         if cart is None:
             return Response({'error': 'Login required or X-Session-Key header missing.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -182,7 +203,7 @@ class ApplyCouponView(APIView):
         if not (discount.start_date <= now <= discount.end_date):
             return Response({'error': 'This coupon has expired or is not active yet.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        cart = get_or_create_cart_for_request(request)
+        cart, session_key, is_new_session = get_or_create_cart_for_request(request)
         if cart is None:
             return Response({'error': 'Login required or X-Session-Key header missing.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -212,7 +233,7 @@ class RemoveCouponView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def delete(self, request):
-        cart = get_or_create_cart_for_request(request)
+        cart, session_key, is_new_session = get_or_create_cart_for_request(request)
         if cart is None:
             return Response({'error': 'Login required or X-Session-Key header missing.'}, status=status.HTTP_400_BAD_REQUEST)
 
