@@ -1,3 +1,5 @@
+import re
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import status, permissions, generics
 from rest_framework.views import APIView
@@ -68,20 +70,78 @@ class CreateReturnView(APIView):
 
 
 class ReturnListView(generics.ListAPIView):
-    """GET /api/v1/returns/ — lists returns visible to the user."""
+    """GET /api/v1/returns/ — lists returns visible to the user.
+
+    FIX (Frontend Bug Report — Returns list, Sep 2026): none of
+    status/search/start_date/end_date/ordering were ever read from
+    query_params — this always just returned every visible return
+    ordered by -created_at, which is why every request (regardless of
+    filters) returned the same records and the stat cards were all
+    identical. All five params are now applied server-side.
+    """
 
     serializer_class = ReturnSerializer
     permission_classes = [permissions.IsAuthenticated]
     pagination_class = StandardResultsPagination
 
+    # Fields the "ordering" param is allowed to map to — a fixed
+    # whitelist so no arbitrary/unsafe column name can be passed in.
+    ORDERING_MAP = {
+        "created_at": "created_at",
+        "-created_at": "-created_at",
+        "customer_name": "customer__name",
+        "-customer_name": "-customer__name",
+    }
+
     # Admins see all returns; customers see only their own.
     def get_queryset(self):
         if self.request.user.role == "admin":
-            return Return.objects.all().order_by("-created_at")
+            qs = Return.objects.all()
+        else:
+            qs = Return.objects.filter(customer__user=self.request.user)
 
-        return Return.objects.filter(
-            customer__user=self.request.user
-        ).order_by("-created_at")
+        qs = qs.select_related("order", "customer")
+
+        params = self.request.query_params
+
+        # 1. status — final accepted values only: pending, approved,
+        # rejected (matches what CreateReturnView actually writes;
+        # anything else is ignored rather than erroring).
+        status_param = params.get("status")
+        if status_param in ("pending", "approved", "rejected"):
+            qs = qs.filter(status=status_param)
+
+        # 2. search — order number, reason text, customer name, and the
+        # return's own reference number (e.g. "RET-16" -> id=16).
+        search = params.get("search", "").strip()
+        if search:
+            search_filter = (
+                Q(order__order_number__icontains=search)
+                | Q(reason__icontains=search)
+                | Q(customer__name__icontains=search)
+            )
+
+            ref_match = re.match(r"^ret-?(\d+)$", search, re.IGNORECASE)
+            if ref_match:
+                search_filter |= Q(id=int(ref_match.group(1)))
+
+            qs = qs.filter(search_filter)
+
+        # 3. start_date / end_date (YYYY-MM-DD) against created_at.
+        start_date = params.get("start_date")
+        if start_date:
+            qs = qs.filter(created_at__date__gte=start_date)
+
+        end_date = params.get("end_date")
+        if end_date:
+            qs = qs.filter(created_at__date__lte=end_date)
+
+        # 4. ordering — whitelisted values only; default stays
+        # -created_at when the param is missing/invalid.
+        ordering = self.ORDERING_MAP.get(params.get("ordering"), "-created_at")
+        qs = qs.order_by(ordering)
+
+        return qs
 
 
 class ReturnDetailView(generics.RetrieveAPIView):

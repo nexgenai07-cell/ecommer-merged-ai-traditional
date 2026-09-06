@@ -132,14 +132,25 @@ class CreatePaymentIntentView(APIView):
         # can display them without the frontend having to re-fetch and
         # recompute the cart (which is where the coupon was already
         # cleared by the time checkout finishes).
+        #
+        # NEW (Shipping cost fix — Sep 2026): total_amount now includes
+        # shipping_cost (subtotal - discount_amount + shipping_cost), so
+        # subtotal has to be reconstructed by removing shipping_cost too,
+        # not just adding discount_amount back — otherwise subtotal would
+        # be overstated by exactly the shipping amount. `amount` (paisa
+        # sent to Stripe) is derived straight from total_amount above, so
+        # it already includes shipping — this is the actual charge fix.
+        subtotal = total_amount + order.discount_amount - order.shipping_cost
+
         return Response(
             {
                 "client_secret": intent.client_secret,
                 "publishable_key": settings.STRIPE_PUBLISHABLE_KEY,
                 "amount": amount_in_paisa,
                 "currency": "pkr",
-                "subtotal": str(total_amount + order.discount_amount),
+                "subtotal": str(subtotal),
                 "discount_amount": str(order.discount_amount),
+                "shipping_cost": str(order.shipping_cost),
                 "total_amount": str(total_amount),
                 "order_number": order.order_number,
             }

@@ -4,6 +4,7 @@ import logging
 import threading
 
 import stripe
+from decimal import Decimal
 from django.conf import settings
 import random
 import string
@@ -537,7 +538,19 @@ class CheckoutView(APIView):
                     subtotal,
                 )
 
-            total_amount = subtotal - discount_amount
+            # NEW (Shipping cost fix — Sep 2026): shipping_method is
+            # required by CheckoutSerializer ("standard" or "express").
+            # shipping_cost is derived from it here (never taken from the
+            # client) and added to total_amount, same as it goes into the
+            # Payment record and, for Stripe orders, the actual Stripe
+            # PaymentIntent amount (payments/views.py:CreatePaymentIntentView
+            # just uses order.total_amount, so it picks this up
+            # automatically). Applies identically to both Stripe and QR
+            # checkouts.
+            shipping_method = data["shipping_method"]
+            shipping_cost = Order.SHIPPING_COSTS[shipping_method]
+
+            total_amount = subtotal - discount_amount + shipping_cost
 
             # ============================================================
             # CREATE ORDER
@@ -549,6 +562,8 @@ class CheckoutView(APIView):
                 order_number=generate_order_number(),
                 total_amount=total_amount,
                 discount_amount=discount_amount,
+                shipping_method=shipping_method,
+                shipping_cost=shipping_cost,
                 status="pending_payment",
                 shipping_address=shipping_address,
                 city=city,

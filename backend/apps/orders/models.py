@@ -1,5 +1,6 @@
 # PATH: apps/orders/models.py
 
+from decimal import Decimal
 from django.db import models
 from django.conf import settings
 
@@ -132,6 +133,33 @@ class Order(models.Model):
     )
 
     order_number = models.CharField(max_length=20, unique=True)
+
+    # NEW (Shipping cost fix — Sep 2026): shipping was never added to
+    # total_amount anywhere (checkout, Stripe intent, or QR amount).
+    # These two fields snapshot the shipping choice made at checkout time
+    # and must never be recalculated/overwritten after payment confirmation
+    # — only status/payment.status change post-checkout.
+    SHIPPING_METHOD_CHOICES = [
+        ("standard", "Standard"),
+        ("express", "Express"),
+    ]
+
+    SHIPPING_COSTS = {
+        "standard": Decimal("299.00"),
+        "express": Decimal("999.00"),
+    }
+
+    shipping_method = models.CharField(
+        max_length=10,
+        choices=SHIPPING_METHOD_CHOICES,
+        default="standard",
+    )
+
+    shipping_cost = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal("299.00"),
+    )
 
     total_amount = models.DecimalField(
         max_digits=10,

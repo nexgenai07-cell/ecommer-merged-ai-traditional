@@ -1,4 +1,7 @@
+import re
+
 from django.contrib.auth import get_user_model
+from django.db.models import Q
 
 from rest_framework import status, permissions, generics
 from rest_framework.views import APIView
@@ -29,14 +32,47 @@ class CreateComplaintView(generics.ListCreateAPIView):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     pagination_class = StandardResultsPagination
 
+    # FIX (Frontend Bug Report — Complaints list, Sep 2026): status/
+    # priority/search were never read from query_params — this always
+    # just returned every visible complaint ordered by -created_at,
+    # which is why every request returned identical results and the
+    # stat cards were all showing the same total. All three are now
+    # applied server-side; page/pagination already worked via
+    # StandardResultsPagination and needed no change.
     # Admins can see every complaint; customers can see only their own.
     def get_queryset(self):
         if self.request.user.role == "admin":
-            return Complaint.objects.all().order_by("-created_at")
+            qs = Complaint.objects.all()
+        else:
+            qs = Complaint.objects.filter(customer__user=self.request.user)
 
-        return Complaint.objects.filter(
-            customer__user=self.request.user
-        ).order_by("-created_at")
+        qs = qs.select_related("customer", "order")
+
+        params = self.request.query_params
+
+        # status — final accepted values only.
+        status_param = params.get("status")
+        if status_param in ("open", "in_progress", "resolved", "closed"):
+            qs = qs.filter(status=status_param)
+
+        # priority — final accepted values only.
+        priority_param = params.get("priority")
+        if priority_param in ("normal", "urgent"):
+            qs = qs.filter(priority=priority_param)
+
+        # search — reference/ID number (e.g. "CMP-34" -> id=34) and the
+        # complaint's own subject/message text.
+        search = params.get("search", "").strip()
+        if search:
+            search_filter = Q(message__icontains=search)
+
+            ref_match = re.match(r"^cmp-?(\d+)$", search, re.IGNORECASE)
+            if ref_match:
+                search_filter |= Q(id=int(ref_match.group(1)))
+
+            qs = qs.filter(search_filter)
+
+        return qs.order_by("-created_at")
 
     # Creates a complaint for the current customer's own order.
     def create(self, request, *args, **kwargs):

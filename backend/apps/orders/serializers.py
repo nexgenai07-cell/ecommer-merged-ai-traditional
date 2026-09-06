@@ -108,6 +108,8 @@ class OrderListSerializer(serializers.ModelSerializer):
             "order_number",
             "total_amount",
             "discount_amount",
+            "shipping_method",
+            "shipping_cost",
             "status",
             "item_count",
             "created_at",
@@ -134,6 +136,8 @@ class AdminOrderListSerializer(serializers.ModelSerializer):
             "customer",
             "total_amount",
             "discount_amount",
+            "shipping_method",
+            "shipping_cost",
             "status",
             "created_at",
         ]
@@ -168,6 +172,8 @@ class OrderDetailSerializer(serializers.ModelSerializer):
             "status",
             "total_amount",
             "discount_amount",
+            "shipping_method",
+            "shipping_cost",
             "shipping_address",
             "city",
             "postal_code",
@@ -265,6 +271,15 @@ class CheckoutSerializer(serializers.Serializer):
         choices=["stripe", "qr"],
         required=True,
         help_text="Payment method: stripe or qr"
+    )
+
+    # NEW (Shipping cost fix — Sep 2026): required. ChoiceField already
+    # 400s on a missing field or any value other than "standard"/"express",
+    # per spec.
+    shipping_method = serializers.ChoiceField(
+        choices=["standard", "express"],
+        required=True,
+        help_text="Shipping method: standard (Rs. 299) or express (Rs. 999)",
     )
 
     # FIX (B19): city/address get real validation instead of none.
