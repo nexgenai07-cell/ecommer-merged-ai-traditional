@@ -1,6 +1,7 @@
 # PATH: apps/cart/views.py
 import uuid
 from rest_framework import status, permissions
+from django.db import transaction
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from django.utils import timezone
@@ -62,6 +63,89 @@ def get_or_create_cart_for_request(request):
         is_new_session = True
 
     return cart, session_key, is_new_session
+
+def merge_guest_cart_into_user_cart(request, user):
+    """
+    Merge the guest cart identified by X-Cart-Session into
+    the authenticated user's account cart.
+
+    If the same product exists in both carts, quantities are added
+    together and capped at the product's available stock.
+
+    Returns True if a guest cart was found and merged.
+    """
+
+    session_key = (
+        request.headers.get("X-Cart-Session")
+        or request.headers.get("X-Session-Key")
+    )
+
+    if not session_key:
+        return False
+
+    store = Store.objects.first()
+
+    if not store:
+        return False
+
+    try:
+        guest_cart = Cart.objects.get(
+            session_key=session_key,
+            user__isnull=True,
+            store=store,
+        )
+    except Cart.DoesNotExist:
+        return False
+
+    with transaction.atomic():
+
+        account_cart, _ = Cart.objects.get_or_create(
+            user=user,
+            store=store,
+        )
+
+        for guest_item in guest_cart.items.select_related("product"):
+            product = guest_item.product
+
+            available_stock = max(
+                product.available_stock,
+                0,
+            )
+
+            if available_stock <= 0:
+                continue
+
+            account_item = CartItem.objects.filter(
+                cart=account_cart,
+                product=product,
+            ).first()
+
+            if account_item:
+                merged_quantity = min(
+                    account_item.quantity + guest_item.quantity,
+                    available_stock,
+                )
+
+                account_item.quantity = merged_quantity
+                account_item.save(update_fields=["quantity"])
+
+            else:
+                account_quantity = min(
+                    guest_item.quantity,
+                    available_stock,
+                )
+
+                CartItem.objects.create(
+                    cart=account_cart,
+                    product=product,
+                    quantity=account_quantity,
+                )
+
+        # Guest cart has successfully been processed.
+        # Remove it so the same guest cart cannot be merged again.
+        guest_cart.delete()
+
+    return True
 
 class CartView(APIView):
     """GET /api/v1/cart/"""
