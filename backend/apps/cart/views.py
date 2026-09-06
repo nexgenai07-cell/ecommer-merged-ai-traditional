@@ -86,34 +86,41 @@ class AddToCartView(APIView):
     def post(self, request):
         serializer = AddToCartSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+
         product = serializer.validated_data['product']
         quantity = serializer.validated_data['quantity']
 
         cart, session_key, is_new_session = get_or_create_cart_for_request(request)
+
         cart_item, created = CartItem.objects.get_or_create(
-            cart=cart, product=product,
+            cart=cart,
+            product=product,
             defaults={'quantity': quantity}
         )
 
         if not created:
-          new_quantity = cart_item.quantity + quantity
-          cart_item.quantity = min(new_quantity, product.available_stock)
-          cart_item.save()
+            new_quantity = cart_item.quantity + quantity
+            cart_item.quantity = min(new_quantity, product.available_stock)
+            cart_item.save()
 
-        # FIX: was returning the ENTIRE cart object. Doc (API 33) says the
-        # response should be { "message": "...", "cart_total_items": N } —
-        # "cart_total_items" is what the frontend uses to update the cart
-        # icon badge, and it did not exist anywhere in the old response.
-          cart_total_items = cart.items.aggregate(total=Sum('quantity'))['total'] or 0
-          response_data = {
-    'message': 'Product added to cart.',
-    'cart_total_items': cart_total_items,
-}
+        # Calculate total quantity of all items in the cart.
+        cart_total_items = (
+            cart.items.aggregate(total=Sum('quantity'))['total'] or 0
+        )
 
+        response_data = {
+            'message': 'Product added to cart.',
+            'cart_total_items': cart_total_items,
+        }
+
+        # Return the session key for guest carts.
         if session_key:
-           response_data['cart_session'] = session_key
+            response_data['cart_session'] = session_key
 
-        return Response(response_data, status=status.HTTP_200_OK)
+        return Response(
+            response_data,
+            status=status.HTTP_200_OK
+        )
 
 class UpdateCartItemView(APIView):
     """PUT /api/v1/cart/update/{item_id}/"""
