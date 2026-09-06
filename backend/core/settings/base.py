@@ -6,6 +6,7 @@ from pathlib import Path
 from datetime import timedelta
 import os
 import warnings
+from corsheaders.defaults import default_headers
 import dj_database_url
 from dotenv import load_dotenv
 import ssl
@@ -244,6 +245,10 @@ SIMPLE_JWT = {
 
 # 1. CORS: Sab origins allow karne ke liye
 CORS_ALLOW_ALL_ORIGINS = True
+
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    "x-cart-session",
+]
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
