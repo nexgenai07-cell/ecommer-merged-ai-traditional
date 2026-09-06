@@ -10,6 +10,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from .models import User
 from .serializers import GoogleLoginSerializer, UserProfileSerializer
 from .views import create_session_record
+from apps.cart.views import merge_guest_cart_into_user_cart
 
 
 class GoogleLoginView(APIView):
@@ -90,6 +91,7 @@ class GoogleLoginView(APIView):
             refresh,
             access_token=access,
         )
+        merge_guest_cart_into_user_cart(request, user)
 
         return Response(
             {

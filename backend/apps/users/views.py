@@ -1,7 +1,6 @@
 # PATH: apps/users/views.py
 from datetime import timedelta
 from threading import Thread
-
 from rest_framework import status, generics, permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -19,6 +18,7 @@ from .email_service import send_verification_with_resend
 from django.conf import settings
 
 from user_agents import parse as parse_user_agent
+from apps.cart.views import merge_guest_cart_into_user_cart
 
 from .models import (
     User,
@@ -219,7 +219,7 @@ class LoginView(APIView):
             )
         else:
             refresh.set_exp(
-                lifetime=timedelta(days=1)
+                lifetime=timedelta(days=7)
             )
 
         access = refresh.access_token
@@ -231,6 +231,8 @@ class LoginView(APIView):
             refresh,
             access_token=access,
         )
+         # Merge guest cart into the user's account cart.
+        merge_guest_cart_into_user_cart(request, user)
 
         return Response(
             {
