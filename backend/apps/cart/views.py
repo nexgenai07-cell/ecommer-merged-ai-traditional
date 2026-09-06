@@ -5,6 +5,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from django.utils import timezone
 from django.db.models import Sum
+from sympy import python
 
 from .models import Cart, CartItem
 from .serializers import (
@@ -75,7 +76,7 @@ class CartView(APIView):
     # Guest cart session key must be returned so frontend
     # can store it in localStorage and send it on future requests.
        if session_key:
-        data["cart_session"] = session_key
+         data["session_key"] = session_key
 
        return Response(data)
 
@@ -115,7 +116,7 @@ class AddToCartView(APIView):
 
         # Return the session key for guest carts.
         if session_key:
-            response_data['cart_session'] = session_key
+          response_data['session_key'] = session_key
 
         return Response(
             response_data,
@@ -128,33 +129,69 @@ class UpdateCartItemView(APIView):
 
     def put(self, request, item_id):
         cart, session_key, is_new_session = get_or_create_cart_for_request(request)
+
         if cart is None:
-            return Response({'error': 'Login required or X-Session-Key header missing.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': 'Login required or X-Session-Key header missing.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         try:
             cart_item = cart.items.get(id=item_id)
         except CartItem.DoesNotExist:
-            return Response({'error': 'Cart item not found.'}, status=status.HTTP_404_NOT_FOUND)
+            response_data = {
+                'error': 'Cart item not found.'
+            }
 
-        serializer = UpdateCartItemSerializer(data=request.data, context={'cart_item': cart_item})
+            if session_key:
+                response_data['session_key'] = session_key
+
+            return Response(
+                response_data,
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        serializer = UpdateCartItemSerializer(
+            data=request.data,
+            context={'cart_item': cart_item}
+        )
         serializer.is_valid(raise_exception=True)
+
         quantity = serializer.validated_data['quantity']
 
-        # FIX: was returning the ENTIRE cart object. Doc (API 34) says the
-        # response should be { "message": "...", "item_total": "..." } —
-        # "item_total" did not exist anywhere in the old response.
         if quantity == 0:
             cart_item.delete()
-            return Response({'message': 'Cart updated.', 'item_total': '0.00'}, status=status.HTTP_200_OK)
+
+            response_data = {
+                'message': 'Cart updated.',
+                'item_total': '0.00',
+            }
+
+            if session_key:
+                response_data['session_key'] = session_key
+
+            return Response(
+                response_data,
+                status=status.HTTP_200_OK
+            )
 
         cart_item.quantity = quantity
         cart_item.save()
+
         item_total = cart_item.product.price * cart_item.quantity
 
-        return Response({
+        response_data = {
             'message': 'Cart updated.',
             'item_total': str(item_total),
-        }, status=status.HTTP_200_OK)
+        }
+
+        if session_key:
+            response_data['session_key'] = session_key
+
+        return Response(
+            response_data,
+            status=status.HTTP_200_OK
+        )
 
 
 class RemoveCartItemView(APIView):
@@ -163,18 +200,41 @@ class RemoveCartItemView(APIView):
 
     def delete(self, request, item_id):
         cart, session_key, is_new_session = get_or_create_cart_for_request(request)
+
         if cart is None:
-            return Response({'error': 'Login required or X-Session-Key header missing.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': 'Login required or X-Session-Key header missing.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         try:
             cart_item = cart.items.get(id=item_id)
         except CartItem.DoesNotExist:
-            return Response({'error': 'Cart item not found.'}, status=status.HTTP_404_NOT_FOUND)
+            response_data = {
+                'error': 'Cart item not found.'
+            }
+
+            if session_key:
+                response_data['session_key'] = session_key
+
+            return Response(
+                response_data,
+                status=status.HTTP_404_NOT_FOUND
+            )
 
         cart_item.delete()
-        # FIX: was returning the ENTIRE cart object; doc (API 35) only
-        # documents { "message": "Item removed from cart." }.
-        return Response({'message': 'Item removed from cart.'}, status=status.HTTP_200_OK)
+
+        response_data = {
+            'message': 'Item removed from cart.'
+        }
+
+        if session_key:
+            response_data['session_key'] = session_key
+
+        return Response(
+            response_data,
+            status=status.HTTP_200_OK
+        )
 
 
 class ClearCartView(APIView):
@@ -183,13 +243,28 @@ class ClearCartView(APIView):
 
     def delete(self, request):
         cart, session_key, is_new_session = get_or_create_cart_for_request(request)
+
         if cart is None:
-            return Response({'error': 'Login required or X-Session-Key header missing.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': 'Login required or X-Session-Key header missing.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         cart.items.all().delete()
         cart.coupon = None
         cart.save()
-        return Response({'message': 'Cart cleared.'}, status=status.HTTP_200_OK)
+
+        response_data = {
+            'message': 'Cart cleared.'
+        }
+
+        if session_key:
+            response_data['session_key'] = session_key
+
+        return Response(
+            response_data,
+            status=status.HTTP_200_OK
+        )
 
 
 class ApplyCouponView(APIView):
@@ -197,42 +272,96 @@ class ApplyCouponView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
+        # Bootstrap/reuse the cart session FIRST.
+        cart, session_key, is_new_session = get_or_create_cart_for_request(request)
+
+        if cart is None:
+            return Response(
+                {'error': 'Login required or X-Session-Key header missing.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         serializer = ApplyCouponSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+
         code = serializer.validated_data['code']
 
         try:
-            discount = Discount.objects.get(code=code, is_active=True)
+            discount = Discount.objects.get(
+                code=code,
+                is_active=True
+            )
         except Discount.DoesNotExist:
-            return Response({'error': 'Invalid or inactive coupon code.'}, status=status.HTTP_400_BAD_REQUEST)
+            response_data = {
+                'error': 'Invalid or inactive coupon code.'
+            }
+
+            if session_key:
+                response_data['session_key'] = session_key
+
+            return Response(
+                response_data,
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         now = timezone.now()
+
         if not (discount.start_date <= now <= discount.end_date):
-            return Response({'error': 'This coupon has expired or is not active yet.'}, status=status.HTTP_400_BAD_REQUEST)
+            response_data = {
+                'error': 'This coupon has expired or is not active yet.'
+            }
 
-        cart, session_key, is_new_session = get_or_create_cart_for_request(request)
-        if cart is None:
-            return Response({'error': 'Login required or X-Session-Key header missing.'}, status=status.HTTP_400_BAD_REQUEST)
+            if session_key:
+                response_data['session_key'] = session_key
 
-        subtotal = sum(item.product.price * item.quantity for item in cart.items.all())
+            return Response(
+                response_data,
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        subtotal = sum(
+            item.product.price * item.quantity
+            for item in cart.items.all()
+        )
 
         if discount.min_order_amount and subtotal < discount.min_order_amount:
+            response_data = {
+                'error': (
+                    f'Minimum order amount of Rs. '
+                    f'{discount.min_order_amount} required for this coupon.'
+                )
+            }
+
+            if session_key:
+                response_data['session_key'] = session_key
+
             return Response(
-                {'error': f'Minimum order amount of Rs. {discount.min_order_amount} required for this coupon.'},
+                response_data,
                 status=status.HTTP_400_BAD_REQUEST
             )
 
         cart.coupon = discount
         cart.save()
 
-        # FIX: was returning the ENTIRE cart object. Doc (API 37) says the
-        # response should be { "message": "...", "discount_amount": "...", "total": "..." }.
         cart_serializer = CartSerializer(cart)
-        return Response({
+
+        response_data = {
             'message': 'Coupon applied.',
-            'discount_amount': str(cart_serializer.get_discount_amount(cart)),
-            'total': str(cart_serializer.get_total(cart)),
-        }, status=status.HTTP_200_OK)
+            'discount_amount': str(
+                cart_serializer.get_discount_amount(cart)
+            ),
+            'total': str(
+                cart_serializer.get_total(cart)
+            ),
+        }
+
+        if session_key:
+            response_data['session_key'] = session_key
+
+        return Response(
+            response_data,
+            status=status.HTTP_200_OK
+        )
 
 
 class RemoveCouponView(APIView):
@@ -241,11 +370,24 @@ class RemoveCouponView(APIView):
 
     def delete(self, request):
         cart, session_key, is_new_session = get_or_create_cart_for_request(request)
+
         if cart is None:
-            return Response({'error': 'Login required or X-Session-Key header missing.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': 'Login required or X-Session-Key header missing.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         cart.coupon = None
         cart.save()
-        # FIX: was returning the ENTIRE cart object; doc (API 38) only
-        # documents { "message": "Coupon removed." }.
-        return Response({'message': 'Coupon removed.'}, status=status.HTTP_200_OK)
+
+        response_data = {
+            'message': 'Coupon removed.'
+        }
+
+        if session_key:
+            response_data['session_key'] = session_key
+
+        return Response(
+            response_data,
+            status=status.HTTP_200_OK
+        )
