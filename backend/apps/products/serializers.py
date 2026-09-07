@@ -181,6 +181,23 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
         min_value=0,
     )
 
+    # FIX (Frontend Bug Report — Create Product stock always 0, Sep 2026):
+    # the frontend's "Starting Quantity" field is sent as "stock" in the
+    # POST payload, but this serializer only ever declared "total_stock"
+    # — DRF silently drops any payload key that isn't a declared field
+    # (no error raised), so total_stock was never set from the request
+    # and fell back to the model's own default of 0 on every create.
+    # "stock" is now accepted as a write-only alias. If a caller sends
+    # "total_stock" directly that value still wins unchanged — "stock" is
+    # only used as a fallback in create()/update() below when
+    # total_stock wasn't provided at all, so nothing that already worked
+    # (e.g. Update Product, Adjust Stock) is affected.
+    stock = serializers.IntegerField(
+        write_only=True,
+        required=False,
+        min_value=0,
+    )
+
     class Meta:
         model = Product
         fields = [
@@ -195,6 +212,7 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
             "total_stock",
             "reserved_stock",
             "stock_to_add",
+            "stock",
             "sku",
             "category",
             "category_id",
@@ -231,6 +249,13 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
             validated_data["category_id"] = category_id
 
         validated_data.pop("stock_to_add", None)
+
+        # FIX (Frontend Bug Report, Sep 2026): map the "stock" alias onto
+        # total_stock as a fallback — only when total_stock itself wasn't
+        # provided, so an explicit total_stock always takes priority.
+        incoming_stock = validated_data.pop("stock", None)
+        if "total_stock" not in validated_data and incoming_stock is not None:
+            validated_data["total_stock"] = incoming_stock
 
         # Ensure reserved_stock is 0 by default
         validated_data.setdefault("reserved_stock", 0)
@@ -304,6 +329,15 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
         # activity. This PUT/update path is NOT safe for concurrent stock
         # changes since it reads instance.stock in Python before saving.
         stock_to_add = validated_data.pop("stock_to_add", 0)
+
+        # FIX (Frontend Bug Report, Sep 2026): same "stock" alias handling
+        # as create() — pulled out before the loop below so it maps onto
+        # total_stock instead of silently landing on the deprecated
+        # Product.stock field via setattr. Only used as a fallback when
+        # total_stock itself wasn't sent.
+        incoming_stock = validated_data.pop("stock", None)
+        if "total_stock" not in validated_data and incoming_stock is not None:
+            validated_data["total_stock"] = incoming_stock
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
