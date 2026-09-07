@@ -825,8 +825,11 @@ class OrderCancelView(APIView):
             # first place (i.e. it was still unpaid), so cancelling an
             # unpaid order no longer incorrectly adds phantom stock back.
             restore_stock_for_order(order, user=request.user)
-
+            
+            reason = request.data.get("reason")
             order.status = "cancelled"
+            if reason is not None:
+               order.cancellation_reason = reason
             order.save()
 
             # FIX (B29): refunded_at timestamp gives a real, checkable
