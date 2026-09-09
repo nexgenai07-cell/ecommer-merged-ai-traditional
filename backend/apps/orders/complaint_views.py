@@ -18,6 +18,7 @@ from apps.returns.complaint_serializers import (
 from apps.notifications.utils import create_notification
 from .models import Order, Customer
 from apps.users.permissions import IsAdmin
+from apps.ai.audit import log_manual_admin_action as log_admin_action
 from core.pagination import StandardResultsPagination
 
 
@@ -101,6 +102,39 @@ class CreateComplaintView(generics.ListCreateAPIView):
             customer=customer,
             order=order,
             status="open",
+        )
+
+        # NEW (Notification Triggers Addendum, Item 13): "New complaint
+        # filed" — the store's admin must be notified. If the complaint
+        # has an order attached, that order's store is used; otherwise
+        # fall back to the store the complaint's own customer profile
+        # belongs to. Note: in this codebase a Customer profile is
+        # already store-scoped (one profile per user per store, created
+        # on that customer's first order in that store — see
+        # get_or_create_customer), so customer.store always resolves the
+        # correct store directly. The addendum's "no store to notify, if
+        # the customer has never ordered anywhere" fallback can't actually
+        # occur here, since CreateComplaintView already requires an
+        # existing Customer profile (see the "Place an order first" check
+        # above) before a complaint can be filed at all.
+        target_store = order.store if order else customer.store
+
+        if complaint.order:
+            complaint_message = (
+                f"Complaint #{complaint.id} has been filed on order "
+                f"{complaint.order.order_number}."
+            )
+        else:
+            complaint_message = f"Complaint #{complaint.id} has been filed."
+
+        create_notification(
+            user=target_store.owner,
+            store=target_store,
+            title="New complaint filed",
+            message=complaint_message,
+            notification_type="system",
+            reference_type="complaint",
+            reference_id=complaint.id,
         )
 
         return Response(
@@ -281,8 +315,25 @@ class AdminComplaintStatusUpdateView(APIView):
         serializer = AdminComplaintStatusSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        old_status = complaint.status
         complaint.status = serializer.validated_data["status"]
         complaint.save()
+
+        # FIX (Frontend Bug Report — Audit Logs, Sep 2026): no admin write
+        # endpoint besides Adjust Stock was writing to the shared AuditLog
+        # table (API 82 / System Activity Logs). Logged here now.
+        # complaint.order can be null (a complaint isn't always tied to an
+        # order), so fall back to the acting admin's own store in that case.
+        log_admin_action(
+            store=complaint.order.store if complaint.order else request.user.stores.first(),
+            user=request.user,
+            action="update_complaint_status",
+            entity="complaint",
+            entity_id=complaint.id,
+            old_data={"status": old_status},
+            new_data={"status": complaint.status},
+            request=request,
+        )
 
         return Response({"message": "Complaint status updated."})
 

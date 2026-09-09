@@ -75,3 +75,72 @@ def log_admin_action(user, tool_name: str, payload: dict, result: dict):
         # bas silently skip karte hain (production mein isay proper
         # logging/monitoring se track karna chahiye).
         pass        # FLOW: audit fail hone se asal action revert nahi hota — silently skip
+
+
+# ============================================================
+# FIX (Frontend Bug Report — Audit logs not being created for admin
+# panel actions, Sep 2026): the function above (log_admin_action) is
+# specifically for the AI tool-confirmation flow — it's called from
+# registry.py's confirm_pending_action() with a tool_name/payload/result
+# shape that only exists in that flow.
+#
+# The regular admin panel (Create/Update/Delete Product, Category,
+# Discount; Admin Update Order/Return/Complaint Status; QR Approve/
+# Reject) has no tool_name/payload/result — those views call this
+# separate function instead, with a plain keyword-argument shape. Kept
+# as a second, distinctly-named function in this same file (not a
+# rename/overwrite of log_admin_action above) so the AI-agent audit flow
+# above is completely unaffected.
+# ============================================================
+def log_manual_admin_action(
+    *,
+    store,
+    user,
+    action,
+    entity,
+    entity_id=None,
+    old_data=None,
+    new_data=None,
+    request=None,
+):
+    """
+    Writes one row to the shared AuditLog table for a normal admin-panel
+    write action (not an AI tool call).
+
+    - store: the stores.Store this action belongs to (required by the
+      model). Pass the entity's own store where one exists (order.store,
+      product.store, etc.); only fall back to the acting admin's own
+      store when the entity has no store of its own (e.g. a complaint
+      that isn't linked to an order).
+    - action: short machine-readable string, e.g. "create_product",
+      "update_order_status", "delete_category" — matches the prefix
+      convention API 82's `action` filter already expects
+      (create/update/delete).
+    - entity / entity_id: what was acted on, e.g. entity="product",
+      entity_id=42.
+    - old_data / new_data: optional JSON-safe snapshots (plain dicts of
+      strings/numbers/bools only — no model instances or Decimal/
+      datetime objects, since these are stored directly in a JSONField).
+    - request: pass the current request when available so the caller's
+      IP address is recorded; safe to omit.
+    """
+    try:
+        ip_address = None
+        if request is not None:
+            ip_address = request.META.get("REMOTE_ADDR")
+
+        AuditLog.objects.create(
+            store=store,
+            user=user,
+            action=action,
+            entity=entity,
+            entity_id=entity_id,
+            old_data=old_data,
+            new_data=new_data,
+            ip_address=ip_address,
+            source="web",
+        )
+    except Exception:
+        # Same fail-safe rule as log_admin_action above — a logging
+        # failure must never revert or block the actual admin action.
+        pass

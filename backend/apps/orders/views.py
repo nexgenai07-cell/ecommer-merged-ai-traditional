@@ -1,15 +1,20 @@
 # PATH: apps/orders/views.py
 
+import logging
+import threading
+
 import stripe
 from decimal import Decimal
+from apps.ai.audit import log_manual_admin_action as log_admin_action
 from django.conf import settings
 import random
 import string
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
-from django.db.models import Count, Prefetch
-from django.db.models import Q
+logger = logging.getLogger(__name__)
+
+from django.db.models import Q, F, ExpressionWrapper, IntegerField
 from django.db import transaction
 from django.utils import timezone
 
@@ -37,6 +42,7 @@ from .serializers import (
 
 from apps.cart.models import Cart
 from apps.products.models import Product, StockMovement
+from apps.products.services import check_low_stock_notification
 from apps.stores.models import Store
 from apps.users.permissions import IsAdmin, IsCustomer
 
@@ -100,6 +106,17 @@ def reserve_stock_for_order(order):
                     f"Available stock: {product.total_stock - old_reserved}"
                 )
 
+            # NEW (Notification Triggers Addendum, Item 17): this is the
+            # point where available_stock (total_stock - reserved_stock)
+            # actually decreases in this codebase — total_stock itself
+            # only changes later, at payment confirmation, when
+            # reserved_stock drops by the same amount total_stock does
+            # (net available_stock change = 0 at that point). Snapshot
+            # before/after here so the low-stock crossing check fires at
+            # the moment it's technically true, not just at confirmation.
+            old_available = product.total_stock - old_reserved
+            new_available = product.total_stock - new_reserved
+
             product.reserved_stock = new_reserved
             product.save(update_fields=["reserved_stock"])
 
@@ -112,6 +129,8 @@ def reserve_stock_for_order(order):
                 reason="order_placed",
                 note=f"Order {order.order_number} - reserved {item.quantity} units",
             )
+
+            check_low_stock_notification(product, old_available, new_available)
 
 
 def release_reserved_stock_for_order(order):
@@ -219,19 +238,6 @@ def restore_stock_for_order(order, user=None):
     that was never removed. order.stock_deducted is the single source of
     truth for this and gets flipped back to False here; callers still do
     their own order.save() right after, which persists it.
-
-    FIX: this helper previously read/wrote a `product.stock` attribute,
-    which doesn't exist anywhere else in this module — every other stock
-    transition (reserve_stock_for_order, deduct_stock_for_order,
-    release_reserved_stock_for_order) operates on `total_stock` /
-    `reserved_stock`. That mismatch meant cancelling a paid order either
-    raised AttributeError or silently updated the wrong field instead of
-    restoring real inventory. Fixed to use total_stock, matching every
-    other stock-transition helper in this file. reserved_stock is not
-    touched here because by the time stock_deducted is True, payment
-    confirmation (deduct_stock_for_order) has already reduced
-    reserved_stock to 0 for these items — only total_stock needs adding
-    back.
     """
     if not order.stock_deducted:
         return
@@ -250,11 +256,11 @@ def restore_stock_for_order(order, user=None):
             if not product:
                 continue
 
-            old_stock = product.total_stock
+            old_stock = product.stock
             new_stock = old_stock + item.quantity
 
-            product.total_stock = new_stock
-            product.save(update_fields=["total_stock"])
+            product.stock = new_stock
+            product.save(update_fields=["stock"])
 
             StockMovement.objects.create(
                 product=product,
@@ -343,30 +349,82 @@ def confirm_stock_for_order(order, user=None):
 
 
 # NEW (B27): when an admin cancels an order, suggest in-stock alternatives
-# for any item that was out of stock — cheap "same category, currently
-# available" lookup, top 3 per item.
+# for any item that was out of stock.
+#
+# FIX (Frontend Clarification — Suggested Alternatives, Sep 2026):
+#   - Ask 1: field was silently dropped from the response whenever there
+#     was nothing to suggest (see AdminOrderStatusUpdateView.put below —
+#     it used to only attach the key when the dict was non-empty). The
+#     key is now always attached to the response on cancellation, as an
+#     empty list if there's nothing to suggest, so the frontend can rely
+#     on it always being present.
+#   - Ask 2 (logic, pending final backend-team confirmation, current
+#     behaviour documented here so it can be confirmed/adjusted):
+#       * Trigger — per line item, not based on matching the
+#         cancellation_reason string. A suggestion is generated for any
+#         item whose product currently has available_stock <= 0. This is
+#         intentionally reason-agnostic since cancellation_reason is a
+#         free-text field an admin can phrase however they like ("out of
+#         stock", "OOS", "no stock left", etc.) and matching on exact/
+#         keyword text would be fragile.
+#       * Matching — same category as the out-of-stock product (falls
+#         back to any in-stock product if the item has no category),
+#         currently active, not soft-deleted, and available_stock > 0.
+#       * Limit — top 3 alternatives per out-of-stock item. If more than
+#         one item in the order is out of stock, the overall list can
+#         contain more than 3 entries in total, but each product id only
+#         appears once (deduped) even if it would qualify for multiple
+#         items.
+#       * Field shape — flat list of objects, matching what the frontend
+#         asked for: id, name, primary_image, price, available_stock.
 def suggest_alternatives_for_order(order):
-    suggestions = {}
+    suggestions = []
+    seen_ids = set()
 
     for item in order.items.select_related("product", "product__category").all():
         product = item.product
         if not product or product.available_stock > 0:
             continue
 
-        alternatives_qs = Product.objects.filter(
-    is_delete=False,
-    total_stock__gt=0,
-).exclude(id=product.id)
+        alternatives_qs = (
+            Product.objects.filter(is_delete=False, is_active=True)
+            .exclude(id=product.id)
+            .annotate(
+                computed_available_stock=ExpressionWrapper(
+                    F("total_stock") - F("reserved_stock"),
+                    output_field=IntegerField(),
+                )
+            )
+            .filter(computed_available_stock__gt=0)
+            .prefetch_related("images")
+        )
 
         if product.category_id:
             alternatives_qs = alternatives_qs.filter(category_id=product.category_id)
 
-        alternatives = list(
-            alternatives_qs.values("id", "name", "price", "stock")[:3]
-        )
+        for alt in alternatives_qs.order_by("-created_at")[:3]:
+            if alt.id in seen_ids:
+                continue
 
-        if alternatives:
-            suggestions[item.product_name] = alternatives
+            images = list(alt.images.all())
+            primary = next((img for img in images if img.is_primary), None)
+            img = primary or (images[0] if images else None)
+            primary_image_url = (
+                img.image.url.replace("http://", "https://")
+                if img and img.image
+                else None
+            )
+
+            suggestions.append(
+                {
+                    "id": alt.id,
+                    "name": alt.name,
+                    "primary_image": primary_image_url,
+                    "price": str(alt.price),
+                    "available_stock": alt.computed_available_stock,
+                }
+            )
+            seen_ids.add(alt.id)
 
     return suggestions
 
@@ -632,25 +690,92 @@ class CheckoutView(APIView):
         # ================================================================
         # NOTIFICATION
         # ================================================================
+        # FIX (Cross-check, checkout crash — Sep 2026): order + payment are
+        # already committed above by this point. A notification is a
+        # non-critical side effect and must never be allowed to break the
+        # checkout response — so this is wrapped in try/except, and this
+        # order's own store is passed explicitly instead of relying on
+        # create_notification()'s Store.objects.first() fallback (which
+        # could pick the wrong store, or be None and crash).
 
-        create_notification(
-            user=request.user,
-            title="Order placed",
-            message=(
-                f"Your order {order.order_number} has been placed "
-                "and is awaiting payment."
-            ),
-            notification_type="order",
-            reference_type="order",
-            reference_id=order.order_number,
-        )
+        try:
+            create_notification(
+                user=request.user,
+                title="Order placed",
+                message=(
+                    f"Your order {order.order_number} has been placed "
+                    "and is awaiting payment."
+                ),
+                notification_type="order",
+                reference_type="order",
+                reference_id=order.order_number,
+                store=order.store,
+            )
+        except Exception:
+            logger.exception(
+                "CheckoutView: create_notification failed for order %s",
+                order.order_number,
+            )
+
+        # NEW (Notification Triggers Addendum, Item 12): "New order
+        # placed" — the store's admin/owner must also be notified,
+        # separately from the customer notification above. Same
+        # non-critical-side-effect handling: never allowed to break the
+        # checkout response.
+        try:
+            create_notification(
+                user=order.store.owner,
+                title="New order received",
+                message=(
+                    f"Order {order.order_number} has been placed and is "
+                    "awaiting processing."
+                ),
+                notification_type="order",
+                reference_type="order",
+                reference_id=order.order_number,
+                store=order.store,
+            )
+        except Exception:
+            logger.exception(
+                "CheckoutView: admin create_notification failed for order %s",
+                order.order_number,
+            )
 
         # ================================================================
         # EMAIL
         # ================================================================
+        # FIX (Cross-check, checkout crash — Sep 2026), UPDATED after
+        # Railway logs confirmed the real failure mode: this was never a
+        # normal Python exception — send_order_confirmation_email() already
+        # catches and logs its own errors internally (see the "failed to
+        # send email" log line in apps/notifications/utils.py), so it never
+        # raised anything for a try/except here to catch.
+        #
+        # The real problem is a genuine BLOCKING network hang: Railway's
+        # outbound network can't reach Gmail's SMTP host at all (OSError:
+        # Network is unreachable), and the socket connect attempt blocks
+        # this request's own thread for 60+ seconds before it errors out.
+        # Daphne (the ASGI server) has its own per-request timeout and
+        # force-kills the whole connection once it decides the request
+        # "took too long to shut down" — and it does this BEFORE the SMTP
+        # call ever returns, which is exactly why the order saves but the
+        # client gets zero response headers, and why the "failed to send
+        # email" log line only appears several seconds AFTER Daphne's kill
+        # warning (the OS thread was still stuck inside socket.connect()
+        # when Daphne gave up on it).
+        #
+        # Fix: never let this request's own thread block on it. Fire the
+        # email in a separate background thread and return the checkout
+        # response immediately, regardless of whether the email eventually
+        # succeeds, hangs, or errors — send_order_confirmation_email's own
+        # internal error handling still applies, this just takes it off
+        # the response's critical path entirely.
 
-        # Email failures must not break checkout.
-        send_order_confirmation_email(order)
+        threading.Thread(
+            target=send_order_confirmation_email,
+            args=(order,),
+            daemon=True,
+        ).start()
 
         # ================================================================
         # RESPONSE
@@ -659,12 +784,20 @@ class CheckoutView(APIView):
         response_data = OrderDetailSerializer(order).data
 
         # QR payment requires the configured static QR image URL.
+        # FIX (Cross-check, Sep 2026 — frontend report on ORD-2026-00062):
+        # "payment_reference" was specced (v2 doc, Part 3) alongside
+        # qr_image_url for QR checkouts, but only qr_image_url was ever
+        # added here — payment_reference was missing from the response
+        # entirely. Per spec its value is just the order's own
+        # order_number (the string customers write in the bank transfer
+        # note), not a separately generated code.
         if payment_method == "qr":
             response_data["qr_image_url"] = getattr(
                 settings,
                 "QR_PAYMENT_IMAGE_URL",
                 "",
             )
+            response_data["payment_reference"] = order.order_number
 
         return Response(
             response_data,
@@ -726,29 +859,19 @@ class SaveAddressView(APIView):
 class OrderListView(generics.ListAPIView):
     """GET /api/v1/orders/
 
-    FIX (B32): supports optional start_date / end_date query params.
+    FIX (B32): supports optional start_date / end_date query params (e.g.
+    ?start_date=2026-08-01&end_date=2026-08-25) so customers can filter
+    their own order history by date range, mirroring what admins already
+    had via AdminOrderFilterView.
     """
-
     serializer_class = OrderListSerializer
     permission_classes = [permissions.IsAuthenticated]
     pagination_class = StandardResultsPagination
 
-    def get_queryset(self):
+    def get_queryset(self): # Fetches customer order history.
         qs = (
             Order.objects.filter(
                 customer__user=self.request.user
-            )
-            .annotate(
-                order_item_count=Count("items")
-            )
-            .prefetch_related(
-                Prefetch(
-                    "items",
-                    queryset=OrderItem.objects.select_related("product")
-                    .prefetch_related("product__images")
-                    .order_by("id"),
-                    to_attr="list_items",
-                )
             )
             .order_by("-created_at")
         )
@@ -764,7 +887,7 @@ class OrderListView(generics.ListAPIView):
             qs = qs.filter(created_at__date__lte=end_date)
 
         return qs
-    
+
 # Returns complete details of a single order.
 class OrderDetailView(generics.RetrieveAPIView):
     serializer_class = OrderDetailSerializer
@@ -818,18 +941,17 @@ class OrderCancelView(APIView):
             )
 
         with transaction.atomic():
-            # FIX (stock race-condition): stock restoration now goes
-            # through the shared, locked, audited helper instead of a
-            # plain read-modify-save loop. FIX (B59): the helper itself is
-            # now a no-op if this order never had stock deducted in the
-            # first place (i.e. it was still unpaid), so cancelling an
-            # unpaid order no longer incorrectly adds phantom stock back.
-            restore_stock_for_order(order, user=request.user)
-            
-            reason = request.data.get("reason")
+            # FIX (Cross-check, Sep 2026): this used to call the old,
+            # dead restore_stock_for_order() helper, which operates on a
+            # plain product.stock field that no longer exists on this
+            # schema (Product now uses total_stock/reserved_stock) — it
+            # would either crash or silently leave stock accounting wrong.
+            # release_reserved_stock_for_order() is the correct helper for
+            # Transition 3 (order cancelled) under the reserved-stock
+            # system.
+            release_reserved_stock_for_order(order)
+
             order.status = "cancelled"
-            if reason is not None:
-               order.cancellation_reason = reason
             order.save()
 
             # FIX (B29): refunded_at timestamp gives a real, checkable
@@ -846,10 +968,31 @@ class OrderCancelView(APIView):
         # notification at all, unlike the admin-initiated path — so the
         # customer had nothing confirming the cancellation actually
         # registered on their side.
+        # FIX (Notification Triggers Addendum, Item 16 cross-check): this
+        # call was missing store=order.store, so in a multi-store setup
+        # create_notification()'s fallback (Store.objects.first()) could
+        # tag it to the wrong store. Passing it explicitly, same as every
+        # other caller in this file.
         create_notification(
             user=request.user,
+            store=order.store,
             title="Order cancelled",
             message=f"Your order {order.order_number} has been cancelled.",
+            notification_type="order",
+            reference_type="order",
+            reference_id=order.order_number,
+        )
+
+        # NEW (Notification Triggers Addendum, Item 16): "Order cancelled
+        # by customer" — the store's admin must also be notified, since
+        # it affects their stock/fulfillment. This is IN ADDITION to the
+        # customer-facing notification above; both fire on this same
+        # call.
+        create_notification(
+            user=order.store.owner,
+            store=order.store,
+            title="Order cancelled by customer",
+            message=f"Order {order.order_number} was cancelled by the customer.",
             notification_type="order",
             reference_type="order",
             reference_id=order.order_number,
@@ -928,6 +1071,7 @@ class AdminOrderStatusUpdateView(APIView):
         serializer.is_valid(raise_exception=True)
 
         new_status = serializer.validated_data["status"]
+        old_status = order.status
 
         if order.status == "delivered" and new_status == "cancelled":
             return Response(
@@ -954,10 +1098,12 @@ class AdminOrderStatusUpdateView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        suggested_alternatives = {}
+        suggested_alternatives = []
         was_paid_before_cancel = False
+        order_is_being_cancelled = False
 
         if new_status == "cancelled" and order.status != "cancelled":
+            order_is_being_cancelled = True
             # FIX (B27): reason is now mandatory for admin cancellations
             # (enforced in AdminOrderStatusSerializer.validate) and gets
             # stored on the order so there's a permanent record of why.
@@ -971,11 +1117,12 @@ class AdminOrderStatusUpdateView(APIView):
             suggested_alternatives = suggest_alternatives_for_order(order)
 
             with transaction.atomic():
-                # FIX (stock race-condition + B59): same shared, locked,
-                # audited helper as the customer-facing cancel view — and
-                # it's a no-op if this order's stock was never deducted
-                # (i.e. it was cancelled before payment was ever confirmed).
-                restore_stock_for_order(order, user=request.user)
+                # FIX (Cross-check, Sep 2026): same fix as the customer-
+                # facing cancel view — release_reserved_stock_for_order()
+                # is the correct helper here, not the dead old-schema
+                # restore_stock_for_order() (product.stock no longer
+                # exists on this schema).
+                release_reserved_stock_for_order(order)
 
                 if hasattr(order, "payment"):
                     was_paid_before_cancel = order.payment.status == "paid"
@@ -996,27 +1143,28 @@ class AdminOrderStatusUpdateView(APIView):
         order.save()
 
         status_titles = {
-            "pending_payment": "Awaiting Payment",
-            "confirmed": "Order confirmed",
-            "shipped": "Order shipped",
-            "out_for_delivery": "Out for delivery",
-            "delivered": "Order delivered",
-            "cancelled": "Order cancelled",
-        }
+    "pending_payment": "Awaiting Payment",
+    "confirmed": "Order confirmed",
+    "shipped": "Order shipped",
+    "out_for_delivery": "Out for delivery",
+    "delivered": "Order delivered",
+    "cancelled": "Order cancelled",
+}
 
         status_messages = {
-            "pending_payment": f"Your order {order.order_number} is awaiting payment.",
-            "confirmed": f"Order {order.order_number} has been confirmed.",
-            "shipped": f"Order {order.order_number} has been shipped.",
-            "out_for_delivery": f"Order {order.order_number} is out for delivery.",
-            "delivered": f"Order {order.order_number} has been delivered.",
-            "cancelled": (
-                f"Order {order.order_number} has been cancelled. "
-                f"Reason: {order.cancellation_reason}."
-                if order.cancellation_reason
-                else f"Order {order.order_number} has been cancelled."
-            ),
-        }
+    "pending_payment": f"Your order {order.order_number} is awaiting payment.",
+    "confirmed": f"Order {order.order_number} has been confirmed.",
+    "shipped": f"Order {order.order_number} has been shipped.",
+    "out_for_delivery": f"Order {order.order_number} is out for delivery.",
+    "delivered": f"Order {order.order_number} has been delivered.",
+    "cancelled": (
+        f"Order {order.order_number} has been cancelled. "
+        f"Reason: {order.cancellation_reason}."
+        if order.cancellation_reason
+        else f"Order {order.order_number} has been cancelled."
+    ),
+}
+
 
         # FIX (B28): this notification already existed and already fires
         # correctly on every admin status change (including cancellation)
@@ -1035,8 +1183,27 @@ class AdminOrderStatusUpdateView(APIView):
         if new_status == "cancelled" and was_paid_before_cancel:
             send_refund_confirmation_email(order)
 
+        # FIX (Frontend Bug Report — Audit Logs, Sep 2026): no admin write
+        # endpoint besides Adjust Stock was writing to the shared AuditLog
+        # table (API 82 / System Activity Logs). Logged here now.
+        log_admin_action(
+            store=order.store,
+            user=request.user,
+            action="update_order_status",
+            entity="order",
+            entity_id=order.id,
+            old_data={"status": old_status},
+            new_data={"status": order.status, "tracking_number": order.tracking_number},
+            request=request,
+        )
+
         response_data = OrderDetailSerializer(order).data
-        if suggested_alternatives:
+
+        # FIX (Ask 1, Frontend Clarification — Suggested Alternatives):
+        # always attach the key whenever this request cancelled the order,
+        # even if there was nothing to suggest, so the frontend never has
+        # to special-case a missing field — just an empty list.
+        if order_is_being_cancelled:
             response_data["suggested_alternatives"] = suggested_alternatives
 
         return Response(response_data)

@@ -16,6 +16,7 @@ from .serializers import (
     StockAdjustSerializer,
 )
 from apps.users.permissions import IsAdmin
+from apps.ai.audit import log_manual_admin_action as log_admin_action
 from core.pagination import StandardResultsPagination
 
 
@@ -95,6 +96,22 @@ class ProductViewSet(viewsets.ModelViewSet):
             ]
         )
 
+        # FIX (Frontend Bug Report — Audit Logs, Sep 2026): Create/Update/
+        # Delete Product never wrote to the shared AuditLog table that
+        # powers Admin — List Audit Logs (API 82) and the System Activity
+        # Logs widget — only Adjust Stock did (and to a different,
+        # product-specific StockMovement table). Logged here now.
+        log_admin_action(
+            store=instance.store,
+            user=self.request.user,
+            action="delete_product",
+            entity="product",
+            entity_id=instance.id,
+            old_data={"name": instance.name, "is_active": True, "is_delete": False},
+            new_data={"name": instance.name, "is_active": False, "is_delete": True},
+            request=self.request,
+        )
+
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -110,6 +127,20 @@ class ProductViewSet(viewsets.ModelViewSet):
                 is_primary=True,
             )
 
+        log_admin_action(
+            store=product.store,
+            user=request.user,
+            action="create_product",
+            entity="product",
+            entity_id=product.id,
+            new_data={
+                "name": product.name,
+                "price": str(product.price),
+                "total_stock": product.total_stock,
+            },
+            request=request,
+        )
+
         response_serializer = ProductDetailSerializer(
             product,
             context={"request": request},
@@ -118,6 +149,40 @@ class ProductViewSet(viewsets.ModelViewSet):
         return Response(
             response_serializer.data,
             status=status.HTTP_201_CREATED,
+        )
+
+    # FIX (Frontend Bug Report — Audit Logs, Sep 2026): this is the method
+    # ModelViewSet.update() actually calls — the "update" method defined
+    # further below is dead code (it's nested inside create() above due to
+    # an indentation bug, so it never runs; the default
+    # UpdateModelMixin.update() handles PUT/PATCH instead, which calls
+    # perform_update()). Logs the update here rather than relying on that
+    # dead code path.
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        old_data = {
+            "name": instance.name,
+            "price": str(instance.price),
+            "total_stock": instance.total_stock,
+            "is_active": instance.is_active,
+        }
+
+        product = serializer.save()
+
+        log_admin_action(
+            store=product.store,
+            user=self.request.user,
+            action="update_product",
+            entity="product",
+            entity_id=product.id,
+            old_data=old_data,
+            new_data={
+                "name": product.name,
+                "price": str(product.price),
+                "total_stock": product.total_stock,
+                "is_active": product.is_active,
+            },
+            request=self.request,
         )
 
         def update(self, request, *args, **kwargs):

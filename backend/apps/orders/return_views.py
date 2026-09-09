@@ -12,6 +12,7 @@ from apps.returns.serializers import (
     AdminReturnStatusSerializer,
 )
 from apps.notifications.utils import create_notification
+from apps.ai.audit import log_manual_admin_action as log_admin_action
 from .models import Order
 from apps.users.permissions import IsAdmin
 from core.pagination import StandardResultsPagination
@@ -61,6 +62,21 @@ class CreateReturnView(APIView):
             customer=order.customer,
             reason=serializer.validated_data["reason"],
             status="pending",
+        )
+
+        # NEW (Notification Triggers Addendum, Item 15): "New return
+        # request" — the store's admin must be notified.
+        create_notification(
+            user=order.store.owner,
+            store=order.store,
+            title="New return request",
+            message=(
+                f"A return request has been submitted for order "
+                f"{order.order_number}."
+            ),
+            notification_type="order",
+            reference_type="return",
+            reference_id=return_request.id,
         )
 
         return Response(
@@ -177,6 +193,7 @@ class AdminReturnStatusUpdateView(APIView):
         serializer = AdminReturnStatusSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        old_status = return_request.status
         return_request.status = serializer.validated_data["status"]
         return_request.resolved_at = timezone.now()
         return_request.save()
@@ -208,6 +225,20 @@ class AdminReturnStatusUpdateView(APIView):
             notification_type="order",
             reference_type="return",
             reference_id=return_request.id,
+        )
+
+        # FIX (Frontend Bug Report — Audit Logs, Sep 2026): no admin write
+        # endpoint besides Adjust Stock was writing to the shared AuditLog
+        # table (API 82 / System Activity Logs). Logged here now.
+        log_admin_action(
+            store=return_request.order.store,
+            user=request.user,
+            action="update_return_status",
+            entity="return",
+            entity_id=return_request.id,
+            old_data={"status": old_status},
+            new_data={"status": return_request.status},
+            request=request,
         )
 
         return Response(

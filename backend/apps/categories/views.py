@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from .models import Category
 from .serializers import CategorySerializer
 from apps.users.permissions import IsAdmin
+from apps.ai.audit import log_manual_admin_action as log_admin_action
 
 
 class CategoryViewSet(viewsets.ModelViewSet):
@@ -120,6 +121,36 @@ class CategoryViewSet(viewsets.ModelViewSet):
             is_delete=False,
         )
 
+        # FIX (Frontend Bug Report — Audit Logs, Sep 2026): no admin write
+        # endpoint besides Adjust Stock was writing to the shared AuditLog
+        # table (API 82 / System Activity Logs). Logged here now.
+        log_admin_action(
+            store=user_store,
+            user=self.request.user,
+            action="create_category",
+            entity="category",
+            entity_id=serializer.instance.id,
+            new_data={"name": serializer.instance.name},
+            request=self.request,
+        )
+
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        old_data = {"name": instance.name, "is_active": instance.is_active}
+
+        category = serializer.save()
+
+        log_admin_action(
+            store=category.store,
+            user=self.request.user,
+            action="update_category",
+            entity="category",
+            entity_id=category.id,
+            old_data=old_data,
+            new_data={"name": category.name, "is_active": category.is_active},
+            request=self.request,
+        )
+
     def perform_destroy(self, instance):
         """
         Soft delete category.
@@ -130,6 +161,17 @@ class CategoryViewSet(viewsets.ModelViewSet):
 
         instance.save(
             update_fields=["is_active", "is_delete"]
+        )
+
+        log_admin_action(
+            store=instance.store,
+            user=self.request.user,
+            action="delete_category",
+            entity="category",
+            entity_id=instance.id,
+            old_data={"name": instance.name, "is_active": True},
+            new_data={"name": instance.name, "is_active": False},
+            request=self.request,
         )
 
     def destroy(self, request, *args, **kwargs):

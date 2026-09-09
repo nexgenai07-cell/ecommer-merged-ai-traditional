@@ -8,6 +8,7 @@ from .discount_serializers import (
     DiscountValidateSerializer,
 )
 from apps.users.permissions import IsAdmin
+from apps.ai.audit import log_manual_admin_action as log_admin_action
 
 # Handles complete CRUD operations for discount coupons.
 # Only admin users can create, update, view, or soft delete discounts.
@@ -63,6 +64,39 @@ class DiscountViewSet(viewsets.ModelViewSet):
         "-created_at"
     )
 
+    # FIX (Frontend Bug Report — Audit Logs, Sep 2026): no admin write
+    # endpoint besides Adjust Stock was writing to the shared AuditLog
+    # table (API 82 / System Activity Logs). Logged for create/update/
+    # delete here now.
+    def perform_create(self, serializer):
+        discount = serializer.save()
+        log_admin_action(
+            store=discount.store,
+            user=self.request.user,
+            action="create_discount",
+            entity="discount",
+            entity_id=discount.id,
+            new_data={"code": discount.code, "type": discount.type, "value": str(discount.value)},
+            request=self.request,
+        )
+
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        old_data = {"code": instance.code, "value": str(instance.value), "is_active": instance.is_active}
+
+        discount = serializer.save()
+
+        log_admin_action(
+            store=discount.store,
+            user=self.request.user,
+            action="update_discount",
+            entity="discount",
+            entity_id=discount.id,
+            old_data=old_data,
+            new_data={"code": discount.code, "value": str(discount.value), "is_active": discount.is_active},
+            request=self.request,
+        )
+
     # Performs a soft delete by marking the discount inactive
     # instead of permanently removing it from the database.
     def perform_destroy(self, instance):
@@ -84,6 +118,17 @@ class DiscountViewSet(viewsets.ModelViewSet):
         "updated_at",
     ]
 )
+
+        log_admin_action(
+            store=instance.store,
+            user=self.request.user,
+            action="delete_discount",
+            entity="discount",
+            entity_id=instance.id,
+            old_data={"code": instance.code, "is_active": True},
+            new_data={"code": instance.code, "is_active": False},
+            request=self.request,
+        )
 
 
 # Validates coupon codes submitted during checkout

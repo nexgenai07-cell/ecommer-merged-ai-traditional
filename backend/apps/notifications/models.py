@@ -44,6 +44,7 @@ class Notification(models.Model):
         ("order", "Order"),
         ("return", "Return"),
         ("complaint", "Complaint"),
+        ("product", "Product"),
     ],
     null=True,
     blank=True,

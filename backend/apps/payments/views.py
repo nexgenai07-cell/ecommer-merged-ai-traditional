@@ -1,11 +1,13 @@
 import stripe
 from decimal import Decimal, ROUND_HALF_UP
 import hashlib
-import cloudinary.uploader
+import os
 
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
 
 from rest_framework import status, permissions
 from rest_framework.views import APIView
@@ -20,6 +22,7 @@ from apps.orders.views import deduct_stock_for_order, confirm_stock_for_order
 from apps.users.permissions import IsAdmin
 from apps.stores.models import Store
 from apps.notifications.utils import create_notification
+from apps.ai.audit import log_manual_admin_action as log_admin_action
 from core.pagination import StandardResultsPagination
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
@@ -248,20 +251,15 @@ class StripeWebhookView(APIView):
 class QRProofUploadView(APIView):
     """
     POST /api/v1/payments/qr/proof/
-
     Request (multipart/form-data):
         - order_number: string (required)
         - screenshot: file (image, required)
         - transaction_id: string (optional)
 
-    Effect:
-        - payment.status -> under_review
-        - order.status stays pending_payment
-        - No stock change
-        - Screenshot is uploaded directly to Cloudinary
-        - Full Cloudinary HTTPS URL is stored in qr_screenshot_url
+    Effect: payment.status -> under_review
+            order.status stays pending_payment
+            No stock change (stays reserved)
     """
-
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
@@ -269,9 +267,6 @@ class QRProofUploadView(APIView):
         screenshot = request.FILES.get("screenshot")
         transaction_id = request.data.get("transaction_id", "")
 
-        # ---------------------------------------------------------
-        # 1. Validate required fields
-        # ---------------------------------------------------------
         if not order_number:
             return Response(
                 {"error": "order_number is required"},
@@ -284,18 +279,13 @@ class QRProofUploadView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ---------------------------------------------------------
-        # 2. Validate screenshot file
-        # ---------------------------------------------------------
-        if not screenshot.content_type or not screenshot.content_type.startswith("image/"):
+        # Check if image is valid
+        if not screenshot.content_type.startswith("image/"):
             return Response(
                 {"error": "File must be an image"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ---------------------------------------------------------
-        # 3. Find customer's order
-        # ---------------------------------------------------------
         try:
             order = Order.objects.get(
                 order_number=order_number,
@@ -307,150 +297,123 @@ class QRProofUploadView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # ---------------------------------------------------------
-        # 4. Get payment
-        # ---------------------------------------------------------
         payment = getattr(order, "payment", None)
-
         if payment is None:
             return Response(
                 {"error": "This order has no payment record."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ---------------------------------------------------------
-        # 5. Make sure this is a QR payment
-        # ---------------------------------------------------------
+        # QR payment only
         if payment.payment_method != "qr":
             return Response(
                 {"error": "This order is not a QR payment order."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ---------------------------------------------------------
-        # 6. Prevent proof upload for already-paid orders
-        # ---------------------------------------------------------
+        # Check if order is already paid
         if payment.status == "paid":
             return Response(
                 {"error": "This order has already been paid."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ---------------------------------------------------------
-        # 7. Prevent upload for cancelled orders
-        # ---------------------------------------------------------
+        # Check if order is cancelled
         if order.status == "cancelled":
             return Response(
                 {"error": "This order has been cancelled."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # ============================================================
+        # Duplicate proof detection (Part 3.6)
+        # ============================================================
         duplicate_warning = False
 
-        # ---------------------------------------------------------
-        # 8. Calculate image hash
-        # ---------------------------------------------------------
+        # Hash the screenshot file
         file_hash = hashlib.sha256(screenshot.read()).hexdigest()
+        screenshot.seek(0)  # Reset file pointer
 
-        # Reset file pointer after reading for hash
-        screenshot.seek(0)
-
-        # ---------------------------------------------------------
-        # 9. Check duplicate screenshot
-        # ---------------------------------------------------------
+        # Check for duplicate image hash
         duplicate_by_hash = Payment.objects.filter(
             qr_image_hash=file_hash,
             order__isnull=False,
-        ).exclude(
-            order=order
-        ).exists()
+        ).exclude(order=order).exists()
 
-        # ---------------------------------------------------------
-        # 10. Check duplicate transaction ID
-        # ---------------------------------------------------------
+        # Check for duplicate transaction_id
         duplicate_by_transaction = False
-
         if transaction_id:
             duplicate_by_transaction = Payment.objects.filter(
                 qr_transaction_id=transaction_id,
                 order__isnull=False,
-            ).exclude(
-                order=order
-            ).exists()
+            ).exclude(order=order).exists()
 
         if duplicate_by_hash or duplicate_by_transaction:
             duplicate_warning = True
 
-        # ---------------------------------------------------------
-        # 11. Upload screenshot directly to Cloudinary
-        # ---------------------------------------------------------
-        try:
-            upload_result = cloudinary.uploader.upload(
-                screenshot,
-                folder="qr_proofs",
-                public_id=(
-                    f"{order_number}_"
-                    f"{timezone.now().strftime('%Y%m%d%H%M%S%f')}"
-                ),
-                resource_type="image",
-            )
+        # ============================================================
+        # Save screenshot
+        # ============================================================
+        # Generate unique filename
+        ext = os.path.splitext(screenshot.name)[1]
+        filename = f"qr_proofs/{order_number}_{timezone.now().strftime('%Y%m%d%H%M%S')}{ext}"
+        file_path = default_storage.save(filename, ContentFile(screenshot.read()))
+        screenshot_url = default_storage.url(file_path)
 
-            screenshot_url = upload_result["secure_url"]
-
-        except Exception as e:
-            return Response(
-                {
-                    "error": "Failed to upload payment screenshot.",
-                    "details": str(e),
-                },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-        # ---------------------------------------------------------
-        # 12. Update payment record
-        # ---------------------------------------------------------
+        # ============================================================
+        # Update payment
+        # ============================================================
         payment.status = "under_review"
         payment.qr_screenshot_url = screenshot_url
         payment.qr_transaction_id = transaction_id or None
         payment.qr_submitted_at = timezone.now()
         payment.qr_image_hash = file_hash
         payment.qr_duplicate_warning = duplicate_warning
-
-        # Clear previous rejection reason on re-upload
-        payment.qr_reject_reason = None
-
+        payment.qr_reject_reason = None  # Clear previous rejection reason
         payment.save()
 
-        # ---------------------------------------------------------
-        # 13. Create notification
-        # ---------------------------------------------------------
+        # ============================================================
+        # Notification to customer
+        # ============================================================
         create_notification(
             user=request.user,
             store=order.store,
             title="QR Payment Proof Submitted",
-            message=(
-                f"Your payment proof for order #{order_number} "
-                "has been submitted and is under review."
-            ),
+            message=f"Your payment proof for order #{order_number} has been submitted and is under review.",
             notification_type="system",
             reference_type="order",
             reference_id=order_number,
         )
 
-        # ---------------------------------------------------------
-        # 14. Return Cloudinary URL
-        # ---------------------------------------------------------
-        return Response(
-            {
-                "order_number": order_number,
-                "payment": {
-                    "status": "under_review",
-                    "screenshot_url": screenshot_url,
-                },
-                "duplicate_warning": duplicate_warning,
-            },
-            status=status.HTTP_200_OK,
+        # NEW (Notification Triggers Addendum, Item 14): "New QR payment
+        # proof submitted" — the store's admin must also be notified,
+        # separately from the customer notification above.
+        create_notification(
+            user=order.store.owner,
+            store=order.store,
+            title="New QR payment proof submitted",
+            message=(
+                f"Order {order_number} has a new payment screenshot "
+                "awaiting verification."
+            ),
+            notification_type="order",
+            reference_type="order",
+            reference_id=order_number,
         )
+
+        # ============================================================
+        # Response
+        # ============================================================
+        return Response({
+            "order_number": order_number,
+            "payment": {
+                "status": "under_review",
+                "screenshot_url": screenshot_url,
+            },
+            "duplicate_warning": duplicate_warning,
+        }, status=status.HTTP_200_OK)
+
+
 class AdminQRPaymentPendingView(APIView):
     """
     GET /api/v1/admin/payments/qr/pending/
@@ -576,6 +539,20 @@ class AdminQRPaymentApproveView(APIView):
             reference_id=order_number,
         )
 
+        # FIX (Frontend Bug Report — Audit Logs, Sep 2026): no admin write
+        # endpoint besides Adjust Stock was writing to the shared AuditLog
+        # table (API 82 / System Activity Logs). Logged here now.
+        log_admin_action(
+            store=order.store,
+            user=request.user,
+            action="approve_qr_payment",
+            entity="payment",
+            entity_id=payment.id,
+            old_data={"status": "under_review"},
+            new_data={"status": "paid"},
+            request=request,
+        )
+
         return Response({
             "order_number": order_number,
             "payment_status": "paid",
@@ -654,6 +631,17 @@ class AdminQRPaymentRejectView(APIView):
             notification_type="system",
             reference_type="order",
             reference_id=order_number,
+        )
+
+        log_admin_action(
+            store=order.store,
+            user=request.user,
+            action="reject_qr_payment",
+            entity="payment",
+            entity_id=payment.id,
+            old_data={"status": "under_review"},
+            new_data={"status": "rejected", "reason": reason},
+            request=request,
         )
 
         return Response({

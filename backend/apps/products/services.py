@@ -2,6 +2,35 @@ from django.db import transaction
 from django.db.models import F
 
 from .models import Product, StockMovement
+from apps.notifications.utils import create_notification
+
+
+# NEW (Notification Triggers Addendum, Item 17): "Low stock alert".
+# Fires the moment a product's available_stock (total_stock -
+# reserved_stock) crosses at/below its own low_stock_threshold — only on
+# the crossing (old value above the threshold, new value at/below it),
+# never repeatedly while stock stays low. Called from both places
+# available_stock can actually move: reserve_stock_for_order() in
+# apps/orders/views.py (checkout reserves stock, which is where
+# available_stock genuinely drops) and adjust_stock() below (manual
+# stock adjustment, API 33). Notified user is always the owning store's
+# admin/owner (store.owner) — never the customer, never a broadcast.
+def check_low_stock_notification(product, old_available, new_available):
+    threshold = product.low_stock_threshold
+
+    if old_available > threshold and new_available <= threshold:
+        create_notification(
+            user=product.store.owner,
+            store=product.store,
+            title="Low stock alert",
+            message=(
+                f"{product.name} is running low on stock "
+                f"({new_available} left, threshold: {threshold})."
+            ),
+            notification_type="system",
+            reference_type="product",
+            reference_id=product.id,
+        )
 
 
 # Safely updates product stock and records every stock movement.
@@ -69,6 +98,16 @@ def adjust_stock(
             delta=delta,
             reason=reason,
             note=note,
+        )
+
+        # NEW (Notification Triggers Addendum, Item 17): reserved_stock is
+        # never touched by this endpoint, so available_stock moves 1:1
+        # with total_stock here — check for a threshold crossing after
+        # the update.
+        check_low_stock_notification(
+            product,
+            old_available=previous_stock - product.reserved_stock,
+            new_available=product.total_stock - product.reserved_stock,
         )
 
         # ============================================================
