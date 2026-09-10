@@ -1,3 +1,5 @@
+# PATH: apps/payments/views.py
+
 import stripe
 from decimal import Decimal, ROUND_HALF_UP
 import hashlib
@@ -201,17 +203,17 @@ class StripeWebhookView(APIView):
                     # Notification
                     # Notification: Stripe payment confirmed
                     create_notification(
-    user=order.customer.user,
-    store=order.store,
-    title="Payment confirmed",
-    message=(
-        f"Payment for order {order.order_number} has been confirmed. "
-        "Your order is now being processed."
-    ),
-    notification_type="order",
-    reference_type="order",
-    reference_id=order.order_number,
-)
+                        user=order.customer.user,
+                        store=order.store,
+                        title="Payment confirmed",
+                        message=(
+                            f"Payment for order {order.order_number} has been confirmed. "
+                            "Your order is now being processed."
+                        ),
+                        notification_type="order",
+                        reference_type="order",
+                        reference_id=order.order_number,
+                    )
 
             except Order.DoesNotExist:
                 pass
@@ -388,18 +390,23 @@ class QRProofUploadView(APIView):
         # NEW (Notification Triggers Addendum, Item 14): "New QR payment
         # proof submitted" — the store's admin must also be notified,
         # separately from the customer notification above.
-        create_notification(
-            user=order.store.owner,
-            store=order.store,
-            title="New QR payment proof submitted",
-            message=(
-                f"Order {order_number} has a new payment screenshot "
-                "awaiting verification."
-            ),
-            notification_type="order",
-            reference_type="order",
-            reference_id=order_number,
-        )
+        #
+        # UPDATED (v4.0): store.owner removed — a store now has multiple,
+        # equal admins (store.admins M2M) instead of one owner. Notify
+        # every admin of the store instead of a single owner.
+        for admin in order.store.admins.all():
+            create_notification(
+                user=admin,
+                store=order.store,
+                title="New QR payment proof submitted",
+                message=(
+                    f"Order {order_number} has a new payment screenshot "
+                    "awaiting verification."
+                ),
+                notification_type="order",
+                reference_type="order",
+                reference_id=order_number,
+            )
 
         # ============================================================
         # Response

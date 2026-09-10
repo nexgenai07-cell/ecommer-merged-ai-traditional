@@ -53,7 +53,14 @@ def log_admin_action(user, tool_name: str, payload: dict, result: dict):
                     entity_id = result[key].get('id')
                     break
 
-        store = user.stores.first() if hasattr(user, 'stores') else None
+        # UPDATED (v4.0): related_name changed from 'stores' to
+        # 'administered_stores' now that a store has multiple, equal
+        # admins (Store.admins M2M) instead of a single owner. The old
+        # 'stores' attribute never existed post-refactor, so hasattr()
+        # was silently False every time and this always fell through to
+        # Store.objects.first() — a random/first store, not the acting
+        # admin's own store. Fixed to check the real attribute.
+        store = user.administered_stores.first() if hasattr(user, 'administered_stores') else None
         if store is None:
             store = Store.objects.first()
 

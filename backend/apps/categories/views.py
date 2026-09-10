@@ -1,3 +1,5 @@
+# PATH: apps/categories/views.py
+
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
@@ -101,7 +103,10 @@ class CategoryViewSet(viewsets.ModelViewSet):
         with is_active=True and is_delete=False.
         """
 
-        user_store = self.request.user.stores.first()
+        # UPDATED (v4.0): related_name changed from 'stores' to
+        # 'administered_stores' now that a store has multiple, equal
+        # admins (Store.admins M2M) instead of a single owner.
+        user_store = self.request.user.administered_stores.first()
 
         if not user_store:
             from rest_framework.exceptions import ValidationError

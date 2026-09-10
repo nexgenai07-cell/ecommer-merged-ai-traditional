@@ -11,10 +11,16 @@ class Store(models.Model):
         ('enterprise', 'Enterprise'),
     ]
 
-    owner      = models.ForeignKey(
+    # UPDATED (v4.0): owner (single ForeignKey) removed — a store can now
+    # have multiple, equal admins instead of one primary owner. Any user
+    # with role='admin' already has full dashboard access (IsAdmin
+    # permission is role-based, not tied to this field) — this field is
+    # used purely to decide who receives store-level notifications (new
+    # orders, payments, complaints, low stock, etc.).
+    admins     = models.ManyToManyField(
                     settings.AUTH_USER_MODEL,
-                    on_delete=models.PROTECT,
-                    related_name='stores',
+                    related_name='administered_stores',
+                    blank=True,
                  )
     name       = models.CharField(max_length=255)
     logo = models.ImageField(

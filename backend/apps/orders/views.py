@@ -25,6 +25,7 @@ from rest_framework.response import Response
 from core.pagination import StandardResultsPagination
 from apps.notifications.utils import (
     create_notification,
+    notify_store_admins,
     send_order_confirmation_email,
     send_refund_confirmation_email,
 )
@@ -718,13 +719,15 @@ class CheckoutView(APIView):
             )
 
         # NEW (Notification Triggers Addendum, Item 12): "New order
-        # placed" — the store's admin/owner must also be notified,
-        # separately from the customer notification above. Same
+        # placed" — every admin of the store must also be notified,
+        # separately from the customer notification above.
+        # UPDATED (v4.0): store.owner removed — routed to all of the
+        # store's admins via notify_store_admins() instead. Same
         # non-critical-side-effect handling: never allowed to break the
         # checkout response.
         try:
-            create_notification(
-                user=order.store.owner,
+            notify_store_admins(
+                order.store,
                 title="New order received",
                 message=(
                     f"Order {order.order_number} has been placed and is "
@@ -733,7 +736,6 @@ class CheckoutView(APIView):
                 notification_type="order",
                 reference_type="order",
                 reference_id=order.order_number,
-                store=order.store,
             )
         except Exception:
             logger.exception(
@@ -984,13 +986,14 @@ class OrderCancelView(APIView):
         )
 
         # NEW (Notification Triggers Addendum, Item 16): "Order cancelled
-        # by customer" — the store's admin must also be notified, since
-        # it affects their stock/fulfillment. This is IN ADDITION to the
-        # customer-facing notification above; both fire on this same
+        # by customer" — every admin of the store must also be notified,
+        # since it affects their stock/fulfillment. This is IN ADDITION to
+        # the customer-facing notification above; both fire on this same
         # call.
-        create_notification(
-            user=order.store.owner,
-            store=order.store,
+        # UPDATED (v4.0): store.owner removed — routed to all of the
+        # store's admins via notify_store_admins() instead.
+        notify_store_admins(
+            order.store,
             title="Order cancelled by customer",
             message=f"Order {order.order_number} was cancelled by the customer.",
             notification_type="order",

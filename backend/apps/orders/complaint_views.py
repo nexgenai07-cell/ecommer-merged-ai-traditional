@@ -1,3 +1,5 @@
+# PATH: apps/orders/complaint_views.py
+
 import re
 
 from django.contrib.auth import get_user_model
@@ -15,7 +17,7 @@ from apps.returns.complaint_serializers import (
     AdminComplaintStatusSerializer,
     AdminComplaintRespondSerializer,
 )
-from apps.notifications.utils import create_notification
+from apps.notifications.utils import create_notification, notify_store_admins
 from .models import Order, Customer
 from apps.users.permissions import IsAdmin
 from apps.ai.audit import log_manual_admin_action as log_admin_action
@@ -105,10 +107,10 @@ class CreateComplaintView(generics.ListCreateAPIView):
         )
 
         # NEW (Notification Triggers Addendum, Item 13): "New complaint
-        # filed" — the store's admin must be notified. If the complaint
-        # has an order attached, that order's store is used; otherwise
-        # fall back to the store the complaint's own customer profile
-        # belongs to. Note: in this codebase a Customer profile is
+        # filed" — every admin of the store must be notified. If the
+        # complaint has an order attached, that order's store is used;
+        # otherwise fall back to the store the complaint's own customer
+        # profile belongs to. Note: in this codebase a Customer profile is
         # already store-scoped (one profile per user per store, created
         # on that customer's first order in that store — see
         # get_or_create_customer), so customer.store always resolves the
@@ -117,6 +119,12 @@ class CreateComplaintView(generics.ListCreateAPIView):
         # occur here, since CreateComplaintView already requires an
         # existing Customer profile (see the "Place an order first" check
         # above) before a complaint can be filed at all.
+        #
+        # UPDATED (v4.0): a store can now have multiple admins (see the
+        # multi-admin migration) instead of a single owner — every admin
+        # currently assigned to the store now receives this notification,
+        # via notify_store_admins() instead of a single create_notification()
+        # call to store.owner.
         target_store = order.store if order else customer.store
 
         if complaint.order:
@@ -127,9 +135,8 @@ class CreateComplaintView(generics.ListCreateAPIView):
         else:
             complaint_message = f"Complaint #{complaint.id} has been filed."
 
-        create_notification(
-            user=target_store.owner,
-            store=target_store,
+        notify_store_admins(
+            target_store,
             title="New complaint filed",
             message=complaint_message,
             notification_type="system",
@@ -232,6 +239,13 @@ class ComplaintMessageView(APIView):
 
     # Adds one private complaint-thread message and creates exactly one
     # notification for the party that did not send that message.
+    #
+    # NOTE (v4.0): unlike the store-wide notifications above, a reply here
+    # is still routed to ONE specific person on purpose — either the
+    # customer, or the admin already handling this complaint (or a
+    # fallback admin) — not to every admin of the store. This did not use
+    # store.owner before and does not need to change for the multi-admin
+    # update.
     def post(self, request, pk):
         complaint, error_response = self._get_complaint_for_user(request, pk)
         if error_response:
@@ -324,8 +338,13 @@ class AdminComplaintStatusUpdateView(APIView):
         # table (API 82 / System Activity Logs). Logged here now.
         # complaint.order can be null (a complaint isn't always tied to an
         # order), so fall back to the acting admin's own store in that case.
+        #
+        # UPDATED (v4.0): request.user.stores no longer exists — that
+        # related_name came from the old Store.owner ForeignKey, which has
+        # been removed in favour of Store.admins (a ManyToManyField). The
+        # equivalent lookup is now request.user.administered_stores.
         log_admin_action(
-            store=complaint.order.store if complaint.order else request.user.stores.first(),
+            store=complaint.order.store if complaint.order else request.user.administered_stores.first(),
             user=request.user,
             action="update_complaint_status",
             entity="complaint",

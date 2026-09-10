@@ -1,3 +1,5 @@
+# PATH: apps/products/serializers.py
+
 from rest_framework import serializers
 from .models import Product, ProductImage, ProductHistory, StockMovement
 
@@ -242,7 +244,10 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
     # Creates a new product and assigns it to the logged-in user's store.
     def create(self, validated_data):
         request = self.context["request"]
-        validated_data["store"] = request.user.stores.first()
+        # UPDATED (v4.0): related_name changed from 'stores' to
+        # 'administered_stores' now that a store has multiple, equal
+        # admins (Store.admins M2M) instead of a single owner.
+        validated_data["store"] = request.user.administered_stores.first()
 
         category_id = validated_data.pop("category_id", None)
         if category_id:

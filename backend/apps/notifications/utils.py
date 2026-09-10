@@ -50,6 +50,26 @@ def create_notification(
         return None
 
 
+# Ye function existing create_notification() ke NEECHE add karo, usko touch mat karna
+
+def notify_store_admins(store, **kwargs):
+    """
+    UPDATED (v4.0): sends the same notification to every admin currently
+    assigned to a store (Store.admins — a ManyToManyField, see the
+    multi-admin migration). Replaces the old single store.owner
+    recipient, since a store can now have zero, one, or many admins.
+
+    If a store has no admins assigned yet, this silently does nothing —
+    same philosophy as create_notification() itself: a notification is a
+    side effect and must never break the real action that triggered it.
+    """
+    if store is None:
+        return
+
+    for admin_user in store.admins.all():
+        create_notification(user=admin_user, store=store, **kwargs)
+        
+
 def send_order_confirmation_email(order):
     customer = order.customer
     to_email = customer.email if customer else None

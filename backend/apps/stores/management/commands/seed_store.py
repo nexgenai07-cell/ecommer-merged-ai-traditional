@@ -38,7 +38,6 @@ class Command(BaseCommand):
         store, created = Store.objects.get_or_create(
             subdomain='main-store',
             defaults={
-                'owner': admin_user,
                 'name': 'Main Store',
                 'phone': '03000000000',
                 'address': 'Pakistan',
@@ -46,6 +45,10 @@ class Command(BaseCommand):
                 'is_active': True,
             }
         )
+
+        # UPDATED (v4.0): owner removed — admin_user ko admins M2M mein add karo
+        # .add() idempotent hai, dobara run karne par duplicate nahi banega
+        store.admins.add(admin_user)
 
         if created:
             self.stdout.write(self.style.SUCCESS(f'Store created: {store.name} (id={store.id})'))

@@ -1,3 +1,5 @@
+# PATH: apps/categories/serializers.py
+
 from rest_framework import serializers
 from .models import Category
 
@@ -36,7 +38,9 @@ class CategorySerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         request = self.context["request"]
-        validated_data["store"] = request.user.stores.first()
+        # UPDATED (v4.0): related_name changed from 'stores' to
+        # 'administered_stores' — see Store.admins M2M.
+        validated_data["store"] = request.user.administered_stores.first()
         return super().create(validated_data)
 
     def validate_name(self, value):

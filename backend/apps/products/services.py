@@ -1,3 +1,5 @@
+# PATH: apps/products/services.py
+
 from django.db import transaction
 from django.db.models import F
 
@@ -13,24 +15,29 @@ from apps.notifications.utils import create_notification
 # available_stock can actually move: reserve_stock_for_order() in
 # apps/orders/views.py (checkout reserves stock, which is where
 # available_stock genuinely drops) and adjust_stock() below (manual
-# stock adjustment, API 33). Notified user is always the owning store's
-# admin/owner (store.owner) — never the customer, never a broadcast.
+# stock adjustment, API 33).
+#
+# UPDATED (v4.0): store.owner removed — a store now has multiple, equal
+# admins (store.admins M2M) instead of one owner. Every admin of the
+# store gets notified, never the customer, never a broadcast to all
+# users.
 def check_low_stock_notification(product, old_available, new_available):
     threshold = product.low_stock_threshold
 
     if old_available > threshold and new_available <= threshold:
-        create_notification(
-            user=product.store.owner,
-            store=product.store,
-            title="Low stock alert",
-            message=(
-                f"{product.name} is running low on stock "
-                f"({new_available} left, threshold: {threshold})."
-            ),
-            notification_type="system",
-            reference_type="product",
-            reference_id=product.id,
-        )
+        for admin in product.store.admins.all():
+            create_notification(
+                user=admin,
+                store=product.store,
+                title="Low stock alert",
+                message=(
+                    f"{product.name} is running low on stock "
+                    f"({new_available} left, threshold: {threshold})."
+                ),
+                notification_type="system",
+                reference_type="product",
+                reference_id=product.id,
+            )
 
 
 # Safely updates product stock and records every stock movement.

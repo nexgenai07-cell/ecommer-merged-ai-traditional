@@ -1,3 +1,5 @@
+# PATH: apps/orders/return_views.py
+
 import re
 from django.db.models import Q
 from django.utils import timezone
@@ -11,7 +13,7 @@ from apps.returns.serializers import (
     CreateReturnSerializer,
     AdminReturnStatusSerializer,
 )
-from apps.notifications.utils import create_notification
+from apps.notifications.utils import create_notification, notify_store_admins
 from apps.ai.audit import log_manual_admin_action as log_admin_action
 from .models import Order
 from apps.users.permissions import IsAdmin
@@ -65,10 +67,13 @@ class CreateReturnView(APIView):
         )
 
         # NEW (Notification Triggers Addendum, Item 15): "New return
-        # request" — the store's admin must be notified.
-        create_notification(
-            user=order.store.owner,
-            store=order.store,
+        # request" — every admin of the store must be notified.
+        # UPDATED (v4.0): store.owner (single FK) removed — a store can
+        # now have multiple admins (Store.admins), so this now goes to
+        # all of them via notify_store_admins() instead of a single
+        # create_notification() call to store.owner.
+        notify_store_admins(
+            order.store,
             title="New return request",
             message=(
                 f"A return request has been submitted for order "
