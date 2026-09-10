@@ -118,27 +118,27 @@ class UserSession(models.Model):
 
 
 class TwoFactorAuth(models.Model):
-    # Stores the secret key and status required for two-factor authentication.
     """
-    One row per user. Stores the TOTP secret used to generate/verify the
-    6-digit codes shown in apps like Google Authenticator.
+    One row per user. Stores an emailed 6-digit OTP used for two-factor
+    authentication instead of an authenticator-app TOTP secret.
 
-    is_enabled becomes True only AFTER the user scans the QR code and
-    successfully verifies one code — this proves they actually set up
-    their authenticator app correctly before we start requiring it.
+    is_enabled becomes True only AFTER the user receives the OTP by email
+    and successfully verifies it — this proves the email address is
+    actually reachable before we start requiring 2FA on every login.
     """
-    user        = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='two_factor')
-    secret      = models.CharField(max_length=64)
-    is_enabled  = models.BooleanField(default=False)
-    created_at  = models.DateTimeField(auto_now_add=True)
+    user            = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='two_factor')
+    secret          = models.CharField(max_length=64, blank=True, null=True)  # legacy, no longer used
+    otp_code        = models.CharField(max_length=6, blank=True, null=True)
+    otp_expires_at  = models.DateTimeField(blank=True, null=True)
+    is_enabled      = models.BooleanField(default=False)
+    created_at      = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = 'two_factor_auth'
 
     def __str__(self):
         return f'2FA for {self.user.email} ({"enabled" if self.is_enabled else "pending"})'
-
-
+    
 class EmailVerification(models.Model):
     # Creates and validates email verification tokens used during account verification.
     """

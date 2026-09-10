@@ -1,91 +1,62 @@
 # PATH: apps/users/twofactor_views.py
-# This is a NEW file. Keep it separate from views.py to stay organized
-# since 2FA has its own dedicated logic.
-#
-# Required pip installs:
-#   pip install pyotp qrcode pillow
-# Handles the complete Two-Factor Authentication (2FA) process,
-# including enabling 2FA, verifying OTPs, disabling 2FA,
-# and completing secure login using OTP verification.
+# Handles email-based Two-Factor Authentication (2FA): enabling,
+# verifying setup, disabling, and completing login with an emailed OTP.
 
+import random
 from datetime import timedelta
 
-import pyotp
-import qrcode
-import io
-import base64
+from django.utils import timezone
 from rest_framework import status, permissions
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 
-
 from .models import TwoFactorAuth, User
 from .serializers import UserProfileSerializer
+from .email_service import send_2fa_code_email
 
-# Generates a unique secret key and QR code for the user to scan
-# with an authenticator app. This starts the 2FA setup process
-# but does not enable 2FA until OTP verification succeeds.
+
+def generate_otp():
+    return f"{random.randint(0, 999999):06d}"
+
+
+# Step 1 of 2FA setup: generates a 6-digit code, emails it to the user,
+# and stores it (unconfirmed) until the user verifies it.
 class Enable2FAView(APIView):
     """
     POST /api/v1/auth/2fa/enable/
 
-    Step 1 of 2FA setup. Generates a new TOTP secret and returns it as a
-    QR code (base64 image) the user scans with Google Authenticator /
-    Authy / Microsoft Authenticator etc.
-
-    IMPORTANT: This does NOT turn on 2FA yet — is_enabled stays False
-    until the user proves they scanned it correctly via Verify2FAView.
-    This prevents someone from accidentally locking themselves out if
-    the QR code never actually got scanned.
+    Sends a 6-digit code to the user's email. is_enabled stays False
+    until the code is confirmed via Verify2FAView — this prevents
+    2FA from being turned on if the email never actually arrives.
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
         user = request.user
 
-        # Generate a new secret each time enable/ is called (overwrites any
-        # previous un-confirmed attempt)
-        secret = pyotp.random_base32()
-        TwoFactorAuth.objects.update_or_create(
+        code = generate_otp()
+        two_fa, _ = TwoFactorAuth.objects.update_or_create(
             user=user,
-            defaults={'secret': secret, 'is_enabled': False}
+            defaults={
+                'otp_code': code,
+                'otp_expires_at': timezone.now() + timedelta(minutes=10),
+                'is_enabled': False,
+            }
         )
 
-        # Build the otpauth:// URI that authenticator apps understand
-        totp = pyotp.TOTP(secret)
-        provisioning_uri = totp.provisioning_uri(
-            name=user.email,
-            issuer_name='AI Commerce Platform'
-        )
-
-        # Render as a QR code image, encode as base64 so the frontend can
-        # display it directly in an <img src="data:image/png;base64,..."> tag
-        qr_img = qrcode.make(provisioning_uri)
-        buffer = io.BytesIO()
-        qr_img.save(buffer, format='PNG')
-        qr_base64 = base64.b64encode(buffer.getvalue()).decode()
+        send_2fa_code_email(user, code)
 
         return Response({
-            'message': 'Scan this QR code with your authenticator app, then call /verify/ with a code.',
-            'qr_code_base64': f'data:image/png;base64,{qr_base64}',
-            'manual_entry_key': secret,  # shown as fallback if user can't scan
+            'message': 'A verification code has been sent to your email. Enter it to enable 2FA.',
         }, status=status.HTTP_200_OK)
 
 
-# Verifies the OTP entered by the user after scanning the QR code.
-# If the OTP is valid, Two-Factor Authentication is officially enabled.
+# Step 2 of setup: verifies the code the user received by email.
 class Verify2FAView(APIView):
     """
     POST /api/v1/auth/2fa/verify/
     Request: { "otp": "123456" }
-
-    Step 2 of setup — user enters the 6-digit code currently shown in their
-    authenticator app. If it matches, 2FA is officially turned on.
-
-    This same endpoint shape is also what LOGIN would call afterwards if
-    2FA is enabled (check otp as a second step after password) — that
-    login-flow wiring is a TODO once this base setup is confirmed working.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -102,23 +73,25 @@ class Verify2FAView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        totp = pyotp.TOTP(two_fa.secret)
-        if not totp.verify(otp, valid_window=1):  # valid_window=1 allows ±30s clock drift
-            return Response({'error': 'Invalid or expired code.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not two_fa.otp_code or two_fa.otp_code != otp:
+            return Response({'error': 'Invalid code.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not two_fa.otp_expires_at or timezone.now() > two_fa.otp_expires_at:
+            return Response({'error': 'Code has expired. Please request a new one.'}, status=status.HTTP_400_BAD_REQUEST)
 
         two_fa.is_enabled = True
+        two_fa.otp_code = None
+        two_fa.otp_expires_at = None
         two_fa.save()
 
         return Response({'message': 'Two-factor authentication enabled successfully.'}, status=status.HTTP_200_OK)
 
 
-# Disables Two-Factor Authentication after confirming
-# the user's password for security.
+# Disables 2FA after confirming the user's password.
 class Disable2FAView(APIView):
     """
     POST /api/v1/auth/2fa/disable/
-    Request: { "password": "string" }  — password required as confirmation,
-    same security pattern as delete account.
+    Request: { "password": "string" }
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -132,8 +105,8 @@ class Disable2FAView(APIView):
         return Response({'message': 'Two-factor authentication disabled.'}, status=status.HTTP_200_OK)
 
 
-# Completes the login process by verifying the OTP.
-# JWT tokens are generated only after successful OTP verification.
+# Completes login by verifying the OTP that was emailed during the
+# login attempt (see the 2FA branch in views.LoginView).
 class TwoFactorLoginVerifyView(APIView):
     """
     POST /api/v1/auth/2fa/login-verify/
@@ -144,116 +117,65 @@ class TwoFactorLoginVerifyView(APIView):
         "otp": "123456",
         "remember_me": true
     }
-
-    The user_id and remember_me values come from the first login step.
-
-    Tokens are issued only after successful OTP verification.
     """
 
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        # Imported here to avoid a circular import between
-        # users/views.py and users/twofactor_views.py.
         from .views import create_session_record
 
         user_id = request.data.get("user_id")
         otp = request.data.get("otp")
 
-        # Remember Me comes from the frontend during the 2FA step.
-        remember_me = request.data.get(
-            "remember_me",
-            False
-        )
-
-        # Normalize string values in case frontend sends
-        # "true" / "false" instead of JSON boolean values.
+        remember_me = request.data.get("remember_me", False)
         if isinstance(remember_me, str):
             remember_me = remember_me.lower() == "true"
 
         if not user_id or not otp:
             return Response(
-                {
-                    "error": "user_id and otp are required."
-                },
+                {"error": "user_id and otp are required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         try:
-            user = User.objects.get(
-                id=user_id,
-                is_active=True,
-            )
+            user = User.objects.get(id=user_id, is_active=True)
         except User.DoesNotExist:
-            return Response(
-                {
-                    "error": "Invalid user."
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({"error": "Invalid user."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            two_fa = TwoFactorAuth.objects.get(
-                user=user,
-                is_enabled=True,
-            )
+            two_fa = TwoFactorAuth.objects.get(user=user, is_enabled=True)
         except TwoFactorAuth.DoesNotExist:
             return Response(
-                {
-                    "error": (
-                        "2FA is not enabled for this account."
-                    )
-                },
+                {"error": "2FA is not enabled for this account."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Verify OTP
-        totp = pyotp.TOTP(two_fa.secret)
+        if not two_fa.otp_code or two_fa.otp_code != otp:
+            return Response({"error": "Invalid code."}, status=status.HTTP_400_BAD_REQUEST)
 
-        if not totp.verify(
-            otp,
-            valid_window=1
-        ):
-            return Response(
-                {
-                    "error": "Invalid or expired code."
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        if not two_fa.otp_expires_at or timezone.now() > two_fa.otp_expires_at:
+            return Response({"error": "Code has expired. Please try logging in again."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # OTP is valid, so now issue JWT tokens.
+        # Clear the used code so it can't be replayed
+        two_fa.otp_code = None
+        two_fa.otp_expires_at = None
+        two_fa.save()
+
         refresh = RefreshToken.for_user(user)
-
-        # Remember Me controls refresh token lifetime.
         if remember_me:
-            refresh.set_exp(
-                lifetime=timedelta(days=30)
-            )
+            refresh.set_exp(lifetime=timedelta(days=30))
         else:
-            refresh.set_exp(
-                lifetime=timedelta(days=7)
-            )
+            refresh.set_exp(lifetime=timedelta(days=7))
 
         access = refresh.access_token
 
-        tokens = {
-            "access": str(access),
-            "refresh": str(refresh),
-        }
-
-        # Create login session only after successful 2FA.
-        create_session_record(
-            request,
-            user,
-            refresh,
-            access_token=access,
-        )
+        create_session_record(request, user, refresh, access_token=access)
 
         return Response(
             {
                 "message": "Login successful.",
                 "user": UserProfileSerializer(user).data,
-                "tokens": tokens,
+                "tokens": {"access": str(access), "refresh": str(refresh)},
                 "remember_me": remember_me,
             },
             status=status.HTTP_200_OK,

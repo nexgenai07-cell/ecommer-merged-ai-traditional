@@ -9,12 +9,14 @@ from rest_framework_simplejwt.exceptions import TokenError
 
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
+from django.utils import timezone
 from django.utils.http import (
     urlsafe_base64_encode,
     urlsafe_base64_decode,
 )
 from django.utils.encoding import force_bytes, force_str
-from .email_service import send_verification_with_resend
+from .email_service import send_verification_with_resend, send_2fa_code_email
+from .twofactor_views import generate_otp
 from django.conf import settings
 
 from user_agents import parse as parse_user_agent
@@ -115,7 +117,7 @@ class RegisterView(generics.CreateAPIView):
         user = serializer.save()
 
         # Send verification email in the background so registration
-        # does not wait for the Resend API response.
+        # does not wait for the email server response.
         Thread(
             target=self._send_verification_email,
             args=(user,),
@@ -139,6 +141,8 @@ class RegisterView(generics.CreateAPIView):
             send_verification_email(user)
         except Exception as exc:
             print("Verification email failed:", exc)
+
+
 # Authenticates users, verifies email status,
 # checks two-factor authentication, and returns JWT tokens.
 class LoginView(APIView):
@@ -189,7 +193,19 @@ class LoginView(APIView):
             is_enabled=True,
         ).first()
 
+        # UPDATED: 2FA is now email-based instead of an authenticator app.
+        # Before returning "require_2fa", we generate a fresh 6-digit code,
+        # save it (with a 10-minute expiry) on the TwoFactorAuth row, and
+        # email it to the user right here. The frontend then collects that
+        # code and posts it to /2fa/login-verify/ to finish logging in.
         if two_fa:
+            code = generate_otp()
+            two_fa.otp_code = code
+            two_fa.otp_expires_at = timezone.now() + timedelta(minutes=10)
+            two_fa.save()
+
+            send_2fa_code_email(user, code)
+
             # IMPORTANT:
             # Do not issue tokens yet.
             # Remember Me is returned so the second 2FA step
@@ -197,7 +213,7 @@ class LoginView(APIView):
             return Response(
                 {
                     "message": (
-                        "Two-factor authentication code required."
+                        "A verification code has been sent to your email."
                     ),
                     "require_2fa": True,
                     "user_id": user.id,
@@ -562,4 +578,3 @@ class ReactivateConfirmView(APIView):
                 "message": "Your account has been reactivated. You can now log in."
             }
         )
-        
