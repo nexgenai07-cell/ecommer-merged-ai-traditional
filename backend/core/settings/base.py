@@ -9,8 +9,7 @@ import warnings
 from corsheaders.defaults import default_headers
 import dj_database_url
 from dotenv import load_dotenv
-import ssl
-import certifi
+
 # -------------------------------------------------
 # BASE DIRECTORY + ENV
 # -------------------------------------------------
@@ -49,36 +48,41 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 REDIS_URL = os.getenv("REDIS_URL", "")
 
 # -------------------------------------------------
-# EMAIL
+# EMAIL (Gmail SMTP)
 # -------------------------------------------------
+# UPDATED — switched from Resend's HTTP API to Gmail SMTP. Uses Django's
+# built-in SMTP EmailBackend. Requires EMAIL_HOST_USER (Gmail address) and
+# EMAIL_HOST_PASSWORD (a 16-char Gmail "App Password", NOT the normal
+# account password — generate one under Google Account → Security →
+# 2-Step Verification → App Passwords).
+#
+# NOTE: if this app is deployed on Railway, confirm Railway's outbound
+# network can actually reach smtp.gmail.com:587 — some Railway plans/
+# regions have had trouble reaching Gmail's SMTP host directly, which
+# previously caused this same send to hang and crash requests (that's
+# why Resend was introduced in the first place). Test this in production
+# after deploying before relying on it for checkout notifications.
 
 EMAIL_BACKEND = os.getenv(
     'EMAIL_BACKEND',
-    'django.core.mail.backends.console.EmailBackend'
+    'django.core.mail.backends.smtp.EmailBackend'
 )
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")
-
-RESEND_FROM_EMAIL = os.getenv(
-    "RESEND_FROM_EMAIL",
-    "onboarding@resend.dev"
-)
-EMAIL_HOST = os.getenv('EMAIL_HOST', '')
+EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
 EMAIL_PORT = int(os.getenv('EMAIL_PORT', 587))
 EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True') == 'True'
 EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
 DEFAULT_FROM_EMAIL = os.getenv(
     'DEFAULT_FROM_EMAIL',
-    'noreply@example.com'
+    EMAIL_HOST_USER or 'noreply@example.com'
 )
+EMAIL_TIMEOUT = 30
 
 FRONTEND_URL = os.getenv(
     'FRONTEND_URL',
     'http://localhost:5173'
 )
 
-EMAIL_SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
-EMAIL_TIMEOUT = 30
 # -------------------------------------------------
 # APPS
 # -------------------------------------------------
@@ -446,6 +450,13 @@ elif GEMINI_API_KEY:
     GEMINI_API_KEYS = [GEMINI_API_KEY]
 else:
     GEMINI_API_KEYS = []
+
+
+# ============================================
+# GOOGLE OAUTH (Sign in with Google)
+# ============================================
+GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID')
+
 
 # ============================================
 # GROQ & INTERNAL API

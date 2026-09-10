@@ -1,11 +1,13 @@
 from datetime import timedelta
 
-from firebase_admin import auth as firebase_auth
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status, permissions
 from rest_framework_simplejwt.tokens import RefreshToken
+from django.conf import settings
 
 from .models import User
 from .serializers import GoogleLoginSerializer, UserProfileSerializer
@@ -22,13 +24,22 @@ class GoogleLoginView(APIView):
 
         id_token = serializer.validated_data["id_token"]
 
-        # Verify Firebase ID token
+        # Verify Google ID token directly with Google's servers.
+        # google.oauth2.id_token.verify_oauth2_token checks the token's
+        # signature, expiry, and that the "aud" (audience) claim matches
+        # our own GOOGLE_CLIENT_ID — this last check is what stops someone
+        # from replaying an ID token that Google issued for a *different*
+        # app.
         try:
-            decoded_token = firebase_auth.verify_id_token(id_token)
-        except Exception:
+            decoded_token = google_id_token.verify_oauth2_token(
+                id_token,
+                google_requests.Request(),
+                settings.GOOGLE_CLIENT_ID,
+            )
+        except ValueError:
             return Response(
                 {
-                    "error": "Invalid Firebase ID token."
+                    "error": "Invalid Google ID token."
                 },
                 status=status.HTTP_401_UNAUTHORIZED,
             )
@@ -40,6 +51,16 @@ class GoogleLoginView(APIView):
             return Response(
                 {
                     "error": "Google account does not contain an email."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Google's own flag for whether this email has actually been
+        # verified on Google's side — extra safety check.
+        if not decoded_token.get("email_verified", False):
+            return Response(
+                {
+                    "error": "Google account email is not verified."
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -69,7 +90,7 @@ class GoogleLoginView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        # Google/Firebase authenticated email
+        # Google-authenticated email is trusted as verified
         if not user.email_verified:
             user.email_verified = True
             user.save(update_fields=["email_verified"])

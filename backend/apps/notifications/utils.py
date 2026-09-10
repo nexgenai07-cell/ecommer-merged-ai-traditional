@@ -1,7 +1,7 @@
 import logging
 
-import requests
 from django.conf import settings
+from django.core.mail import EmailMultiAlternatives
 
 from .models import Notification
 from apps.stores.models import Store
@@ -9,22 +9,6 @@ from apps.stores.models import Store
 logger = logging.getLogger(__name__)
 
 
-# FIX (B2): default sent_via updated from "web" to "in_app" to match
-# the new Notification.SENT_VIA_CHOICES (in_app/email/sms).
-#
-# FIX (Cross-check, Sep 2026 — PDF Part 2 Item 3): reference_type/
-# reference_id were added to the Notification model and to every caller
-# of this function (checkout, cancel, admin status update, reinstate,
-# complaints, QR payment flows, the stale-payment cron job) but were
-# never added to this function's signature. Every one of those callers
-# passes reference_type=/reference_id= as keyword arguments, so every
-# single automatic notification in the app was raising
-# "TypeError: create_notification() got an unexpected keyword argument
-# 'reference_type'" at runtime — breaking checkout, cancellation, order
-# status updates, reinstate, complaint replies, and all QR payment
-# notifications. Adding the two parameters here (optional, default
-# None, per spec: "POST /api/v1/notifications/send/ ... default null if
-# omitted") and storing them on the created row fixes this.
 def create_notification(
     user,
     title,
@@ -35,24 +19,6 @@ def create_notification(
     reference_type=None,
     reference_id=None,
 ):
-    # FIX (Cross-check, checkout crash — Sep 2026): this function used to
-    # let Notification.objects.create() raise straight up to the caller.
-    # Notification.store is a required (non-null) FK, and when no store
-    # was passed in, we fell back to Store.objects.first() — which can be
-    # None (no Store rows yet, or the query fails for any other reason).
-    # That produced an IntegrityError *after* the caller had already
-    # committed its own work (e.g. CheckoutView had already saved the
-    # Order + Payment in its own transaction.atomic() block), so the
-    # customer's order was created successfully in the DB but the
-    # unhandled exception crashed the request before any response could
-    # be sent back — the frontend saw zero response headers.
-    #
-    # A notification is a side effect only — nothing in this codebase
-    # uses this function's return value — so it must never be allowed to
-    # break whatever real business action (checkout, cancel, complaint
-    # reply, refund, cron job, etc.) triggered it. We now resolve the
-    # store defensively and wrap the actual create in try/except,
-    # logging on any failure instead of raising.
     if store is None:
         store = Store.objects.first()
 
@@ -84,24 +50,6 @@ def create_notification(
         return None
 
 
-# FIX (Cross-check, checkout crash — Sep 2026), UPDATED: this used to send
-# via send_mail() on the SMTP backend (Gmail). Railway logs showed that
-# path failing with "OSError: Network is unreachable" — Railway's outbound
-# network cannot reach Gmail's SMTP host at all — and the socket connect
-# attempt was blocking this request's own thread for 60+ seconds before
-# erroring out, long enough for the ASGI server (Daphne) to force-kill the
-# whole connection before any response could reach the client. The
-# try/except here was never the problem (it always correctly caught and
-# logged the SMTP failure) — the request was already dead by the time this
-# exception fired.
-#
-# apps/users/email_service.py already sends email through Resend's HTTP
-# API (over HTTPS/443, not SMTP) for email verification, and that path
-# already works in this same Railway environment. Switching this function
-# to the same Resend API call fixes the "unreachable" host entirely — and
-# even if Resend itself were ever slow, requests.post(..., timeout=10)
-# bounds it to 10 seconds instead of the 60+ second SMTP hang, so it can
-# no longer be the thing that trips Daphne's connection kill.
 def send_order_confirmation_email(order):
     customer = order.customer
     to_email = customer.email if customer else None
@@ -138,24 +86,16 @@ def send_order_confirmation_email(order):
     html_message = f"<html><body><pre>{message}</pre></body></html>"
 
     try:
-        response = requests.post(
-            "https://api.resend.com/emails",
-            headers={
-                "Authorization": f"Bearer {settings.RESEND_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "from": settings.RESEND_FROM_EMAIL,
-                "to": [to_email],
-                "subject": subject,
-                "text": message,
-                "html": html_message,
-            },
-            timeout=10,
+        email_msg = EmailMultiAlternatives(
+            subject=subject,
+            body=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[to_email],
         )
-        response.raise_for_status()
+        email_msg.attach_alternative(html_message, "text/html")
+        email_msg.send(fail_silently=False)
         return True
-    except requests.RequestException:
+    except Exception:
         logger.exception(
             "send_order_confirmation_email: failed to send email for order %s",
             order.order_number,
@@ -163,14 +103,6 @@ def send_order_confirmation_email(order):
         return False
 
 
-# FIX (B29): sends the customer a clear confirmation that their refund was
-# processed, instead of leaving them to guess from a silent status change.
-#
-# FIX (Cross-check, checkout crash — Sep 2026), UPDATED: switched to
-# Resend's HTTP API for the same reason as send_order_confirmation_email
-# above — Gmail SMTP is unreachable from Railway and can hang long enough
-# to trip the ASGI server's connection timeout on whatever request
-# triggered this (order cancel / admin status update).
 def send_refund_confirmation_email(order):
     customer = order.customer
     to_email = customer.email if customer else None
@@ -189,24 +121,16 @@ def send_refund_confirmation_email(order):
     html_message = f"<html><body><pre>{message}</pre></body></html>"
 
     try:
-        response = requests.post(
-            "https://api.resend.com/emails",
-            headers={
-                "Authorization": f"Bearer {settings.RESEND_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "from": settings.RESEND_FROM_EMAIL,
-                "to": [to_email],
-                "subject": subject,
-                "text": message,
-                "html": html_message,
-            },
-            timeout=10,
+        email_msg = EmailMultiAlternatives(
+            subject=subject,
+            body=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[to_email],
         )
-        response.raise_for_status()
+        email_msg.attach_alternative(html_message, "text/html")
+        email_msg.send(fail_silently=False)
         return True
-    except requests.RequestException:
+    except Exception:
         logger.exception(
             "send_refund_confirmation_email: failed to send email for order %s",
             order.order_number,

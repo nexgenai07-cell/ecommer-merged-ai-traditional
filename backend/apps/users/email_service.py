@@ -1,5 +1,9 @@
-import requests
+import logging
+
 from django.conf import settings
+from django.core.mail import EmailMultiAlternatives
+
+logger = logging.getLogger(__name__)
 
 
 def send_verification_with_resend(
@@ -12,27 +16,16 @@ def send_verification_with_resend(
     fail_silently=False,
 ):
     """
-    Send an email through Resend.
+    Sends verification / password-reset / reactivation emails via Gmail SMTP.
 
-    Used for:
-    - Email verification
-    - Password reset
-    - Account reactivation
-
-    The first two arguments remain compatible with the existing
-    registration verification flow.
+    NOTE: function name kept as-is (send_verification_with_resend) so that
+    email_verification_views.py and views.py don't need any changes —
+    only the internal sending mechanism changed from Resend's HTTP API
+    to Django's SMTP email backend (Gmail).
     """
 
-    url = "https://api.resend.com/emails"
-
-    headers = {
-        "Authorization": f"Bearer {settings.RESEND_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
     recipients = recipient_list or [email]
-
-    sender = from_email or settings.RESEND_FROM_EMAIL
+    sender = from_email or settings.DEFAULT_FROM_EMAIL
 
     if message is None:
         message = (
@@ -46,45 +39,27 @@ def send_verification_with_resend(
         <html>
             <body>
                 <h2>{subject}</h2>
-
-                <p>
-                    {message.replace(chr(10), '<br>')}
-                </p>
-
-                <p>
-                    <a href="{verify_link}">
-                        Continue
-                    </a>
-                </p>
+                <p>{message.replace(chr(10), '<br>')}</p>
+                <p><a href="{verify_link}">Continue</a></p>
             </body>
         </html>
     """
 
-    payload = {
-        "from": sender,
-        "to": recipients,
-        "subject": subject,
-        "html": html_message,
-        "text": message,
-    }
-
     try:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=10,
+        email_msg = EmailMultiAlternatives(
+            subject=subject,
+            body=message,
+            from_email=sender,
+            to=recipients,
         )
+        email_msg.attach_alternative(html_message, "text/html")
+        email_msg.send(fail_silently=False)
 
-        print("RESEND STATUS:", response.status_code)
-        print("RESEND RESPONSE:", response.text)
+        logger.info("Verification email sent to %s", recipients)
+        return True
 
-        response.raise_for_status()
-
-        return response.json()
-
-    except requests.RequestException:
+    except Exception:
+        logger.exception("send_verification_with_resend: failed to send email to %s", recipients)
         if fail_silently:
             return None
-
         raise
