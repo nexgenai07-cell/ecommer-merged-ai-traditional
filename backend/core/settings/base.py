@@ -80,8 +80,8 @@ EMAIL_TIMEOUT = 30
 
 FRONTEND_URL = os.getenv(
     'FRONTEND_URL',
-    'http://localhost:5173'
-)
+    'https://ecommerce-frontend-n7h2.vercel.app/'
+).rstrip('/')
 
 # -------------------------------------------------
 # APPS
@@ -255,7 +255,7 @@ CORS_ALLOW_HEADERS = list(default_headers) + [
 ]
 
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
+    "https://ecommerce-frontend-n7h2.vercel.app",
     "http://localhost:3000",
 ]
 if os.getenv('CORS_ALLOWED_ORIGINS'):
@@ -265,7 +265,7 @@ if os.getenv('CORS_ALLOWED_ORIGINS'):
 CSRF_TRUSTED_ORIGINS = [
     "http://*",
     "https://*",
-    "http://localhost:5173",
+    "https://ecommerce-frontend-n7h2.vercel.app",
     "http://localhost:3000",
 ]
 

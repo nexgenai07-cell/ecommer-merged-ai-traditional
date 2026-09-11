@@ -1,4 +1,7 @@
 # PATH: apps/products/views.py
+
+from decimal import Decimal, InvalidOperation
+
 from rest_framework import viewsets, permissions, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -284,12 +287,67 @@ class ProductViewSet(viewsets.ModelViewSet):
             qs = qs.filter(category_id__in=category_ids).distinct()
 
         min_price = request.query_params.get('min_price')
-        if min_price:
-            qs = qs.filter(price__gte=min_price)
-
         max_price = request.query_params.get('max_price')
-        if max_price:
-            qs = qs.filter(price__lte=max_price)
+
+        # FIX (Price range filter bug report, Sep 2026): min_price /
+        # max_price were passed straight into the queryset with no
+        # validation at all — negative values (e.g. min_price=-500) were
+        # silently accepted, and a "reversed" range (min_price greater
+        # than max_price, e.g. min_price=10000&max_price=5000) was also
+        # silently accepted and just returned zero results instead of
+        # telling the caller their range was invalid. Both are now
+        # rejected with a clear 400 error before touching the queryset.
+        min_price_value = None
+        if min_price is not None and min_price != '':
+            try:
+                min_price_value = Decimal(min_price)
+            except (InvalidOperation, ValueError):
+                return Response(
+                    {"error": "min_price must be a valid number."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if min_price_value < 0:
+                return Response(
+                    {"error": "min_price cannot be negative."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        max_price_value = None
+        if max_price is not None and max_price != '':
+            try:
+                max_price_value = Decimal(max_price)
+            except (InvalidOperation, ValueError):
+                return Response(
+                    {"error": "max_price must be a valid number."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if max_price_value < 0:
+                return Response(
+                    {"error": "max_price cannot be negative."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        if (
+            min_price_value is not None
+            and max_price_value is not None
+            and min_price_value > max_price_value
+        ):
+            return Response(
+                {
+                    "error": (
+                        "min_price cannot be greater than max_price. "
+                        "The range must go from the smaller value to the "
+                        "larger value, e.g. min_price=5000&max_price=10000."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if min_price_value is not None:
+            qs = qs.filter(price__gte=min_price_value)
+
+        if max_price_value is not None:
+            qs = qs.filter(price__lte=max_price_value)
 
         # FIX (Cross-check, Sep 2026 — PDF Part 2 Item 5): this filter was
         # still reading the deprecated 'stock' field, which nothing in the

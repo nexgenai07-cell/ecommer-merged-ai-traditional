@@ -8,7 +8,6 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
 
 from django.contrib.auth.tokens import default_token_generator
-from django.core.mail import send_mail
 from django.utils import timezone
 from django.utils.http import (
     urlsafe_base64_encode,
@@ -313,6 +312,9 @@ class PasswordResetRequestView(APIView):
             f"{uid}/{token}/"
         )
 
+        # UPDATED (v4.0): the verification email now has a styled button
+        # instead of a plain link — button_text makes it say "Reset
+        # Password" here instead of the default "Verify Me".
         send_verification_with_resend(
             email,
             reset_link,
@@ -325,6 +327,8 @@ class PasswordResetRequestView(APIView):
             from_email=settings.DEFAULT_FROM_EMAIL,
             recipient_list=[email],
             fail_silently=True,
+            button_text="Reset Password",
+            html_intro="Click the button below to reset your password.",
         )
 
         return Response(
@@ -515,12 +519,23 @@ class ReactivateRequestView(APIView):
                 f"{verification.token}/"
             )
 
-            send_mail(
+            # UPDATED (v4.0): switched from the plain-text send_mail() to
+            # send_verification_with_resend() so this email also gets the
+            # styled HTML button instead of a bare link — button_text
+            # makes it say "Reactivate Account" here.
+            send_verification_with_resend(
+                user.email,
+                link,
                 subject="Reactivate your account",
-                message=f"Click the link below:\n\n{link}",
+                message=(
+                    f"Click the button below to reactivate your account:\n\n"
+                    f"{link}"
+                ),
                 from_email=settings.DEFAULT_FROM_EMAIL,
                 recipient_list=[user.email],
                 fail_silently=False,
+                button_text="Reactivate Account",
+                html_intro="Click the button below to reactivate your account.",
             )
 
             print("Email sent successfully.")

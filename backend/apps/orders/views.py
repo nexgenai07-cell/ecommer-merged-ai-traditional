@@ -1073,8 +1073,48 @@ class AdminOrderStatusUpdateView(APIView):
         serializer = AdminOrderStatusSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        # FIX (Admin dashboard bug report, Sep 2026): once an order has
+        # been refunded, its story is over — no further status changes
+        # are allowed via this endpoint at all (any new_status, not just
+        # a specific one). The only way back for a refunded/cancelled
+        # order is the dedicated Reinstate endpoint, which explicitly
+        # resets the payment record first.
+        existing_payment = getattr(order, "payment", None)
+        if existing_payment and existing_payment.status == "refunded":
+            return Response(
+                {
+                    "error": (
+                        "This order has already been refunded — its "
+                        "status can no longer be updated. Use the "
+                        "reinstate action if it needs to be reopened."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         new_status = serializer.validated_data["status"]
         old_status = order.status
+
+        # FIX (Admin dashboard bug report, Sep 2026): once a customer has
+        # actually paid (payment.status == "paid"), the order must never
+        # be moved back to "pending_payment" — doing so left the order
+        # and its payment record out of sync (order list showed
+        # "pending_payment" while the order detail / payment still showed
+        # "paid"). Block that transition outright, regardless of the
+        # order's current status.
+        if new_status == "pending_payment":
+            payment = getattr(order, "payment", None)
+            if payment and payment.status == "paid":
+                return Response(
+                    {
+                        "error": (
+                            "This order has already been paid for — its "
+                            "status cannot be reverted to 'Pending "
+                            "Payment'."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         if order.status == "delivered" and new_status == "cancelled":
             return Response(
@@ -1276,6 +1316,10 @@ class AdminOrderFilterView(generics.ListAPIView):
     - end_date
     - search
     - customer_id
+    - product   (NEW — filters orders containing a product whose name
+                 matches, case-insensitive partial match)
+    - category  (NEW — filters orders containing a product whose
+                 category name matches, case-insensitive partial match)
     - page
     """
 
@@ -1297,6 +1341,15 @@ class AdminOrderFilterView(generics.ListAPIView):
         # Status filter
         status = params.get("status")
         if status:
+            # FIX (Frontend clarification, Sep 2026): "pending" isn't a
+            # real Order.status value in this schema — the only
+            # pending-type order status is "pending_payment" ("pending"
+            # is a Payment status instead, which is likely where the mix
+            # -up comes from). Accept "pending" as a shorthand alias so a
+            # stray "pending" query still returns the right orders
+            # instead of silently coming back empty.
+            if status == "pending":
+                status = "pending_payment"
             qs = qs.filter(status=status)
 
         # Customer filter (NEW)
@@ -1320,6 +1373,34 @@ class AdminOrderFilterView(generics.ListAPIView):
                 Q(order_number__icontains=search) |
                 Q(customer__name__icontains=search)
             )
+
+        # Product filter (NEW) — admin searches by product name, and we
+        # return every order that contains a matching product. Matches
+        # against the live product name (items__product__name) and also
+        # the snapshot name stored on the order item itself
+        # (items__product_name), so orders still match even if the
+        # product was later deleted (product FK is SET_NULL on delete).
+        product = params.get("product")
+        if product:
+            qs = qs.filter(
+                Q(items__product__name__icontains=product) |
+                Q(items__product_name__icontains=product)
+            )
+
+        # Category filter (NEW) — admin searches by category name, and we
+        # return every order that contains a product from that category.
+        category = params.get("category")
+        if category:
+            qs = qs.filter(
+                items__product__category__name__icontains=category
+            )
+
+        # Joining through items for the two filters above can duplicate
+        # an order row (once per matching item), so de-duplicate here —
+        # but only when those filters were actually used, to avoid an
+        # unnecessary DISTINCT on the common, unfiltered case.
+        if product or category:
+            qs = qs.distinct()
 
         return qs
 

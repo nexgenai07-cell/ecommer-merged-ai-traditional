@@ -174,7 +174,21 @@ class ProductDetailSerializer(serializers.ModelSerializer):
 # UPDATED: ProductCreateUpdateSerializer with new stock fields
 # ============================================================
 class ProductCreateUpdateSerializer(serializers.ModelSerializer):
-    sku = serializers.CharField(required=False, allow_blank=True)
+    # FIX (SKU length bug report, Sep 2026): this field was declared
+    # manually with no max_length, which overrides DRF's normal
+    # auto-generation from the model field — so the model's own length
+    # limit on Product.sku was never actually being enforced here, and
+    # an admin could submit a SKU of any length. max_length is now set
+    # explicitly to match the model column (15 characters), with a clear
+    # error message instead of a raw DB error if it's ever exceeded.
+    sku = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=15,
+        error_messages={
+            "max_length": "SKU cannot be longer than 15 characters."
+        },
+    )
     category_id = serializers.IntegerField(write_only=True, required=False)
     stock_to_add = serializers.IntegerField(
         write_only=True,
@@ -224,12 +238,14 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["id"]
 
-    # Validates that every SKU remains unique.
+    # Validates that every SKU remains unique among still-active
+    # (is_delete=False) products — a soft-deleted product's SKU no
+    # longer blocks reuse, matching the DB-level constraint.
     def validate_sku(self, value):
         if not value:
             return value
 
-        qs = Product.objects.filter(sku=value)
+        qs = Product.objects.filter(sku=value, is_delete=False)
 
         if self.instance:
             qs = qs.exclude(pk=self.instance.pk)
@@ -267,9 +283,12 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
 
         return super().create(validated_data)
 
-    # Prevents duplicate product names.
+    # Prevents duplicate product names — only among products that are
+    # still "alive" (is_delete=False). A soft-deleted product's name no
+    # longer blocks a new product from reusing it, matching the
+    # is_delete=False condition on the DB-level unique constraint.
     def validate_name(self, value):
-        qs = Product.objects.filter(name=value)
+        qs = Product.objects.filter(name=value, is_delete=False)
 
         if self.instance:
             qs = qs.exclude(pk=self.instance.pk)

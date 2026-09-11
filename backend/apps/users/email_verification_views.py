@@ -107,6 +107,19 @@ class VerifyEmailView(APIView):
             verification = EmailVerification.objects.get(token=token)
         except EmailVerification.DoesNotExist:
             return Response({'error': 'Invalid verification link.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # UPDATED (v4.0): made this endpoint idempotent. Some frontends
+        # (e.g. React StrictMode in development) call this API twice on
+        # the same page load — the first call succeeds and marks the
+        # token used, the second then hit the old "expired or already
+        # used" error even though the account was actually verified
+        # successfully by the first call. If the token is already used
+        # but its owner is already verified, that's not a real failure —
+        # it's a harmless duplicate call, so we return the same success
+        # response instead of an error.
+        if verification.is_used and verification.user.email_verified:
+            return Response({'message': 'Email verified successfully.'}, status=status.HTTP_200_OK)
+
         # Checks whether the verification token is still valid,
         # has not expired, and has not already been used.
         if not verification.is_valid():
