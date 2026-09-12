@@ -89,6 +89,14 @@ class PaymentSerializer(serializers.ModelSerializer):
             "refund_method",
             "refund_transaction_reference",
             "screenshot_url",
+            # FIX (12-scenario QA completeness check, Sep 2026): tracked
+            # correctly on the model since Scenario 3/7, but was never
+            # actually exposed anywhere an admin or customer could see it
+            # (order detail, admin pending queue) — only showed up in the
+            # reject/re-upload endpoints' own immediate response. Exposed
+            # here now under a clearer name so it reads on every order
+            # detail view.
+            "qr_rejection_count",
         ]
 
     def get_screenshot_url(self, obj):

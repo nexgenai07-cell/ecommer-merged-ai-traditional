@@ -113,6 +113,11 @@ class Order(models.Model):
     # so admins had no way to mark an order as on its way.
     STATUS_CHOICES = [
         ("pending_payment", "Pending Payment"),
+        # NEW (Supervisor scenario 4, Sep 2026): distinct from
+        # pending_payment — set when a customer re-uploads QR proof
+        # after a prior rejection, so admin's queue can tell a fresh
+        # first-time review apart from a retry review.
+        ("on_hold", "On Hold"),
         ("confirmed", "Confirmed"),
         ("shipped", "Shipped"),
         ("out_for_delivery", "Out for Delivery"),
@@ -384,6 +389,16 @@ class Payment(models.Model):
     qr_duplicate_warning = models.BooleanField(
         default=False,
         help_text="Set to True if duplicate proof detected"
+    )
+
+    # NEW (Supervisor scenario 3 — QR reject workflow, Sep 2026): counts
+    # how many times this order's QR proof has been rejected by an admin.
+    # Incremented once per rejection, on AdminQRPaymentRejectView. Lets
+    # the admin dashboard show "Rejected 2x" etc., and can later be used
+    # to cap how many re-upload attempts a customer gets.
+    qr_rejection_count = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of times this order's QR proof has been rejected",
     )
 
     created_at = models.DateTimeField(auto_now_add=True)

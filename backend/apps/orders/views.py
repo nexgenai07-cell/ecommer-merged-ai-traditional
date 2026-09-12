@@ -930,9 +930,19 @@ class OrderCancelView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        if order.status == "delivered":
+        # UPDATED (Supervisor Scenario 12, Sep 2026): a customer can only
+        # cancel an order *before* it has shipped. Once it's shipped,
+        # out for delivery, or delivered, the package is already
+        # physically moving/moved — the customer can no longer cancel it
+        # themselves (an admin can still handle it as a return instead).
+        if order.status in ("shipped", "out_for_delivery", "delivered"):
             return Response(
-                {"error": "Delivered orders cannot be cancelled."},
+                {
+                    "error": (
+                        f"This order has already been {order.status.replace('_', ' ')} "
+                        "and can no longer be cancelled."
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -1073,18 +1083,19 @@ class AdminOrderStatusUpdateView(APIView):
         serializer = AdminOrderStatusSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        # FIX (Admin dashboard bug report, Sep 2026): once an order has
-        # been refunded, its story is over — no further status changes
-        # are allowed via this endpoint at all (any new_status, not just
-        # a specific one). The only way back for a refunded/cancelled
-        # order is the dedicated Reinstate endpoint, which explicitly
-        # resets the payment record first.
+        # FIX (Admin dashboard bug report, Sep 2026): once an order's
+        # payment has been refunded OR its QR proof was rejected, the
+        # order's story is over — no further status changes are allowed
+        # via this endpoint at all (any new_status, not just a specific
+        # one). The only way back for a refunded/rejected/cancelled order
+        # is the dedicated Reinstate endpoint, which explicitly resets
+        # the payment record first.
         existing_payment = getattr(order, "payment", None)
-        if existing_payment and existing_payment.status == "refunded":
+        if existing_payment and existing_payment.status in ("refunded", "rejected"):
             return Response(
                 {
                     "error": (
-                        "This order has already been refunded — its "
+                        f"This order's payment is '{existing_payment.status}' — its "
                         "status can no longer be updated. Use the "
                         "reinstate action if it needs to be reopened."
                     )
@@ -1116,6 +1127,29 @@ class AdminOrderStatusUpdateView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+        # FIX (Order status workflow bug report, Sep 2026): the status
+        # sequence is strictly forward-only — pending_payment -> confirmed
+        # -> shipped -> out_for_delivery -> delivered. An admin could
+        # previously jump status backward at any point (e.g. shipped back
+        # to confirmed, delivered back to shipped) via this endpoint.
+        # Block any backward move within that sequence. "cancelled" is
+        # handled separately below/above and isn't part of this sequence.
+        FORWARD_STATUS_SEQUENCE = [
+            "pending_payment", "confirmed", "shipped",
+            "out_for_delivery", "delivered",
+        ]
+        if old_status in FORWARD_STATUS_SEQUENCE and new_status in FORWARD_STATUS_SEQUENCE:
+            if FORWARD_STATUS_SEQUENCE.index(new_status) < FORWARD_STATUS_SEQUENCE.index(old_status):
+                return Response(
+                    {
+                        "error": (
+                            f"Order status cannot move backward from "
+                            f"'{old_status}' to '{new_status}'."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         if order.status == "delivered" and new_status == "cancelled":
             return Response(
                 {"error": "Delivered orders cannot be cancelled."},
@@ -1125,17 +1159,28 @@ class AdminOrderStatusUpdateView(APIView):
         # FIX (B29): admin could previously mark an order "shipped" or
         # "delivered" even though it had never actually been paid for.
         # Block that transition outright — payment must be confirmed
-        # ("paid") before an order can move to shipped / out_for_delivery
-        # / delivered.
-        if new_status in ("shipped", "out_for_delivery", "delivered"):
+        # ("paid") before an order can move to confirmed / shipped /
+        # out_for_delivery / delivered.
+        # FIX (QR proof workflow bug report, Sep 2026): "confirmed" is now
+        # included here too — an admin was able to manually confirm an
+        # order before its QR payment proof had actually been approved
+        # (payment.status still "pending" or "under_review"). Confirming
+        # an order should only ever happen once payment.status == "paid"
+        # — normally that transition should be automatic, done by the QR
+        # proof approval endpoint itself, not typed in manually here.
+        if new_status in ("confirmed", "shipped", "out_for_delivery", "delivered"):
             payment = getattr(order, "payment", None)
             if not payment or payment.status != "paid":
+                # UPDATED (Supervisor Scenario 11, Sep 2026): wording
+                # aligned to spec — "Please approve payment first."
                 return Response(
                     {
                         "error": (
-                            "This order's payment has not been confirmed yet — "
-                            "it cannot be marked as "
-                            f"'{new_status.replace('_', ' ')}' until payment is received."
+                            "Please approve payment first. This order's "
+                            "payment has not been confirmed yet — it "
+                            "cannot be marked as "
+                            f"'{new_status.replace('_', ' ')}' until "
+                            "payment is received."
                         )
                     },
                     status=status.HTTP_400_BAD_REQUEST,
@@ -1197,7 +1242,17 @@ class AdminOrderStatusUpdateView(APIView):
         status_messages = {
     "pending_payment": f"Your order {order.order_number} is awaiting payment.",
     "confirmed": f"Order {order.order_number} has been confirmed.",
-    "shipped": f"Order {order.order_number} has been shipped.",
+    # FIX (Order shipped notification bug report, Sep 2026 — Scenario 9):
+    # this used to say only "has been shipped", with no tracking number
+    # even when the admin provided one in the same request — the
+    # customer had no way to actually track their package from this
+    # notification. Now includes it whenever one is set on the order.
+    "shipped": (
+        f"Order {order.order_number} has been shipped. "
+        f"Tracking number: {order.tracking_number}."
+        if order.tracking_number
+        else f"Order {order.order_number} has been shipped."
+    ),
     "out_for_delivery": f"Order {order.order_number} is out for delivery.",
     "delivered": f"Order {order.order_number} has been delivered.",
     "cancelled": (

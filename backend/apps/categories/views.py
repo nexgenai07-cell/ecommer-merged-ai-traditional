@@ -81,8 +81,15 @@ class CategoryViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # FIX (Consistency check while documenting soft-delete name/SKU
+        # reuse, Sep 2026): this must match the same is_delete=False
+        # scope as the actual create/update uniqueness check — otherwise
+        # this live-validation endpoint could say a name is "taken" for
+        # a soft-deleted category, even though creating it would
+        # actually succeed.
         queryset = Category.objects.filter(
-            name__iexact=name
+            name__iexact=name,
+            is_delete=False,
         )
 
         if exclude_id:

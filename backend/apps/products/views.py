@@ -1,5 +1,4 @@
 # PATH: apps/products/views.py
-
 from decimal import Decimal, InvalidOperation
 
 from rest_framework import viewsets, permissions, status, filters
@@ -575,7 +574,12 @@ class ProductViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        qs = Product.objects.filter(name__iexact=name)
+        # FIX (Consistency check while documenting soft-delete name/SKU
+        # reuse, Sep 2026): scoped to is_delete=False to match the real
+        # create/update uniqueness check — otherwise this endpoint could
+        # say a name is "taken" for a soft-deleted product, even though
+        # creating it would actually succeed.
+        qs = Product.objects.filter(name__iexact=name, is_delete=False)
 
         exclude_id = request.query_params.get("exclude_id")
 
@@ -620,7 +624,12 @@ class ProductViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        qs = Product.objects.filter(sku=sku)
+        # FIX (Consistency check while documenting soft-delete name/SKU
+        # reuse, Sep 2026): scoped to is_delete=False to match the real
+        # create/update uniqueness check — otherwise this endpoint could
+        # say a SKU is "taken" for a soft-deleted product, even though
+        # creating it would actually succeed.
+        qs = Product.objects.filter(sku=sku, is_delete=False)
 
         exclude_id = request.query_params.get("exclude_id")
 
