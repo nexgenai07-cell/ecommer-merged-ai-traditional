@@ -94,7 +94,13 @@ class DashboardView(APIView):
         prev_30_days = last_30_days - timedelta(days=30)
 
 
-        delivered_orders = Order.objects.exclude(status='cancelled')
+        # FIX (Sep 2026 — Total Spent / Revenue consistency): exclude(status='cancelled')
+        # wrongly counted pending_payment and on_hold orders as revenue (money that
+        # was never actually confirmed as paid). Switched to an explicit include-list,
+        # Order.REVENUE_STATUSES (confirmed / shipped / out_for_delivery / delivered) —
+        # same rule used everywhere else (admin customer list, customer's own
+        # dashboard, CSV export) so every 'revenue'/'total_spent' number agrees.
+        delivered_orders = Order.objects.filter(status__in=Order.REVENUE_STATUSES)
 
 
         total_revenue = delivered_orders.aggregate(total=Sum('total_amount'))['total'] or 0
@@ -180,8 +186,9 @@ class SalesReportView(APIView):
     def get(self, request):
         start_date, end_date, period = parse_date_range(request)
 
+        # FIX (Sep 2026 — Total Spent / Revenue consistency): see DashboardView above.
         qs = filter_orders_by_date(
-            Order.objects.exclude(status="cancelled"),
+            Order.objects.filter(status__in=Order.REVENUE_STATUSES),
             start_date,
             end_date,
         )
@@ -261,8 +268,9 @@ class RevenueReportView(APIView):
     def get(self, request):
         start_date, end_date, period = parse_date_range(request)
 
+        # FIX (Sep 2026 — Total Spent / Revenue consistency): see DashboardView above.
         qs = filter_orders_by_date(
-            Order.objects.exclude(status="cancelled"),
+            Order.objects.filter(status__in=Order.REVENUE_STATUSES),
             start_date,
             end_date,
         )
@@ -340,7 +348,8 @@ class BestSellersView(APIView):
         limit = int(request.query_params.get("limit", 5))
 
 
-        qs = OrderItem.objects.exclude(order__status="cancelled")
+        # FIX (Sep 2026 — Total Spent / Revenue consistency): see DashboardView above.
+        qs = OrderItem.objects.filter(order__status__in=Order.REVENUE_STATUSES)
 
 
         if start_date:
@@ -382,8 +391,9 @@ class LowPerformingProductsView(APIView):
         limit = int(request.query_params.get('limit', 5))
 
 
+        # FIX (Sep 2026 — Total Spent / Revenue consistency): see DashboardView above.
         sold_product_ids = (
-            OrderItem.objects.exclude(order__status='cancelled')
+            OrderItem.objects.filter(order__status__in=Order.REVENUE_STATUSES)
             .values('product_id')
             .annotate(total_sold=Sum('quantity'))
         )
@@ -683,11 +693,12 @@ class AnalyticsExportView(APIView):
             ])
 
     def _export_revenue(self, writer, start_date, end_date):
-        # Revenue-recognized orders only - excludes cancelled /
-        # pending_payment, same exclusion used for the customers
-        # total_spent calculation elsewhere (A2), for consistency.
+        # Revenue-recognized orders only - Order.REVENUE_STATUSES (confirmed /
+        # shipped / out_for_delivery / delivered), same rule used for the
+        # customers total_spent calculation elsewhere (A2 + Sep 2026 fix),
+        # for consistency.
         qs = filter_orders_by_date(Order.objects.all(), start_date, end_date)
-        qs = qs.exclude(status__in=['cancelled', 'pending_payment'])
+        qs = qs.filter(status__in=Order.REVENUE_STATUSES)
         writer.writerow(['Order Number', 'Customer', 'Total Amount', 'Status', 'Created At'])
         for order in qs.select_related('customer'):
             writer.writerow([
@@ -780,13 +791,13 @@ class AnalyticsExportView(APIView):
         if end_date:
             qs = qs.filter(created_at__date__lte=end_date)
 
-        excluded_statuses = ['cancelled', 'pending_payment']
+        # FIX (Sep 2026 — Total Spent / Revenue consistency): see DashboardView above.
         qs = qs.annotate(
             _total_orders=Count(
-                'orders', filter=~Q(orders__status__in=excluded_statuses), distinct=True,
+                'orders', filter=Q(orders__status__in=Order.REVENUE_STATUSES), distinct=True,
             ),
             _total_spent=Coalesce(
-                Sum('orders__total_amount', filter=~Q(orders__status__in=excluded_statuses)),
+                Sum('orders__total_amount', filter=Q(orders__status__in=Order.REVENUE_STATUSES)),
                 Value(0), output_field=DecimalField(),
             ),
         )

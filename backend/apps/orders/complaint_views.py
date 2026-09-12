@@ -214,6 +214,14 @@ class ComplaintMessageView(APIView):
     # GET /api/v1/complaints/{id}/messages/
     # Returns the full message thread, chronological, visible to both
     # roles (customer and admin) — API 72.1.
+    #
+    # FIX (Frontend Bug Report — Complaint chat, Sep 2026): only
+    # sender_id/sender_role were returned, never the sender's actual
+    # name, so neither the admin dashboard nor the customer side could
+    # show "who" sent each message (they only had a raw user id to work
+    # with). sender_name is now included, sourced from the custom User
+    # model's `.name` field (same field used elsewhere, e.g.
+    # get_or_create_customer in orders/views.py).
     def get(self, request, pk):
         complaint, error_response = self._get_complaint_for_user(request, pk)
         if error_response:
@@ -228,6 +236,7 @@ class ComplaintMessageView(APIView):
                 "id": msg.id,
                 "complaint": complaint.id,
                 "sender": msg.sender_id,
+                "sender_name": msg.sender.name,
                 "sender_role": "admin" if msg.sender.role == "admin" else "customer",
                 "message": msg.message,
                 "created_at": msg.created_at,
@@ -246,6 +255,13 @@ class ComplaintMessageView(APIView):
     # fallback admin) — not to every admin of the store. This did not use
     # store.owner before and does not need to change for the multi-admin
     # update.
+    #
+    # FIX (Frontend Bug Report — Complaint chat, Sep 2026): the response
+    # after posting a reply returned no sender info at all (not even
+    # sender_id/sender_role), so the sender's own message would render
+    # without a name/role until the thread was refetched. Now returns the
+    # same shape as the GET list (sender, sender_role, sender_name) so
+    # the UI can render it immediately and consistently.
     def post(self, request, pk):
         complaint, error_response = self._get_complaint_for_user(request, pk)
         if error_response:
@@ -304,6 +320,9 @@ class ComplaintMessageView(APIView):
             {
                 "id": complaint_message.id,
                 "complaint": complaint.id,
+                "sender": complaint_message.sender_id,
+                "sender_name": complaint_message.sender.name,
+                "sender_role": "admin" if sender_is_admin else "customer",
                 "message": complaint_message.message,
                 "created_at": complaint_message.created_at,
             },

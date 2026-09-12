@@ -125,6 +125,25 @@ class Order(models.Model):
         ("cancelled", "Cancelled"),
     ]
 
+    # NEW (Sep 2026 — Total Spent / Revenue consistency fix): single
+    # source of truth for "this order's money counts as spent/revenue".
+    # A customer has genuinely paid once the order reaches confirmed, and
+    # that stays true through shipped / out_for_delivery / delivered —
+    # out_for_delivery is included because payment already happened
+    # before that stage. pending_payment and on_hold are excluded because
+    # payment isn't confirmed yet at those stages. cancelled is excluded
+    # because a cancelled order's payment gets refunded (see
+    # AdminOrderStatusUpdateView in views.py — a refund always sets
+    # order.status = "cancelled", there is no separate "refunded" order
+    # status), so a refunded order is already covered by excluding
+    # "cancelled" here.
+    #
+    # Used by customer_serializers.py (admin customer list), customer_views.py
+    # (same list's sort annotation), customer_stats_views.py (customer's own
+    # dashboard), and apps/analytics/dashboard_views.py (admin revenue
+    # dashboard + CSV export) — so all four "money" numbers always agree.
+    REVENUE_STATUSES = ["confirmed", "shipped", "out_for_delivery", "delivered"]
+
     store = models.ForeignKey(
         "stores.Store",
         on_delete=models.CASCADE,

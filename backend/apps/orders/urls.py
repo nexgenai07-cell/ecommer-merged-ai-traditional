@@ -1,3 +1,5 @@
+# PATH: apps/orders/urls.py
+
 from django.urls import path
 
 from .views import (
@@ -14,6 +16,7 @@ from .views import (
     AdminOrderReinstateView,
     AdminOrderFilterView,
 )
+from .customer_stats_views import MyOrderStatsView
 from .return_views import (
     CreateReturnView,
     ReturnListView,
@@ -42,6 +45,10 @@ urlpatterns = [
         SaveAddressView.as_view(),
         name="save-address",
     ),
+    # NEW (Sep 2026): must stay ABOVE "<str:order_number>/" below — since
+    # that pattern matches any string, "stats/" would otherwise be
+    # swallowed by it and never reach MyOrderStatsView.
+    path("stats/", MyOrderStatsView.as_view(), name="order-stats"),
     path("", OrderListView.as_view(), name="order-list"),
     path(
         "<str:order_number>/",

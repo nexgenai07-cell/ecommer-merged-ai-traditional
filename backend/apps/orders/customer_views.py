@@ -5,7 +5,7 @@ import re
 from rest_framework import generics, permissions
 from django.db.models import Q, Count, Sum, Value, DecimalField
 from django.db.models.functions import Coalesce, Replace
-from .models import Customer
+from .models import Customer, Order
 from .customer_serializers import CustomerAdminSerializer
 from apps.users.permissions import IsAdmin
 from core.pagination import StandardResultsPagination
@@ -31,8 +31,17 @@ class AdminCustomerListView(generics.ListAPIView):
     total_spent (and their '-' descending forms). total_orders and
     total_spent aren't real DB columns — the serializer computes them
     in Python via SerializerMethodField — so they're annotated here
-    with the exact same "exclude cancelled + pending_payment" logic
-    the serializer uses, purely so the DB can sort by them.
+    with the exact same status logic the serializer uses, purely so
+    the DB can sort by them.
+
+    FIX (Sep 2026 — Total Spent / Revenue consistency): this annotation
+    used to EXCLUDE ['cancelled', 'pending_payment'], which meant
+    'on_hold' orders (payment under review, not confirmed yet) were
+    still counted. Switched to an explicit INCLUDE-list —
+    Order.REVENUE_STATUSES (confirmed / shipped / out_for_delivery /
+    delivered) — matching CustomerAdminSerializer exactly, so the
+    numbers shown on this list and the numbers used to sort it can
+    never drift apart.
     """
     serializer_class = CustomerAdminSerializer
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
@@ -60,17 +69,16 @@ class AdminCustomerListView(generics.ListAPIView):
         # separately, in Python, by the serializer). Coalesce forces the
         # NULL to a real 0 before ordering, so 0-spend customers now
         # correctly sort to the bottom on descending / top on ascending.
-        excluded_statuses = ['cancelled', 'pending_payment']
         qs = qs.annotate(
             _total_orders=Count(
                 'orders',
-                filter=~Q(orders__status__in=excluded_statuses),
+                filter=Q(orders__status__in=Order.REVENUE_STATUSES),
                 distinct=True,
             ),
             _total_spent=Coalesce(
                 Sum(
                     'orders__total_amount',
-                    filter=~Q(orders__status__in=excluded_statuses),
+                    filter=Q(orders__status__in=Order.REVENUE_STATUSES),
                 ),
                 Value(0),
                 output_field=DecimalField(),

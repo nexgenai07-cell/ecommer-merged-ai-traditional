@@ -3,7 +3,7 @@
 from decimal import Decimal
 
 from rest_framework import serializers
-from .models import Customer
+from .models import Customer, Order
 
 
 # Converts customer information into API responses for the admin panel.
@@ -30,38 +30,40 @@ class CustomerAdminSerializer(serializers.ModelSerializer):
             "created_at",
         ]
 
-    # Returns total number of REAL orders placed by the customer.
-    # FIX (B57): "cancelled" ke sath "pending_payment" bhi exclude kiya —
-    # pending_payment order ka matlab hai payment abhi complete hi nahi
-    # hui, isliye woh "placed" order nahi ginna chahiye. Is fix ke baad
-    # jin customers ke sirf pending orders hain unke liye ye 0 aayega.
-    def get_total_orders(self, obj):
-        return obj.orders.exclude(
-            status__in=["cancelled", "pending_payment"]
-        ).count()
-
-    # Returns total amount actually spent — cancelled AND unpaid
-    # (pending_payment) orders excluded, kyunke unka paisa kabhi actually
-    # nahi aaya. FIX (B57): pehle sirf "cancelled" exclude hota tha, is
-    # liye pending/unpaid orders ka amount lifetime value mein ghalat
-    # tarah jud jata tha.
+    # Returns total number of orders that actually count as "placed" —
+    # i.e. the customer has paid for them.
     #
-    # FIX (Cross-check, Sep 2026 — PDF Part 4): sum() ka default start
-    # value Python int 0 hai — jab customer ka koi bhi qualifying order
-    # nahi hota (spec ka apna example: "total_orders: 0, total_spent:
-    # '0.00'"), ye method plain int 0 return karta tha, jo JSON mein
-    # number 0 ban jata (na ke spec-required string "0.00"), aur jab
-    # orders maujood hon to Decimal return hota (JSON mein string ban
-    # jata) — matlab field ka type customer ke data pe depend karta tha.
-    # Decimal("0.00") ko explicit start value dene se hamesha Decimal
-    # (=> hamesha JSON string) return hota hai.
+    # FIX (Sep 2026 — Total Spent / Revenue consistency): previously
+    # excluded only "cancelled" + "pending_payment", which still counted
+    # "on_hold" orders (payment under review, not confirmed yet) as
+    # placed. Now uses Order.REVENUE_STATUSES (confirmed / shipped /
+    # out_for_delivery / delivered) as an explicit include-list instead,
+    # so this can never silently start counting a new not-yet-paid
+    # status again if one gets added later.
+    def get_total_orders(self, obj):
+        return obj.orders.filter(status__in=Order.REVENUE_STATUSES).count()
+
+    # Returns total amount actually spent — only orders in
+    # Order.REVENUE_STATUSES count (confirmed / shipped /
+    # out_for_delivery / delivered). Cancelled orders are excluded, which
+    # also correctly excludes refunds: a refund always sets
+    # order.status = "cancelled" (there's no separate "refunded" order
+    # status — see AdminOrderStatusUpdateView), so a refunded order's
+    # amount is automatically removed from total_spent the moment the
+    # refund happens.
+    #
+    # FIX (Cross-check, Sep 2026 — PDF Part 4): sum()'s default start
+    # value is Python int 0, so when a customer has no qualifying orders
+    # this returned plain int 0 (JSON number) instead of the
+    # spec-required string "0.00" — meaning the field's JSON type
+    # depended on whether the customer had orders. Decimal("0.00") as an
+    # explicit start value makes this always return a Decimal (=> always
+    # a JSON string).
     def get_total_spent(self, obj):
         return sum(
             (
                 order.total_amount
-                for order in obj.orders.exclude(
-                    status__in=["cancelled", "pending_payment"]
-                )
+                for order in obj.orders.filter(status__in=Order.REVENUE_STATUSES)
             ),
             Decimal("0.00"),
         )
