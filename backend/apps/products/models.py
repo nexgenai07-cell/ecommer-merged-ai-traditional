@@ -51,8 +51,13 @@ class Product(models.Model):
     stock = models.PositiveIntegerField(default=0, help_text="DEPRECATED: Use total_stock instead")
 
     # Auto-generated if left blank
+    # NOTE (Sep 2026): this auto-generation is now unreachable through the
+    # normal API — ProductCreateUpdateSerializer.sku is required=True — but
+    # is kept here as a DB-level safety net for any other code path
+    # (management commands, data migrations, admin-site direct saves) that
+    # creates a Product without going through that serializer.
     sku = models.CharField(
-        max_length=15,
+        max_length=25,
         blank=True,
     )
 

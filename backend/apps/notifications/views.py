@@ -1,3 +1,6 @@
+# PATH: apps/notifications/views.py
+
+from django.contrib.auth import get_user_model
 from django.db.models import Q
 from rest_framework import viewsets, permissions, mixins, status
 from rest_framework.decorators import action
@@ -7,8 +10,8 @@ from rest_framework.views import APIView
 from core.pagination import StandardResultsPagination
 from .models import Notification
 from .serializers import NotificationSerializer
+from .utils import create_notification
 from apps.users.permissions import IsAdmin
-from apps.stores.models import Store
 
 
 class NotificationViewSet(
@@ -97,11 +100,42 @@ class NotificationViewSet(
 
 
 class SendNotificationView(APIView):
-    """Admin-only endpoint for manually creating a notification."""
+    """
+    POST /api/v1/notifications/send/
+
+    Admin-only endpoint for manually creating a notification — either to
+    one specific user (pass "user": <user_id>), or a broadcast visible to
+    every logged-in user (omit "user", or pass null — NotificationViewSet.
+    get_base_queryset() already shows user=null notifications to everyone).
+
+    FIX (Sep 2026 — "Send Notification" button not working for a specific
+    user): reference_type and reference_id were being treated as
+    REQUIRED here ("... are required", 400) even though the model
+    defines both as null=True/blank=True — genuinely optional by design.
+    The frontend's Send Notification form only ever collects
+    user/title/message/type/channel — it has no order/return/complaint/
+    product to reference, since this is a free-form admin message, not
+    tied to any record. So EVERY request from that form was failing this
+    check with 400, which is exactly why the button appeared to do
+    nothing (this affected both the specific-user case and the broadcast
+    case equally, since the check ran regardless of whether "user" was
+    provided).
+
+    Also switched from calling Notification.objects.create() directly to
+    the shared create_notification() helper (utils.py), so a manually
+    sent notification gets the same "no Store configured yet -> log and
+    return None instead of crashing" safety net every other notification
+    path in the app already has, instead of raising an unhandled error.
+
+    reference_type/reference_id are each optional independently (both
+    omitted = a general/broadcast notification), but are validated as
+    required-together: if exactly one is given without the other, this
+    now returns 400 instead of silently saving a half-filled reference.
+    """
 
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
-    # Validates and creates a manually sent notification with deep-link data.
+    # Validates and creates a manually sent notification.
     def post(self, request):
         user_id = request.data.get("user")
         title = request.data.get("title")
@@ -111,27 +145,82 @@ class SendNotificationView(APIView):
         reference_id = request.data.get("reference_id")
         sent_via = request.data.get("sent_via", "web")
 
-        if not title or not message or not reference_type or reference_id is None:
+        if not title or not message:
+            return Response(
+                {"error": "title and message are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # NEW (Sep 2026 — Send Notification, broadcast fix follow-up):
+        # reference_type/reference_id are each optional on their own (a
+        # general/broadcast notification has neither), but if one is
+        # given the other must be too — a half-filled reference would
+        # save a dangling pointer that breaks deep-linking (clicking the
+        # notification to open the referenced order/return/complaint)
+        # later, with no error raised at the time it happened.
+        if bool(reference_type) != bool(reference_id):
             return Response(
                 {
                     "error": (
-                        "title, message, reference_type and reference_id "
-                        "are required."
+                        "reference_type and reference_id must be provided "
+                        "together, or both left out for a general "
+                        "notification."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        notification = Notification.objects.create(
-            store=Store.objects.first(),
-            user_id=user_id,
+        if notif_type not in dict(Notification.TYPE_CHOICES):
+            return Response(
+                {
+                    "error": f"Invalid type '{notif_type}'.",
+                    "accepted_values": list(dict(Notification.TYPE_CHOICES)),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if sent_via not in dict(Notification.SENT_VIA_CHOICES):
+            return Response(
+                {
+                    "error": f"Invalid sent_via '{sent_via}'.",
+                    "accepted_values": list(dict(Notification.SENT_VIA_CHOICES)),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # user is optional (null = broadcast). If given, it must resolve
+        # to a real user — resolved to an actual User instance here
+        # because create_notification()/Notification.user is a
+        # ForeignKey and can't be assigned a raw id directly.
+        target_user = None
+        if user_id is not None:
+            target_user = get_user_model().objects.filter(id=user_id).first()
+            if target_user is None:
+                return Response(
+                    {"error": f"No user found with id {user_id}."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+        notification = create_notification(
+            user=target_user,
             title=title,
             message=message,
-            type=notif_type,
-            reference_type=reference_type,
-            reference_id=str(reference_id),
+            notification_type=notif_type,
             sent_via=sent_via,
+            reference_type=reference_type,
+            reference_id=reference_id,
         )
+
+        if notification is None:
+            return Response(
+                {
+                    "error": (
+                        "Could not create notification — no store is "
+                        "configured on this platform yet."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
 
         return Response(
             NotificationSerializer(notification).data,

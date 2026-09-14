@@ -1,3 +1,5 @@
+# PATH: apps/users/email_service.py
+
 import logging
 
 from django.conf import settings
@@ -146,4 +148,95 @@ def send_2fa_code_email(user, code):
         return True
     except Exception:
         logger.exception("send_2fa_code_email: failed to send code to %s", user.email)
+        return False
+
+
+def send_email_change_code(new_email, code):
+    """
+    NEW (Sep 2026 — Profile: editable email with OTP verification).
+    Sent to the NEW address the user wants to switch to — receiving and
+    re-entering this code is what proves they actually control that
+    inbox, before user.email is allowed to change (see
+    email_change_views.RequestEmailChangeView / ConfirmEmailChangeView).
+    Same 6-digit / 10-minute pattern as send_2fa_code_email.
+    """
+    subject = "Confirm your new email address"
+    message = (
+        f"Your email change verification code is: {code}\n\n"
+        "Enter this code to confirm this is your new email address. "
+        "This code is valid for 10 minutes. If you did not request this, "
+        "please ignore this email and your account email will stay "
+        "unchanged."
+    )
+    html_message = f"""
+        <html>
+            <body>
+                <h2>Confirm your new email address</h2>
+                <p>Use this code to confirm this is your new email address:</p>
+                <h1 style="letter-spacing: 4px;">{code}</h1>
+                <p>This code is valid for 10 minutes.</p>
+                <p>If you did not request this, you can safely ignore this
+                email — your account email will not change.</p>
+            </body>
+        </html>
+    """
+
+    try:
+        email_msg = EmailMultiAlternatives(
+            subject=subject,
+            body=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[new_email],
+        )
+        email_msg.attach_alternative(html_message, "text/html")
+        email_msg.send(fail_silently=False)
+        return True
+    except Exception:
+        logger.exception("send_email_change_code: failed to send code to %s", new_email)
+        return False
+
+
+def send_email_change_notice(old_email, new_email):
+    """
+    NEW (Sep 2026 — Profile: editable email with OTP verification).
+    Best-effort heads-up sent to the OLD address the moment a change is
+    REQUESTED (not once it's confirmed) — so if someone else with
+    momentary access to the account starts this flow, the real owner
+    finds out immediately at the address they can still check, even
+    before any code is entered. Never raises — a failure here must not
+    block the actual OTP email/flow.
+    """
+    subject = "Email change requested on your account"
+    message = (
+        f"A request was made to change your account email to {new_email}.\n\n"
+        "If this was you, no action is needed — enter the code sent to "
+        f"{new_email} to confirm it.\n\n"
+        "If this was NOT you, please change your password immediately."
+    )
+    html_message = f"""
+        <html>
+            <body>
+                <h2>Email change requested</h2>
+                <p>A request was made to change your account email to
+                <strong>{new_email}</strong>.</p>
+                <p>If this was you, no action is needed here — enter the
+                code sent to {new_email} to confirm it.</p>
+                <p>If this was <strong>not</strong> you, please change your
+                password immediately.</p>
+            </body>
+        </html>
+    """
+
+    try:
+        email_msg = EmailMultiAlternatives(
+            subject=subject,
+            body=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[old_email],
+        )
+        email_msg.attach_alternative(html_message, "text/html")
+        email_msg.send(fail_silently=True)
+        return True
+    except Exception:
+        logger.exception("send_email_change_notice: failed to notify %s", old_email)
         return False

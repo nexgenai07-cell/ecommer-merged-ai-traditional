@@ -1,6 +1,7 @@
 #apps/analytics/dashboard_views.py
 import calendar
 import datetime as dt
+import re
 from datetime import timedelta
 
 from django.conf import settings
@@ -60,6 +61,83 @@ def filter_orders_by_date(qs, start_date, end_date):
         qs = qs.filter(created_at__date__lte=end_date)
 
     return qs
+
+
+def filter_orders_by_status(qs, status_param):
+    """
+    NEW (Sep 2026 - Sales/Revenue Report vs Export mismatch fix): a single
+    place that maps the dashboard's status filter to the underlying Order
+    query, used by SalesReportView, RevenueReportView, and their matching
+    CSV exports (_export_sales / _export_revenue) - so switching the
+    status filter on the dashboard and exporting always show the exact
+    same records. Previously the report views were hardcoded to "paid
+    orders only" with no way to switch, and _export_sales had NO status
+    filter at all (exported every order regardless of status), which is
+    exactly why the dashboard cards and the downloaded CSV disagreed.
+
+    "sold"      -> Order.REVENUE_STATUSES (confirmed / shipped /
+                   out_for_delivery / delivered). This is the default
+                   when no status is given, so existing calls keep
+                   behaving exactly as before this fix.
+    "cancelled" -> status=cancelled orders that were never actually
+                   refunded (e.g. cancelled while still pending_payment
+                   / on_hold - there was no payment to refund).
+    "refunded"  -> status=cancelled orders where payment.status is
+                   "refunded" (money was taken, then given back).
+    "all"       -> every order, no status filtering at all.
+    Any other exact Order.status value (on_hold, pending_payment,
+    confirmed, shipped, out_for_delivery, delivered) filters to just
+    that status. An unrecognized value falls back to "sold" rather than
+    silently returning unfiltered data.
+    """
+    status_param = (status_param or "sold").lower()
+
+    if status_param == "sold":
+        return qs.filter(status__in=Order.REVENUE_STATUSES)
+    if status_param == "cancelled":
+        return qs.filter(status="cancelled").exclude(payment__status="refunded")
+    if status_param == "refunded":
+        return qs.filter(status="cancelled", payment__status="refunded")
+    if status_param == "all":
+        return qs
+
+    valid_statuses = {choice[0] for choice in Order.STATUS_CHOICES}
+    if status_param in valid_statuses:
+        return qs.filter(status=status_param)
+
+    return qs.filter(status__in=Order.REVENUE_STATUSES)
+
+
+def format_phone_for_csv(phone):
+    """
+    NEW (Sep 2026 — Customers CSV export phone number bug): a plain CSV
+    write of a local-format Pakistani number (e.g. "03001234567") gets
+    reinterpreted by Excel as a plain number the moment the file is
+    opened directly (double-click) — Excel drops the leading 0, showing
+    "3001234567", which is exactly the "poora number nahi aa raha" bug
+    reported. Two things fix this together:
+      1. normalize local "0XXXXXXXXXX" to the international
+         "+92XXXXXXXXXX" format that was asked for.
+      2. wrap it as ="..." — a text-formula Excel recognises when
+         opening a CSV directly, so it displays the exact string
+         (leading + included) instead of trying to parse it as a number.
+    Returns '' unchanged for a blank/missing phone.
+    """
+    if not phone:
+        return ''
+
+    digits = re.sub(r'\D', '', phone)
+    if not digits:
+        return ''
+
+    if digits.startswith('92'):
+        normalized = '+' + digits
+    elif digits.startswith('0'):
+        normalized = '+92' + digits[1:]
+    else:
+        normalized = '+92' + digits
+
+    return f'="{normalized}"'
 
 
 def get_trunc_function(period):
@@ -186,9 +264,12 @@ class SalesReportView(APIView):
     def get(self, request):
         start_date, end_date, period = parse_date_range(request)
 
-        # FIX (Sep 2026 — Total Spent / Revenue consistency): see DashboardView above.
+        # FIX (Sep 2026 — Sales/Revenue Report vs Export mismatch): status
+        # is now a real, explicit filter (?status=sold|cancelled|refunded|
+        # all|<exact status>, defaults to "sold") instead of being
+        # hardcoded to paid orders only - see filter_orders_by_status().
         qs = filter_orders_by_date(
-            Order.objects.filter(status__in=Order.REVENUE_STATUSES),
+            filter_orders_by_status(Order.objects.all(), request.query_params.get("status")),
             start_date,
             end_date,
         )
@@ -268,9 +349,12 @@ class RevenueReportView(APIView):
     def get(self, request):
         start_date, end_date, period = parse_date_range(request)
 
-        # FIX (Sep 2026 — Total Spent / Revenue consistency): see DashboardView above.
+        # FIX (Sep 2026 — Sales/Revenue Report vs Export mismatch): status
+        # is now a real, explicit filter (?status=sold|cancelled|refunded|
+        # all|<exact status>, defaults to "sold") instead of being
+        # hardcoded to paid orders only - see filter_orders_by_status().
         qs = filter_orders_by_date(
-            Order.objects.filter(status__in=Order.REVENUE_STATUSES),
+            filter_orders_by_status(Order.objects.all(), request.query_params.get("status")),
             start_date,
             end_date,
         )
@@ -664,7 +748,16 @@ class AnalyticsExportView(APIView):
         writer = csv.writer(response)
 
         handler = getattr(self, f'_export_{export_type}')
-        handler(writer, start_date, end_date)
+
+        # FIX (Sep 2026 — Sales/Revenue Report vs Export mismatch): the
+        # export now honours the same ?status= filter as SalesReportView/
+        # RevenueReportView (see filter_orders_by_status()), so exporting
+        # while the dashboard has a status filter selected downloads
+        # exactly what's on screen, not a different unfiltered set.
+        if export_type in ('sales', 'revenue'):
+            handler(writer, start_date, end_date, request.query_params.get('status'))
+        else:
+            handler(writer, start_date, end_date)
 
         return response
 
@@ -680,11 +773,18 @@ class AnalyticsExportView(APIView):
                 order.status, payment_status, order.created_at,
             ])
 
-    def _export_sales(self, writer, start_date, end_date):
-        # Per-order sales record: same underlying orders as the 'orders'
-        # export, trimmed/reshaped to what a sales report typically
-        # needs (item count instead of payment status).
-        qs = filter_orders_by_date(Order.objects.all(), start_date, end_date)
+    def _export_sales(self, writer, start_date, end_date, status_param=None):
+        # FIX (Sep 2026 — Sales/Revenue Report vs Export mismatch): this
+        # had NO status filter at all before — every order regardless of
+        # status (pending_payment, on_hold, cancelled, everything) was
+        # exported, while the Sales Report dashboard cards only ever
+        # counted paid orders. That mismatch is exactly the bug reported —
+        # dashboard and CSV showing different numbers for the same date
+        # range. Now uses filter_orders_by_status() with the same
+        # ?status= value the dashboard is filtered to (defaults to "sold",
+        # matching SalesReportView's default).
+        qs = filter_orders_by_status(Order.objects.all(), status_param)
+        qs = filter_orders_by_date(qs, start_date, end_date)
         writer.writerow(['Order Number', 'Customer', 'Items', 'Total Amount', 'Status', 'Created At'])
         for order in qs.select_related('customer').prefetch_related('items'):
             writer.writerow([
@@ -692,13 +792,14 @@ class AnalyticsExportView(APIView):
                 order.total_amount, order.status, order.created_at,
             ])
 
-    def _export_revenue(self, writer, start_date, end_date):
-        # Revenue-recognized orders only - Order.REVENUE_STATUSES (confirmed /
-        # shipped / out_for_delivery / delivered), same rule used for the
-        # customers total_spent calculation elsewhere (A2 + Sep 2026 fix),
-        # for consistency.
-        qs = filter_orders_by_date(Order.objects.all(), start_date, end_date)
-        qs = qs.filter(status__in=Order.REVENUE_STATUSES)
+    def _export_revenue(self, writer, start_date, end_date, status_param=None):
+        # FIX (Sep 2026 — Sales/Revenue Report vs Export mismatch): now
+        # uses the same filter_orders_by_status() as RevenueReportView,
+        # driven by the same ?status= value the dashboard is filtered to
+        # (defaults to "sold" — Order.REVENUE_STATUSES — matching the
+        # previous hardcoded behaviour when no filter is selected).
+        qs = filter_orders_by_status(Order.objects.all(), status_param)
+        qs = filter_orders_by_date(qs, start_date, end_date)
         writer.writerow(['Order Number', 'Customer', 'Total Amount', 'Status', 'Created At'])
         for order in qs.select_related('customer'):
             writer.writerow([
@@ -804,5 +905,5 @@ class AnalyticsExportView(APIView):
         writer.writerow(['Name', 'Phone', 'Email', 'Total Orders', 'Total Spent', 'Created At'])
         for c in qs:
             writer.writerow([
-                c.name, c.phone, c.email or '', c._total_orders, c._total_spent, c.created_at,
+                c.name, format_phone_for_csv(c.phone), c.email or '', c._total_orders, c._total_spent, c.created_at,
             ])

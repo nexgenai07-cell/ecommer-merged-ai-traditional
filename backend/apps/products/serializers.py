@@ -1,7 +1,27 @@
 # PATH: apps/products/serializers.py
 
+import re
+
 from rest_framework import serializers
 from .models import Product, ProductImage, ProductHistory, StockMovement
+
+
+# NEW (Production SKU validation spec, Sep 2026)
+# Enforces: starts AND ends with a letter/number, middle characters may be
+# A-Z, 0-9, hyphen, or underscore. This does NOT by itself enforce the
+# minimum length of 3 (a bare single character like "A" also matches) or
+# reject consecutive special characters like "--"/"__" — both of those are
+# checked separately in validate_sku() below, since the regex alone can't
+# express them cleanly.
+SKU_REGEX = re.compile(r"^[A-Z0-9](?:[A-Z0-9_-]{1,23}[A-Z0-9])?$")
+
+SKU_MIN_LENGTH = 3
+SKU_MAX_LENGTH = 25
+
+# NEW (Production SKU validation spec, Sep 2026): these exact strings can
+# never be used as a SKU, checked after uppercasing — so "null", "Null",
+# and "NULL" are all blocked alike.
+RESERVED_SKUS = {"NULL", "TEST", "ADMIN"}
 
 
 # Returns basic category information inside product responses.
@@ -174,19 +194,22 @@ class ProductDetailSerializer(serializers.ModelSerializer):
 # UPDATED: ProductCreateUpdateSerializer with new stock fields
 # ============================================================
 class ProductCreateUpdateSerializer(serializers.ModelSerializer):
-    # FIX (SKU length bug report, Sep 2026): this field was declared
-    # manually with no max_length, which overrides DRF's normal
-    # auto-generation from the model field — so the model's own length
-    # limit on Product.sku was never actually being enforced here, and
-    # an admin could submit a SKU of any length. max_length is now set
-    # explicitly to match the model column (15 characters), with a clear
-    # error message instead of a raw DB error if it's ever exceeded.
+    # NEW (Production SKU validation spec, Sep 2026): SKU is now
+    # mandatory on every create/update — allow_blank=False rejects "" up
+    # front. trim_whitespace=False because validate_sku() below does its
+    # own trimming as an explicit, visible step (matching the stated
+    # spec) rather than relying on DRF's default silent trim.
     sku = serializers.CharField(
-        required=False,
-        allow_blank=True,
-        max_length=15,
+        required=True,
+        allow_blank=False,
+        allow_null=False,
+        trim_whitespace=False,
+        max_length=SKU_MAX_LENGTH,
         error_messages={
-            "max_length": "SKU cannot be longer than 15 characters."
+            "required": "SKU is required.",
+            "blank": "SKU is required.",
+            "null": "SKU is required.",
+            "max_length": f"SKU cannot be longer than {SKU_MAX_LENGTH} characters.",
         },
     )
     category_id = serializers.IntegerField(write_only=True, required=False)
@@ -238,13 +261,67 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["id"]
 
-    # Validates that every SKU remains unique among still-active
-    # (is_delete=False) products — a soft-deleted product's SKU no
-    # longer blocks reuse, matching the DB-level constraint.
+    # NEW (Production SKU validation spec, Sep 2026): full validation
+    # pipeline, applied in this order —
+    # 1. Trim leading/trailing spaces; reject internal spaces
+    # 2. Convert to uppercase before every further check and before saving
+    # 3. Length: 3-25 characters
+    # 4. Allowed characters + must start/end with a letter or number
+    #    (regex) — this also structurally guarantees at least one
+    #    alphanumeric character exists, since start/end can't both be
+    #    "-"/"_"
+    # 5. No consecutive special characters ("--", "__", "-_", "_-")
+    # 6. Not a reserved word (NULL / TEST / ADMIN)
+    # 7. Unique among still-active (is_delete=False) products — a
+    #    soft-deleted product's SKU no longer blocks reuse
     def validate_sku(self, value):
-        if not value:
-            return value
+        # 1) Trim; reject internal spaces
+        trimmed = value.strip()
 
+        if not trimmed:
+            raise serializers.ValidationError("SKU is required.")
+
+        if " " in trimmed:
+            raise serializers.ValidationError(
+                "SKU cannot contain spaces."
+            )
+
+        # 2) Uppercase
+        value = trimmed.upper()
+
+        # 3) Length
+        if len(value) < SKU_MIN_LENGTH:
+            raise serializers.ValidationError(
+                f"SKU must be at least {SKU_MIN_LENGTH} characters long."
+            )
+
+        if len(value) > SKU_MAX_LENGTH:
+            raise serializers.ValidationError(
+                f"SKU cannot be longer than {SKU_MAX_LENGTH} characters."
+            )
+
+        # 4) Allowed characters + must start/end with a letter or number
+        if not SKU_REGEX.match(value):
+            raise serializers.ValidationError(
+                "SKU must start and end with a letter or number, and can "
+                "only contain uppercase letters, numbers, hyphens (-), "
+                "and underscores (_)."
+            )
+
+        # 5) No consecutive special characters
+        if any(bad in value for bad in ("--", "__", "-_", "_-")):
+            raise serializers.ValidationError(
+                "SKU cannot contain consecutive special characters "
+                "(e.g. '--', '__')."
+            )
+
+        # 6) Reserved words
+        if value in RESERVED_SKUS:
+            raise serializers.ValidationError(
+                f"'{value}' is a reserved word and cannot be used as a SKU."
+            )
+
+        # 7) Uniqueness among active products
         qs = Product.objects.filter(sku=value, is_delete=False)
 
         if self.instance:
@@ -344,7 +421,34 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
         return data
 
     # Updates existing product information.
+    # NEW (Production SKU validation spec, Sep 2026): SKU is immutable
+    # after creation — a normal update request cannot change it. To
+    # deliberately override this (rare, admin-only correction), the
+    # request must include "admin_override_sku": true alongside the new
+    # sku value; without that flag, changing sku on update is rejected
+    # with a 400 even though every other field updates normally.
     def update(self, instance, validated_data):
+        new_sku = validated_data.get("sku")
+
+        if new_sku is not None and new_sku != instance.sku:
+            request = self.context.get("request")
+            override = False
+
+            if request is not None:
+                override_raw = request.data.get("admin_override_sku", False)
+                override = str(override_raw).strip().lower() in ("true", "1", "yes")
+
+            if not override:
+                raise serializers.ValidationError(
+                    {
+                        "sku": (
+                            "SKU cannot be changed after the product is "
+                            "created. To override this, resend the "
+                            "request with admin_override_sku: true."
+                        )
+                    }
+                )
+
         # NOTE: 'stock_to_add' on this endpoint is kept working for backward
         # compatibility, but the frontend should no longer send it once a
         # product already exists — stock changes after creation now go through

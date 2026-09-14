@@ -154,6 +154,16 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
     two_factor_enabled = serializers.SerializerMethodField()
 
+    # NEW (Sep 2026 — Profile: personal info + picture, admin + customer):
+    # addresses is read-only here — the full create/edit/delete/
+    # set-default flow already exists at /api/v1/addresses/
+    # (apps.orders.address_views); this just surfaces the saved list on
+    # the same profile response so the frontend doesn't need a second
+    # call to build the page. Admin users simply get an empty list here
+    # (Address belongs to Customer, which is store-scoped and doesn't
+    # exist for admins) rather than an error.
+    addresses = serializers.SerializerMethodField()
+
     class Meta:
         model = User
         fields = [
@@ -161,17 +171,26 @@ class UserProfileSerializer(serializers.ModelSerializer):
             'name',
             'email',
             'phone',
+            'profile_picture',
             'role',
             'email_verified',
             'two_factor_enabled',
+            'addresses',
             'created_at',
         ]
         read_only_fields = [
             'id',
+            # email is intentionally read-only here — changing it now goes
+            # through the dedicated OTP-verified flow instead
+            # (POST /me/email/change/ + /me/email/confirm/, see
+            # email_change_views.py), so a plain PUT/PATCH to this
+            # endpoint can never silently move the account to an
+            # unverified address.
             'email',
             'role',
             'email_verified',
             'two_factor_enabled',
+            'addresses',
             'created_at',
         ]
 
@@ -182,6 +201,21 @@ class UserProfileSerializer(serializers.ModelSerializer):
             return two_factor.is_enabled
 
         return False
+
+    def get_addresses(self, obj):
+        # Local import to avoid a module-load-time circular import between
+        # apps.users and apps.orders (orders.models only references
+        # settings.AUTH_USER_MODEL by string, but apps.orders itself
+        # imports apps.users.permissions in places, so this stays a
+        # runtime-only import here rather than a top-of-file one).
+        from apps.orders.models import Address
+        from apps.orders.address_serializers import AddressSerializer
+
+        addresses = Address.objects.filter(
+            customer__user=obj
+        ).order_by('-is_default', '-created_at')
+
+        return AddressSerializer(addresses, many=True).data
 
 
 class PasswordResetRequestSerializer(serializers.Serializer):

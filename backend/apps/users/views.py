@@ -2,6 +2,7 @@
 from datetime import timedelta
 from threading import Thread
 from rest_framework import status, generics, permissions
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -389,8 +390,27 @@ class PasswordResetConfirmView(APIView):
 
 # Returns and updates the authenticated user's profile.
 class MeView(generics.RetrieveUpdateAPIView):
+    """
+    GET /api/v1/auth/me/           -> profile (name, email, phone,
+                                       profile_picture, addresses, ...)
+    PUT/PATCH /api/v1/auth/me/update/  -> update name/phone/profile_picture
+
+    Works identically for admin and customer accounts — both are just
+    User rows with a different `role`, so this single endpoint already
+    serves as "the" profile page for both; no separate admin-only
+    profile view is needed.
+
+    FIX (Sep 2026 — Profile picture upload): parser_classes previously
+    defaulted to DRF's JSON-only parsers, which silently can't read a
+    multipart/form-data file upload at all — a profile_picture file sent
+    here would have been dropped before serializer validation even ran.
+    MultiPartParser/FormParser added so an actual image file can be sent
+    alongside the other fields; JSONParser is kept so a plain
+    name/phone-only update (no file) still works exactly as before.
+    """
     serializer_class = UserProfileSerializer
     permission_classes = [permissions.IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_object(self):
         return self.request.user

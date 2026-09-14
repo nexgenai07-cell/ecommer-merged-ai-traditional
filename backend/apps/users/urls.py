@@ -31,6 +31,12 @@ from .email_verification_views import (
     VerifyEmailView,
 )
 
+# NEW (Sep 2026 — Profile: editable email with OTP verification)
+from .email_change_views import (
+    RequestEmailChangeView,
+    ConfirmEmailChangeView,
+)
+
 urlpatterns = [
 
     # ==========================================================
@@ -186,5 +192,21 @@ urlpatterns = [
         "verify-email/",
         VerifyEmailView.as_view(),
         name="verify_email",
+    ),
+
+    # ==========================================================
+    # NEW: Email Change (OTP-verified) — profile page "edit email"
+    # ==========================================================
+
+    path(
+        "me/email/change/",
+        RequestEmailChangeView.as_view(),
+        name="me_email_change",
+    ),
+
+    path(
+        "me/email/confirm/",
+        ConfirmEmailChangeView.as_view(),
+        name="me_email_confirm",
     ),
 ]

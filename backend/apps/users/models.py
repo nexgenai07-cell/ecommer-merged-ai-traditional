@@ -46,6 +46,19 @@ class User(AbstractBaseUser, PermissionsMixin):
     email           = models.EmailField(unique=True)
     phone           = models.CharField(max_length=20, blank=True, null=True)
     role            = models.CharField(max_length=20, choices=ROLE_CHOICES, default='customer')
+
+    # NEW (Sep 2026 — Profile picture, admin + customer): stored via
+    # Cloudinary automatically, same as every other image upload in this
+    # project (see settings.DEFAULT_FILE_STORAGE) — no separate storage
+    # setup needed. Works for both roles since it's on the base User
+    # model, not Customer (which is store-scoped and doesn't exist for
+    # admins at all).
+    profile_picture = models.ImageField(
+        upload_to='profile_pictures/',
+        null=True,
+        blank=True,
+    )
+
     # True once the user clicks the link sent by send-verification-email/.
     # Kept separate from is_active so an unverified account can still log in
     # (we just show a "please verify" banner) rather than being locked out.
@@ -165,3 +178,35 @@ class EmailVerification(models.Model):
             token=secrets.token_urlsafe(32),
             expires_at=timezone.now() + timedelta(hours=validity_hours),
         )
+
+
+# NEW (Sep 2026 — Profile: editable email with OTP verification): a
+# customer/admin can now change their own email from the profile page,
+# but changing it directly (like name/phone) would let a typo or a
+# hijacked session silently lock the real owner out, or let someone move
+# the account to an email they don't actually control. This mirrors the
+# TwoFactorAuth OTP pattern (6-digit code, 10-minute expiry) rather than
+# EmailVerification's token-link pattern, since the user is sitting on
+# the profile page already and can type a code straight back in.
+#
+# One row per user (OneToOneField) — requesting a new change overwrites
+# any still-pending one, so only the most recent code is ever valid.
+class EmailChangeRequest(models.Model):
+    user           = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='email_change_request',
+    )
+    new_email      = models.EmailField()
+    otp_code       = models.CharField(max_length=6)
+    otp_expires_at = models.DateTimeField()
+    created_at     = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'email_change_requests'
+
+    def __str__(self):
+        return f'{self.user.email} -> {self.new_email}'
+
+    def is_valid(self):
+        return timezone.now() < self.otp_expires_at
