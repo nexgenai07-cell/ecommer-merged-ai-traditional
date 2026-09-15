@@ -49,11 +49,41 @@ class Customer(models.Model):
 # Prevents duplicate customer profiles for the same user or phone number within a store.
     class Meta:
         db_table = "customers"
-        unique_together = [
-            ("user", "store"),
-            ("phone", "store"),
+        # FIX (Sep 2026 — IntegrityError on /api/v1/addresses/ and
+        # anywhere else get_or_create_customer() runs, for any user with
+        # no phone number on their account):
+        #
+        # unique_together = [("phone", "store")] used to apply to EVERY
+        # row, including ones where phone is blank ("") — e.g. a user who
+        # signed up via Google and never set a phone number gets
+        # Customer.phone="" on first-ever create. Postgres treats "" as
+        # an ordinary, comparable value (unlike NULL, which is never
+        # equal to another NULL), so the SECOND user in the same store
+        # who also has no phone crashes with a duplicate-key
+        # IntegrityError the moment their Customer row is first created —
+        # completely unrelated to whatever they were actually trying to
+        # do (in the reported case, saving an address).
+        #
+        # Fix: keep (user, store) as a plain unique constraint — that one
+        # was always fine, since Postgres already treats multiple NULL
+        # users (guest customers) in the same store as distinct. For
+        # (phone, store), only enforce uniqueness when phone is actually
+        # set — condition=~Q(phone="") — so any number of customers with
+        # no phone on file can coexist in the same store, exactly like
+        # multiple guest customers already could.
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "store"],
+                name="customers_user_store_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["phone", "store"],
+                condition=~models.Q(phone=""),
+                name="customers_phone_store_nonblank_uniq",
+            ),
         ]
 
+        
 # Returns customer's name and phone number.
     def __str__(self):
         return f"{self.name} ({self.phone})"

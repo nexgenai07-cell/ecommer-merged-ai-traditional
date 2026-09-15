@@ -15,7 +15,7 @@ stripe.api_key = settings.STRIPE_SECRET_KEY
 logger = logging.getLogger(__name__)
 
 from django.db.models import Q, F, ExpressionWrapper, IntegerField
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from django.utils import timezone
 
 from rest_framework import status, permissions, generics
@@ -65,16 +65,29 @@ def generate_order_number(): # Generates a unique order number for every new ord
 
 # Finds an existing customer profile or creates one for the current user.
 def get_or_create_customer(user, store_id=1):
-    customer, _ = Customer.objects.get_or_create(
-        user=user,
-        store_id=store_id,
-        defaults={
-            "name": user.name,
-            "phone": user.phone or "",
-            "email": user.email,
-        },
-    )
+    try:
+        customer, _ = Customer.objects.get_or_create(
+            user=user,
+            store_id=store_id,
+            defaults={
+                "name": user.name,
+                "phone": user.phone or "",
+                "email": user.email,
+            },
+        )
+    except IntegrityError:
+        # NEW (Sep 2026 — defensive safety net): the (phone, store)
+        # blank-phone collision this used to hit is already fixed at the
+        # database level (see Customer.Meta.constraints in models.py —
+        # blank phone no longer participates in that uniqueness check).
+        # This catch only remains for the genuine, much rarer case of
+        # two simultaneous requests for the SAME user+store both racing
+        # get_or_create() at once (not something a blank phone can cause
+        # anymore) — one of them wins the insert, the other lands here
+        # and just needs to re-fetch the row the first one created.
+        customer = Customer.objects.get(user=user, store_id=store_id)
     return customer
+
 
 def reserve_stock_for_order(order):
     """
