@@ -20,6 +20,7 @@ from channels.routing import ProtocolTypeRouter, URLRouter
 from channels.auth import AuthMiddlewareStack
 from apps.ai.routing import websocket_urlpatterns              # FLOW → apps/ai/routing.py (customer chat URLs)
 from apps.ai.admin_routing import admin_websocket_urlpatterns   # FLOW → apps/ai/admin_routing.py (admin chat URLs)
+from apps.returns.routing import complaint_websocket_urlpatterns  # NEW (Sep 2026) → apps/returns/routing.py (complaint chat URLs)
 
 application = ProtocolTypeRouter({
     'http': django_asgi_app,
@@ -27,7 +28,7 @@ application = ProtocolTypeRouter({
     "websocket": WebSocketDebugMiddleware(
     AuthMiddlewareStack(
         URLRouter(
-            websocket_urlpatterns + admin_websocket_urlpatterns
+            websocket_urlpatterns + admin_websocket_urlpatterns + complaint_websocket_urlpatterns
         )
     )
 ),

@@ -1,8 +1,10 @@
 # PATH: apps/orders/models.py
 
 from decimal import Decimal
+from datetime import timedelta
 from django.db import models
 from django.conf import settings
+from django.utils import timezone
 
 # Stores customer information for each store.
 # One user can have different customer profiles in different stores.
@@ -428,3 +430,80 @@ class Payment(models.Model):
 
     def __str__(self):
         return f"Payment for {self.order.order_number}"
+
+
+# NEW (Sep 2026 — Checkout OTP verification): a customer must verify a
+# 6-digit code emailed to them before an order can be placed. One row per
+# user — sending a fresh code overwrites the previous one, and each
+# successful verification can be "spent" on exactly one order (see
+# consumed_at) so it can't silently authorize an unlimited number of
+# future checkouts. Phone/SMS delivery is a planned follow-up (out of
+# scope for now) — this only guards email delivery.
+class CheckoutOTP(models.Model):
+    """
+    Gate on CheckoutView: an order can only be created once this user has
+    a usable (verified, unexpired-for-use, unconsumed) row here.
+    """
+
+    # How long a code is valid to be entered (send -> verify).
+    OTP_VALIDITY_MINUTES = 10
+
+    # How long a *verified* code stays usable to actually place the order
+    # (verify -> checkout). Kept separate from OTP_VALIDITY_MINUTES so a
+    # customer who verifies and then keeps shopping for a few minutes
+    # doesn't get blocked at the last step.
+    VERIFICATION_WINDOW_MINUTES = 30
+
+    # Minimum gap between two "send OTP" requests for the same user, to
+    # stop the email endpoint being hammered.
+    RESEND_COOLDOWN_SECONDS = 60
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="checkout_otp",
+    )
+
+    # Snapshot of the address the code was actually sent to — kept
+    # separate from user.email so a later email change can't silently
+    # invalidate/relocate an in-flight verification.
+    email = models.EmailField()
+
+    otp_code = models.CharField(max_length=6, blank=True, null=True)
+    otp_expires_at = models.DateTimeField(blank=True, null=True)
+
+    is_verified = models.BooleanField(default=False)
+    verified_at = models.DateTimeField(blank=True, null=True)
+
+    # Set once this verified code has actually been used to place an
+    # order — a customer must send + verify a new code for the next one.
+    consumed_at = models.DateTimeField(blank=True, null=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "checkout_otps"
+
+    def __str__(self):
+        state = "verified" if self.is_verified else "pending"
+        return f"Checkout OTP for {self.email} ({state})"
+
+    def is_code_valid(self, code):
+        """Code matches and hasn't expired yet."""
+        if not self.otp_code or not self.otp_expires_at:
+            return False
+        if self.otp_code != code:
+            return False
+        return timezone.now() < self.otp_expires_at
+
+    def is_verification_usable(self):
+        """
+        True if this row can currently authorize placing ONE order:
+        verified, not already spent on a previous order, and still
+        within the post-verification usable window.
+        """
+        if not self.is_verified or self.consumed_at or not self.verified_at:
+            return False
+        window_end = self.verified_at + timedelta(minutes=self.VERIFICATION_WINDOW_MINUTES)
+        return timezone.now() < window_end

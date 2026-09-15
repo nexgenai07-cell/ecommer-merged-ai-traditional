@@ -18,6 +18,7 @@ from apps.returns.complaint_serializers import (
     AdminComplaintRespondSerializer,
 )
 from apps.notifications.utils import create_notification, notify_store_admins
+from apps.returns.consumers import broadcast_complaint_message
 from .models import Order, Customer
 from apps.users.permissions import IsAdmin
 from apps.ai.audit import log_manual_admin_action as log_admin_action
@@ -316,16 +317,27 @@ class ComplaintMessageView(APIView):
             reference_id=complaint.id,
         )
 
+        response_payload = {
+            "id": complaint_message.id,
+            "complaint": complaint.id,
+            "sender": complaint_message.sender_id,
+            "sender_name": complaint_message.sender.name,
+            "sender_role": "admin" if sender_is_admin else "customer",
+            "message": complaint_message.message,
+            "created_at": complaint_message.created_at,
+        }
+
+        # NEW (Sep 2026 — Complaint chat live updates): pushes this same
+        # message to anyone currently connected to
+        # ws/complaints/{id}/ (the other party's open chat window), so
+        # they see it immediately without refreshing/reopening the tab.
+        # A client that sent the message over the socket instead of this
+        # REST endpoint already got this via ComplaintConsumer itself —
+        # this is only for replies posted through plain REST.
+        broadcast_complaint_message(complaint.id, response_payload)
+
         return Response(
-            {
-                "id": complaint_message.id,
-                "complaint": complaint.id,
-                "sender": complaint_message.sender_id,
-                "sender_name": complaint_message.sender.name,
-                "sender_role": "admin" if sender_is_admin else "customer",
-                "message": complaint_message.message,
-                "created_at": complaint_message.created_at,
-            },
+            response_payload,
             status=status.HTTP_201_CREATED,
         )
 

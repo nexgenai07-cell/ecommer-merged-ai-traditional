@@ -55,6 +55,9 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
 # Converts payment details into API response.
 # Used when returning complete order information.
+
+# Converts payment details into API response.
+# Used when returning complete order information.
 class PaymentSerializer(serializers.ModelSerializer):
     # FIX (Cross-check, Sep 2026): spec locks this field's JSON name as
     # "method" (referenced throughout the PDF as "payment.method", e.g.
@@ -74,6 +77,22 @@ class PaymentSerializer(serializers.ModelSerializer):
     # "None".
     screenshot_url = serializers.SerializerMethodField()
 
+    # FIX (Sep 2026 — "Card via Stripe" wrongly shown on QR orders): the
+    # frontend order-tracking page was hardcoding "Card via Stripe" as the
+    # payment label because this serializer never gave it anything to
+    # branch on for QR orders — qr_transaction_id (the QR reference the
+    # customer entered at proof-upload) was captured on the model but
+    # never exposed here. Two additions fix this at the source instead of
+    # relying on the frontend guessing a label:
+    #   - qr_transaction_id: the raw reference number, only meaningful
+    #     when method == "qr" (null for stripe orders).
+    #   - reference / method_label: a ready-to-render pair so the
+    #     frontend doesn't need its own if/else on method — for stripe,
+    #     reference is the Stripe payment_intent id; for qr, it's the
+    #     qr_transaction_id.
+    reference = serializers.SerializerMethodField()
+    method_label = serializers.SerializerMethodField()
+
     class Meta:
         model = Payment
         fields = [
@@ -86,6 +105,9 @@ class PaymentSerializer(serializers.ModelSerializer):
             # NEW: Payment method fields
             # ============================================================
             "method",
+            "method_label",
+            "reference",
+            "qr_transaction_id",
             "refund_method",
             "refund_transaction_reference",
             "screenshot_url",
@@ -102,6 +124,16 @@ class PaymentSerializer(serializers.ModelSerializer):
     def get_screenshot_url(self, obj):
         return obj.qr_screenshot_url or None
 
+    def get_method_label(self, obj):
+        if obj.payment_method == "qr":
+            return "QR Payment"
+        return "Card via Stripe"
+
+    def get_reference(self, obj):
+        if obj.payment_method == "qr":
+            return obj.qr_transaction_id or None
+        return obj.stripe_payment_intent_id or None
+    
 
 # Returns a lightweight order summary for customer order history.
 class OrderListItemSerializer(serializers.ModelSerializer):

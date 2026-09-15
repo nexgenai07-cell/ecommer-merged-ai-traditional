@@ -18,6 +18,41 @@ def _get_customer(request):
     return get_or_create_customer(request.user, store_id=store.id if store else 1)
 
 
+# FIX (Sep 2026 — "Failed to save this address" showing with no real
+# reason): DRF's default serializer.errors is a dict keyed by field name,
+# e.g. {"shipping_address": ["Shipping address looks too short..."]}.
+# Every OTHER error response in this API (CheckoutView, OTP send/verify,
+# AddressSetDefaultView below, etc.) instead returns a flat
+# {"error": "<message>"} — the frontend's shared error handler only ever
+# reads that "error" key, so an address validation failure (e.g. a
+# street address under 8 characters, an invalid postal code, a bad phone
+# format) was silently falling through to a generic fallback message
+# with no indication of what was actually wrong. This picks the first
+# validation message (checked in a stable field order, so the same bad
+# input always reports the same thing) and reshapes it into that same
+# {"error": "..."} convention the rest of the API already uses.
+def _first_error_message(errors):
+    field_order = [
+        "label",
+        "shipping_address",
+        "city",
+        "postal_code",
+        "phone",
+        "non_field_errors",
+    ]
+    for field in field_order:
+        messages = errors.get(field)
+        if messages:
+            return str(messages[0])
+
+    # Fallback for any field outside the expected list.
+    for messages in errors.values():
+        if messages:
+            return str(messages[0]) if isinstance(messages, list) else str(messages)
+
+    return "Please check the address details and try again."
+
+
 # GET /api/v1/addresses/  — list this customer's saved addresses
 # POST /api/v1/addresses/ — create a new address (never overwrites an
 # existing one — this is always an INSERT, never an UPDATE).
@@ -46,7 +81,11 @@ class AddressListCreateView(generics.ListCreateAPIView):
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        if not serializer.is_valid():
+            return Response(
+                {"error": _first_error_message(serializer.errors)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         self.perform_create(serializer)
         # Respond with the full address shape (including "id"), same as
         # the list response, not just the write-serializer's fields.
@@ -69,7 +108,11 @@ class AddressDetailView(generics.UpdateAPIView, generics.DestroyAPIView):
         partial = kwargs.pop("partial", False)
         instance = self.get_object()
         serializer = self.get_serializer(instance, data=request.data, partial=partial)
-        serializer.is_valid(raise_exception=True)
+        if not serializer.is_valid():
+            return Response(
+                {"error": _first_error_message(serializer.errors)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         self.perform_update(serializer)
         return Response(AddressSerializer(serializer.instance).data)
 

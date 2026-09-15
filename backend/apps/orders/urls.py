@@ -17,6 +17,7 @@ from .views import (
     AdminOrderFilterView,
 )
 from .customer_stats_views import MyOrderStatsView
+from .otp_views import SendCheckoutOTPView, VerifyCheckoutOTPView
 from .return_views import (
     CreateReturnView,
     ReturnListView,
@@ -39,6 +40,18 @@ urlpatterns = [
         "checkout/prefill/",
         CheckoutPrefillView.as_view(),
         name="checkout-prefill",
+    ),
+    # NEW (Sep 2026 — Checkout OTP verification): must be called, in this
+    # order, before POST checkout/ will succeed.
+    path(
+        "checkout/send-otp/",
+        SendCheckoutOTPView.as_view(),
+        name="checkout-send-otp",
+    ),
+    path(
+        "checkout/verify-otp/",
+        VerifyCheckoutOTPView.as_view(),
+        name="checkout-verify-otp",
     ),
     path(
         "save-address/",

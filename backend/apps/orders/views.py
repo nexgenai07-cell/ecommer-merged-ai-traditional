@@ -30,7 +30,7 @@ from apps.notifications.utils import (
     send_refund_confirmation_email,
 )
 
-from .models import Address, Customer, Order, OrderItem, Payment
+from .models import Address, CheckoutOTP, Customer, Order, OrderItem, Payment
 from .serializers import (
     OrderListSerializer,
     AdminOrderListSerializer,
@@ -530,6 +530,28 @@ class CheckoutView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # ============================================================
+        # NEW (Sep 2026 — Checkout OTP verification): block order
+        # creation until the customer has requested AND verified the
+        # code emailed to their account address (see otp_views.py).
+        # A verification is single-use — consumed further down, right
+        # after the order is actually created — so placing another
+        # order later needs a fresh send-otp/verify-otp round trip.
+        # ============================================================
+        checkout_otp = CheckoutOTP.objects.filter(user=request.user).first()
+
+        if not checkout_otp or not checkout_otp.is_verification_usable():
+            return Response(
+                {
+                    "error": (
+                        "Please verify the code sent to your email before "
+                        "placing the order."
+                    ),
+                    "otp_required": True,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         with transaction.atomic():
 
             cart_items = list(
@@ -639,6 +661,11 @@ class CheckoutView(APIView):
                 contact_phone=contact_phone,
                 notes=data.get("notes", ""),
             )
+
+            # Spend this verification now that the order actually exists,
+            # so it can't be reused to authorize a second order.
+            checkout_otp.consumed_at = timezone.now()
+            checkout_otp.save(update_fields=["consumed_at", "updated_at"])
 
             # ============================================================
             # CREATE ORDER ITEMS
