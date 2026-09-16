@@ -32,6 +32,7 @@ class ComplaintViewSet(
     GET    /api/v1/complaints/{id}/               - Get complaint detail with messages
     GET    /api/v1/complaints/{id}/messages/      - Get full message thread
     POST   /api/v1/complaints/{id}/messages/      - Add a message to complaint
+    GET    /api/v1/complaints/open-count/         - Count of not-yet-resolved complaints (own, or all for admin)
     PUT    /api/v1/admin/complaints/{id}/status/  - Admin only: update status
 
     NOTE: respond/ endpoint is DEPRECATED and REMOVED per PDF Part 2 Item 4
@@ -67,6 +68,28 @@ class ComplaintViewSet(
         instance = self.get_object()
         serializer = self.get_serializer(instance)
         return Response(serializer.data)
+
+    # NEW: Open-complaints counter for the customer portal's "Active
+    # Status Notice" line. Previously that whole notice (count, order
+    # number, View Status button) was hardcoded static text on the
+    # frontend — this gives it a real number to show instead.
+    #
+    # Reuses get_queryset(), so scoping is identical to the list
+    # endpoint: a customer gets only their own count, an admin gets the
+    # count across every customer.
+    #
+    # "Open" here means not yet resolved/closed — status in
+    # ("open", "in_progress"). Adjust the list below if only the exact
+    # "open" status should count.
+    @action(detail=False, methods=["get"], url_path="open-count")
+    def open_count(self, request):
+        """
+        GET /api/v1/complaints/open-count/
+        Response: {"open_count": <int>}
+        """
+        queryset = self.get_queryset()
+        count = queryset.filter(status__in=["open", "in_progress"]).count()
+        return Response({"open_count": count})
 
     @action(detail=True, methods=["get"], url_path="messages")
     def get_messages(self, request, pk=None):

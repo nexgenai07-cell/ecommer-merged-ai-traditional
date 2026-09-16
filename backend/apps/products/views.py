@@ -395,20 +395,23 @@ class ProductViewSet(viewsets.ModelViewSet):
         if statuses:
             qs = qs.annotate(
                 _available_stock=F('total_stock') - F('reserved_stock')
-            )
-            status_filter = Q()
-            if 'out_of_stock' in statuses:
-                status_filter |= Q(_available_stock__lte=0)
-            if 'low_stock' in statuses:
-                status_filter |= Q(
-                    _available_stock__gt=0,
-                    _available_stock__lte=F('low_stock_threshold'),
-                )
-            if 'healthy' in statuses:
-                status_filter |= Q(_available_stock__gt=F('low_stock_threshold'))
+        )
+        status_filter = Q()
+        if 'out_of_stock' in statuses:
+            status_filter |= Q(_available_stock__lte=0)
+        if 'low_stock' in statuses:
+            status_filter |= Q(
+            _available_stock__gt=0,
+            _available_stock__lte=F('low_stock_threshold'),
+        )
+    # FIX: "healthy" aur "in_stock" dono accept karo — frontend jo bhi
+    # naam bheje "In Stock" k liye, dono handle ho jayen
+        if 'healthy' in statuses or 'in_stock' in statuses:
+            status_filter |= Q(_available_stock__gt=F('low_stock_threshold'))
 
-            if status_filter:
-                qs = qs.filter(status_filter)
+        qs = qs.filter(status_filter)  # FIX: unconditional — empty Q() bhi
+                                     # sahi filter hai jab statuses non-empty ho
+
 
         # FIX: 'ordering' param ab handle ho raha hai (pehle ignore hota tha).
         # Sirf inhi fields pe ordering allow hai — kisi bhi arbitrary column

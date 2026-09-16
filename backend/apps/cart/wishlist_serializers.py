@@ -88,3 +88,17 @@ class AddToWishlistSerializer(serializers.Serializer):
      ).exists():
             raise serializers.ValidationError("Product not found.")
         return value
+
+
+# NEW: Bulk-remove — accepts a list of wishlist item ids so multiple
+# selected items can be deleted in a single request/query instead of
+# one DELETE request per item (which is what the frontend was doing
+# before, causing items to disappear one-by-one instead of together).
+class BulkRemoveFromWishlistSerializer(serializers.Serializer):
+    item_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        allow_empty=False,
+        error_messages={
+            "empty": "item_ids cannot be empty.",
+        },
+    )

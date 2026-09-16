@@ -5,7 +5,11 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 
 from .models import Wishlist, WishlistItem
-from .wishlist_serializers import WishlistSerializer, AddToWishlistSerializer
+from .wishlist_serializers import (
+    WishlistSerializer,
+    AddToWishlistSerializer,
+    BulkRemoveFromWishlistSerializer,
+)
 from apps.stores.models import Store
 
 
@@ -51,3 +55,41 @@ class RemoveFromWishlistView(APIView):
 
         item.delete()
         return Response(WishlistSerializer(wishlist).data)
+
+
+# NEW: Bulk-remove endpoint — POST /api/v1/wishlist/bulk-remove/
+# Body: {"item_ids": [3, 7, 12]}
+#
+# Deletes all matching wishlist items belonging to the logged-in user's
+# own wishlist in ONE DB query (wishlist.items.filter(id__in=...).delete()),
+# instead of the frontend looping and calling
+# DELETE /wishlist/remove/{item_id}/ once per selected item — which is
+# what was causing items to disappear one at a time instead of together.
+#
+# Works for both "select all and delete" (frontend just sends every
+# item's id) and any partial multi-select delete.
+#
+# item_ids that don't exist, or belong to someone else's wishlist, are
+# silently ignored (scoped via wishlist.items, never a raw WishlistItem
+# query) — they never cause an error, they're just not reflected in
+# removed_count.
+class BulkRemoveFromWishlistView(APIView):
+    """POST /api/v1/wishlist/bulk-remove/"""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = BulkRemoveFromWishlistSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        item_ids = serializer.validated_data['item_ids']
+
+        wishlist = get_or_create_wishlist(request.user)
+        deleted_count, _ = wishlist.items.filter(id__in=item_ids).delete()
+
+        return Response(
+            {
+                'message': 'Wishlist items removed.',
+                'removed_count': deleted_count,
+                'wishlist': WishlistSerializer(wishlist).data,
+            },
+            status=status.HTTP_200_OK,
+        )
