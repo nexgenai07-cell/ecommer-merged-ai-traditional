@@ -905,6 +905,13 @@ class OrderListView(generics.ListAPIView):
     ?start_date=2026-08-01&end_date=2026-08-25) so customers can filter
     their own order history by date range, mirroring what admins already
     had via AdminOrderFilterView.
+
+    FIX (Frontend audit, Sep 2026): also accepts an optional `status`
+    query param (e.g. ?status=delivered), so the customer's status-tab
+    filter (Pending/Confirmed/Shipped/Delivered/Cancelled) is applied
+    server-side instead of the frontend fetching every page and
+    filtering in the browser. Mirrors AdminOrderFilterView's status
+    handling, including the same "pending" -> "pending_payment" alias.
     """
     serializer_class = OrderListSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -919,6 +926,15 @@ class OrderListView(generics.ListAPIView):
         )
 
         params = self.request.query_params
+
+        status_param = params.get("status")
+        if status_param:
+            # Same alias as AdminOrderFilterView: "pending" isn't a real
+            # Order.status value in this schema — the only pending-type
+            # order status is "pending_payment".
+            if status_param == "pending":
+                status_param = "pending_payment"
+            qs = qs.filter(status=status_param)
 
         start_date = params.get("start_date")
         if start_date:
@@ -1415,12 +1431,26 @@ class AdminOrderFilterView(generics.ListAPIView):
                  matches, case-insensitive partial match)
     - category  (NEW — filters orders containing a product whose
                  category name matches, case-insensitive partial match)
+    - ordering  (NEW — created_at / -created_at / total_amount /
+                 -total_amount. Used by the admin Customer Detail
+                 Drawer's orders tab so that one customer's full order
+                 history can be sorted by Newest/Oldest/Amount server
+                 -side instead of only re-sorting the loaded page.
+                 Defaults to -created_at when missing/invalid.)
     - page
     """
 
     serializer_class = AdminOrderListSerializer
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
     pagination_class = StandardResultsPagination
+
+    # Fixed whitelist so no arbitrary/unsafe column name can be passed in.
+    ORDERING_MAP = {
+        "created_at": "created_at",
+        "-created_at": "-created_at",
+        "total_amount": "total_amount",
+        "-total_amount": "-total_amount",
+    }
 
 # Filters orders using status, customer, dates and search keywords.
     def get_queryset(self):
@@ -1496,6 +1526,12 @@ class AdminOrderFilterView(generics.ListAPIView):
         # unnecessary DISTINCT on the common, unfiltered case.
         if product or category:
             qs = qs.distinct()
+
+        # Ordering (NEW) — only overrides the default -created_at when a
+        # whitelisted value is actually passed in.
+        ordering = params.get("ordering")
+        if ordering in self.ORDERING_MAP:
+            qs = qs.order_by(self.ORDERING_MAP[ordering])
 
         return qs
 

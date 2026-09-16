@@ -58,21 +58,35 @@ class NotificationViewSet(
 
     # Returns paginated notifications plus the user's total unread count.
     # unread_count is calculated before filters/pagination are applied.
+    #
+    # NEW (Frontend audit, Sep 2026): added `unread_by_type` — a count
+    # per notification type (order/promotion/system), computed the same
+    # unfiltered way as unread_count. Previously only the "Unread" tab
+    # could show a real count badge; Orders/Promotions/System tabs had
+    # no count at all since the backend only ever returned one grand
+    # total. Additive only — unread_count and results are unchanged.
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
-        unread_count = self.get_base_queryset().filter(is_read=False).count()
+        base_unread = self.get_base_queryset().filter(is_read=False)
+        unread_count = base_unread.count()
+        unread_by_type = {
+            value: base_unread.filter(type=value).count()
+            for value, _label in Notification.TYPE_CHOICES
+        }
 
         page = self.paginate_queryset(queryset)
         if page is not None:
             serializer = self.get_serializer(page, many=True)
             response = self.get_paginated_response(serializer.data)
             response.data["unread_count"] = unread_count
+            response.data["unread_by_type"] = unread_by_type
             return response
 
         serializer = self.get_serializer(queryset, many=True)
         return Response(
             {
                 "unread_count": unread_count,
+                "unread_by_type": unread_by_type,
                 "results": serializer.data,
             }
         )

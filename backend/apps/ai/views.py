@@ -20,6 +20,7 @@ from rest_framework.response import Response
 
 from apps.stores.models import Store
 from apps.users.permissions import IsAdmin
+from apps.users.models import User
 from .models import ChatSession, ChatMessage, AuditLog
 from .serializers import ChatSessionSerializer, ChatSessionHistorySerializer, AuditLogSerializer
 from core.pagination import StandardResultsPagination
@@ -147,3 +148,58 @@ class AuditLogListView(generics.ListAPIView):
             qs = qs.filter(Q(action__icontains=search))
 
         return qs
+
+
+class AuditLogEntityListView(APIView):
+    """
+    GET /api/v1/admin/audit-logs/entities/
+
+    NEW (Frontend audit, Sep 2026): the Entity filter dropdown above the
+    audit log table was only ever populated from whatever log rows
+    happened to be on the currently-loaded page, so it never showed
+    every real option. 'entity' has no fixed choices on the model
+    (free-text, e.g. "product", "order", "category", "inventory"), so
+    this returns every distinct value that has ever actually been
+    logged, sorted alphabetically.
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+
+    def get(self, request):
+        entities = (
+            AuditLog.objects
+            .exclude(entity__isnull=True)
+            .exclude(entity="")
+            .values_list("entity", flat=True)
+            .distinct()
+            .order_by("entity")
+        )
+        return Response(list(entities))
+
+
+class AuditLogUserListView(APIView):
+    """
+    GET /api/v1/admin/audit-logs/users/
+
+    NEW (Frontend audit, Sep 2026): same issue as the entity dropdown
+    above, for the User/Admin filter — only whatever admins happened to
+    appear on the currently-loaded page were shown. Returns every admin
+    /staff user that has ever performed a logged action (i.e. every
+    distinct AuditLog.user), not every admin account in the system, so
+    the dropdown only offers options that will actually return results.
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+
+    def get(self, request):
+        user_ids = (
+            AuditLog.objects
+            .exclude(user__isnull=True)
+            .values_list("user_id", flat=True)
+            .distinct()
+        )
+        users = (
+            User.objects
+            .filter(id__in=user_ids)
+            .order_by("name")
+            .values("id", "name", "email")
+        )
+        return Response(list(users))

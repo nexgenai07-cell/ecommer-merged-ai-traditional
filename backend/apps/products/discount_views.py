@@ -1,6 +1,10 @@
+# PATH: apps/products/discount_views.py
+
 from rest_framework import viewsets, permissions, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from django.db.models import Q
+from django.utils import timezone
 
 from .models import Discount
 from .discount_serializers import (
@@ -9,6 +13,7 @@ from .discount_serializers import (
 )
 from apps.users.permissions import IsAdmin
 from apps.ai.audit import log_manual_admin_action as log_admin_action
+from core.pagination import StandardResultsPagination
 
 # Handles complete CRUD operations for discount coupons.
 # Only admin users can create, update, view, or soft delete discounts.
@@ -50,19 +55,70 @@ class DiscountViewSet(viewsets.ModelViewSet):
 
     serializer_class = DiscountSerializer
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
-    pagination_class = None
+
+    # FIX (Frontend audit, Sep 2026): GET /discounts/ never read any
+    # query params before this — switching filters/search/pagination in
+    # the admin UI changed nothing about the response, so the frontend
+    # was calling this with NO params and doing 100% of the
+    # search/type-filter/status-filter/pagination in the browser.
+    # pagination_class was also explicitly None; it's now
+    # StandardResultsPagination (page/page_size, same as every other
+    # admin list), which means this endpoint's response shape changes
+    # from a plain array to {count, next, previous, results} — the
+    # frontend call site needs to be updated to read `.results` /
+    # send `page` & `page_size` to match.
+    pagination_class = StandardResultsPagination
+
+    ORDERING_MAP = {
+        'created_at': 'created_at',
+        '-created_at': '-created_at',
+        'code': 'code',
+        '-code': '-code',
+        'value': 'value',
+        '-value': '-value',
+        'end_date': 'end_date',
+        '-end_date': '-end_date',
+    }
 
     # Returns all discounts (both active and inactive)
     # ordered by newest first for the admin panel.
     def get_queryset(self):
-     """
-    Only non-deleted discounts.
-    """
-     return Discount.objects.filter(
-        is_delete=False
-    ).order_by(
-        "-created_at"
-    )
+        """
+        Only non-deleted discounts.
+
+        Query Params (NEW):
+        - search   (matches coupon code, case-insensitive partial)
+        - type     (percent / fixed)
+        - status   (active / expired — derived, not a stored column:
+                     "active" = is_active AND end_date in the future;
+                     everything else, including a manually deactivated
+                     coupon or one past its end_date, is "expired")
+        - ordering (see ORDERING_MAP above; defaults to -created_at)
+        """
+        qs = Discount.objects.filter(is_delete=False)
+
+        params = self.request.query_params
+
+        search = params.get('search')
+        if search:
+            qs = qs.filter(code__icontains=search)
+
+        discount_type = params.get('type')
+        if discount_type in ('percent', 'fixed'):
+            qs = qs.filter(type=discount_type)
+
+        status_param = params.get('status')
+        if status_param == 'active':
+            qs = qs.filter(is_active=True, end_date__gte=timezone.now())
+        elif status_param == 'expired':
+            qs = qs.filter(
+                Q(is_active=False) | Q(end_date__lt=timezone.now())
+            )
+
+        ordering = params.get('ordering')
+        qs = qs.order_by(self.ORDERING_MAP.get(ordering, '-created_at'))
+
+        return qs
 
     # FIX (Frontend Bug Report — Audit Logs, Sep 2026): no admin write
     # endpoint besides Adjust Stock was writing to the shared AuditLog

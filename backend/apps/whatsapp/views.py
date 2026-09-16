@@ -1,10 +1,12 @@
 # PATH: apps/whatsapp/views.py
 
 import os
+import re
 import hmac
 import hashlib
 import requests
 from django.conf import settings
+from django.db.models import Max, Count
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from rest_framework import generics, permissions, status
@@ -15,6 +17,8 @@ from .models import WhatsAppLog, WhatsAppSession
 from .serializers import WhatsAppLogSerializer, WhatsAppSessionSerializer, SendWhatsAppMessageSerializer
 from apps.users.permissions import IsAdmin
 from apps.stores.models import Store
+from apps.orders.models import Customer
+from core.pagination import StandardResultsPagination
 
 META_VERIFY_TOKEN = os.getenv('META_VERIFY_TOKEN', '')
 META_WHATSAPP_TOKEN = os.getenv('META_WHATSAPP_TOKEN', '')
@@ -206,3 +210,79 @@ class AdminWhatsAppSessionsView(generics.ListAPIView):
     serializer_class = WhatsAppSessionSerializer
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
     queryset = WhatsAppSession.objects.all().order_by('-last_active')
+
+
+def _last10_digits(phone):
+    """Digits-only, last 10 chars — a country-code/leading-zero-agnostic
+    key for matching a WhatsApp number (e.g. '923001234567', as sent by
+    Meta) against a stored Customer.phone (e.g. '+92 300 1234567' or
+    '03001234567'). Both formats share the same trailing 10 digits.
+    """
+    digits = re.sub(r'\D', '', phone or '')
+    return digits[-10:] if digits else ''
+
+
+class AdminWhatsAppConversationsView(generics.GenericAPIView):
+    """
+    GET /api/v1/admin/whatsapp/conversations/?search=&page=&page_size=
+
+    NEW (Frontend audit, Sep 2026): the admin "Numbers" page needed a
+    real, paginated, searchable list of every phone number that has
+    ever exchanged a WhatsApp message with the store. It was previously
+    reusing AdminWhatsAppSessionsView — a small, bounded list of only
+    the numbers currently mid-flow — and doing the search-match and
+    pagination itself in the browser, plus a second, frontend-only
+    lookup against the customer list just to match by customer name.
+
+    This is one row per distinct phone_number in WhatsAppLog (the full
+    message history, not just active sessions), newest activity first.
+    `search` matches either the phone number itself, or the name of the
+    Customer linked to that number — matched by comparing the last 10
+    digits of both numbers, since WhatsApp numbers and stored customer
+    phone numbers aren't always formatted the same way (country code
+    vs. leading zero, spaces/dashes, etc.).
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+    pagination_class = StandardResultsPagination
+
+    def get(self, request):
+        search = request.query_params.get('search', '').strip()
+
+        rows = list(
+            WhatsAppLog.objects
+            .values('phone_number')
+            .annotate(
+                last_message_at=Max('created_at'),
+                message_count=Count('id'),
+                is_admin=Max('is_admin'),
+            )
+            .order_by('-last_message_at')
+        )
+
+        # Build a {last-10-digits -> customer name} map once, up front,
+        # rather than re-querying per row.
+        customer_names_by_digits = {
+            _last10_digits(phone): name
+            for phone, name in Customer.objects.exclude(
+                phone__isnull=True
+            ).exclude(phone='').values_list('phone', 'name')
+        }
+
+        for row in rows:
+            row['customer_name'] = customer_names_by_digits.get(
+                _last10_digits(row['phone_number'])
+            )
+
+        if search:
+            search_lower = search.lower()
+            rows = [
+                row for row in rows
+                if search_lower in row['phone_number'].lower()
+                or (row['customer_name'] and search_lower in row['customer_name'].lower())
+            ]
+
+        page = self.paginate_queryset(rows)
+        if page is not None:
+            return self.get_paginated_response(page)
+
+        return Response(rows)

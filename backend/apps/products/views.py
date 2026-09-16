@@ -270,10 +270,16 @@ class ProductViewSet(viewsets.ModelViewSet):
 
         q = request.query_params.get('q')
         if q:
+            # NEW (Frontend audit, Sep 2026): 'q' now also matches the
+            # product's category name — previously a customer typing a
+            # category name (e.g. "Shoes") into the navbar search got
+            # zero results because q only matched name/description/sku,
+            # even though the category itself exists.
             qs = qs.filter(
                 Q(name__icontains=q) |
                 Q(description__icontains=q) |
-                Q(sku__icontains=q)
+                Q(sku__icontains=q) |
+                Q(category__name__icontains=q)
             )
 
         # FIX (Bug 1 / A1 / E3): 'category_id' ab sahi se padha ja raha hai,
@@ -375,17 +381,34 @@ class ProductViewSet(viewsets.ModelViewSet):
         # FIX (Cross-check, Sep 2026 — PDF Part 2 Item 5): same 'stock' ->
         # available_stock (total_stock - reserved_stock) fix as in_stock
         # above.
-        status_param = request.query_params.get('status')
-        if status_param == 'out_of_stock':
-            qs = qs.filter(total_stock__lte=F('reserved_stock'))
-        elif status_param == 'low_stock':
+        # FIX (Frontend audit, Sep 2026): 'status' now accepts 2+ values
+        # at once — comma-separated (?status=out_of_stock,low_stock) and
+        # repeated (?status=out_of_stock&status=low_stock) both work, the
+        # same way category_id already does above — so Inventory Alerts
+        # can select multiple status tabs in a single request instead of
+        # looping one request per status and merging in the browser.
+        status_values = request.query_params.getlist('status')
+        statuses = []
+        for raw in status_values:
+            statuses.extend([v.strip() for v in raw.split(',') if v.strip()])
+
+        if statuses:
             qs = qs.annotate(
                 _available_stock=F('total_stock') - F('reserved_stock')
-            ).filter(_available_stock__gt=0, _available_stock__lte=F('low_stock_threshold'))
-        elif status_param == 'healthy':
-            qs = qs.annotate(
-                _available_stock=F('total_stock') - F('reserved_stock')
-            ).filter(_available_stock__gt=F('low_stock_threshold'))
+            )
+            status_filter = Q()
+            if 'out_of_stock' in statuses:
+                status_filter |= Q(_available_stock__lte=0)
+            if 'low_stock' in statuses:
+                status_filter |= Q(
+                    _available_stock__gt=0,
+                    _available_stock__lte=F('low_stock_threshold'),
+                )
+            if 'healthy' in statuses:
+                status_filter |= Q(_available_stock__gt=F('low_stock_threshold'))
+
+            if status_filter:
+                qs = qs.filter(status_filter)
 
         # FIX: 'ordering' param ab handle ho raha hai (pehle ignore hota tha).
         # Sirf inhi fields pe ordering allow hai — kisi bhi arbitrary column
@@ -422,11 +445,38 @@ class ProductViewSet(viewsets.ModelViewSet):
         bana hai), is liye field kabhi response mein aati hi nahi thi.
         Ab isके liye alag, chota LowStockProductSerializer use ho raha hai
         jo sirf doc-required fields return karta hai.
+
+        FIX (Frontend audit, Sep 2026): this endpoint used to return the
+        FULL unpaginated list with no search/category params, so
+        selecting "Low Stock" together with a text search or a category
+        filter made the frontend download everything and do the
+        search-match, category-match, and pagination itself in the
+        browser. Now accepts the same q / category_id / page / page_size
+        params as /products/search/, applied server-side before the
+        Python low-stock comparison below (which still has to happen in
+        Python since available_stock/low_stock_threshold isn't a single
+        DB column to filter/order by directly).
         """
         qs = Product.objects.filter(
             is_active=True,
             is_delete=False,
         )
+
+        q = request.query_params.get('q')
+        if q:
+            qs = qs.filter(
+                Q(name__icontains=q) |
+                Q(description__icontains=q) |
+                Q(sku__icontains=q) |
+                Q(category__name__icontains=q)
+            )
+
+        category_id_values = request.query_params.getlist('category_id')
+        category_ids = []
+        for raw in category_id_values:
+            category_ids.extend([v.strip() for v in raw.split(',') if v.strip()])
+        if category_ids:
+            qs = qs.filter(category_id__in=category_ids)
 
         # FIX (Cross-check, Sep 2026 — PDF Part 2 Item 5): was comparing
         # p.stock (the deprecated field, frozen since nothing updates it
@@ -435,6 +485,22 @@ class ProductViewSet(viewsets.ModelViewSet):
         # (total_stock - reserved_stock), same as everywhere else post
         # Reserved Stock change.
         low_stock_products = [p for p in qs if p.available_stock <= p.low_stock_threshold]
+
+        # IMPORTANT: pagination is opt-in, gated on `page` actually being
+        # sent — same reasoning as CategoryViewSet.list(). This endpoint
+        # has two consumers: the small admin-dashboard "red-alert"
+        # widget (documented as expecting a plain array, no wrapper) and
+        # the fuller Low Stock admin table (which needs search/
+        # category_id/pagination and will send page/page_size). Calling
+        # paginate_queryset() unconditionally would always return the
+        # {count, next, previous, results} shape and silently truncate
+        # the dashboard widget to one page — so it's only used when the
+        # caller explicitly asks for a page.
+        if "page" in request.query_params:
+            page = self.paginate_queryset(low_stock_products)
+            serializer = LowStockProductSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
         serializer = LowStockProductSerializer(low_stock_products, many=True)
         return Response(serializer.data)
 

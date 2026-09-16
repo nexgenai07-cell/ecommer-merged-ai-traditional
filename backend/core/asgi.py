@@ -12,7 +12,7 @@ import os
 from django.core.asgi import get_asgi_application
 from apps.ai.debug_middleware import WebSocketDebugMiddleware
 
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings.development')
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'core.settings.production')
 
 django_asgi_app = get_asgi_application()
 

@@ -18,7 +18,7 @@ from django.db.models.functions import (
 )
 from django.utils import timezone
 
-from rest_framework import permissions, status
+from rest_framework import permissions, status, generics
 from rest_framework.views import APIView
 from rest_framework.response import Response
 
@@ -27,6 +27,7 @@ from apps.products.models import Product, Discount
 from apps.social.models import SocialPost
 from apps.returns.models import Return, Complaint
 from apps.users.permissions import IsAdmin
+from core.pagination import StandardResultsPagination
 
 def parse_date_range(request):
     """
@@ -421,15 +422,28 @@ class OrdersAnalyticsView(APIView):
 
 
 
-class BestSellersView(APIView):
-    """GET /api/v1/analytics/products/best-sellers/?start_date=&end_date=&limit=5"""
+class BestSellersView(generics.GenericAPIView):
+    """GET /api/v1/analytics/products/best-sellers/?start_date=&end_date=&limit=5&category_id=&page=&page_size=
+
+    FIX (Frontend audit, Sep 2026): added category_id (accepts a single
+    id or comma-separated ids, same convention as elsewhere in the app)
+    and real page/page_size pagination — previously this was hard
+    -capped at `limit` (frontend used limit=50) with no way to see
+    products ranked 51+. When `page` is passed, the standard
+    {count, next, previous, results} shape is returned instead; when
+    it's omitted, the old `limit`-sliced plain-array behaviour is kept
+    unchanged for existing callers (e.g. dashboard widgets using
+    ?limit=5).
+    """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
+    pagination_class = StandardResultsPagination
 
 
     def get(self, request):
         start_date = request.query_params.get("start_date")
         end_date = request.query_params.get("end_date")
         limit = int(request.query_params.get("limit", 5))
+        category_id = request.query_params.get("category_id")
 
 
         # FIX (Sep 2026 — Total Spent / Revenue consistency): see DashboardView above.
@@ -441,38 +455,60 @@ class BestSellersView(APIView):
         if end_date:
             qs = qs.filter(order__created_at__date__lte=end_date)
 
+        # NEW: category filter — accepts one id or comma-separated ids.
+        if category_id:
+            category_ids = [v.strip() for v in category_id.split(",") if v.strip()]
+            if category_ids:
+                qs = qs.filter(product__category_id__in=category_ids)
 
-        data = (
+
+        qs = (
             qs.values("product_id", "product_name")
               .annotate(
                   total_sold=Sum("quantity"),
                   total_revenue=Sum("total_price"),
               )
-              .order_by("-total_sold")[:limit]
+              .order_by("-total_sold")
         )
 
+        def _serialize(rows):
+            return [
+                {
+                    "product_id": item["product_id"],
+                    "name": item["product_name"],   # API docs expect "name"
+                    "total_sold": item["total_sold"],
+                    "total_revenue": item["total_revenue"],
+                }
+                for item in rows
+            ]
 
-        response = [
-            {
-                "product_id": item["product_id"],
-                "name": item["product_name"],   # API docs expect "name"
-                "total_sold": item["total_sold"],
-                "total_revenue": item["total_revenue"],
-            }
-            for item in data
-        ]
+        # NEW: real pagination — only kicks in when the caller actually
+        # sends a `page` param, so existing ?limit=N callers (e.g.
+        # dashboard widgets) keep getting the exact same plain-array
+        # response they always did.
+        if "page" in request.query_params:
+            page = self.paginate_queryset(qs)
+            return self.get_paginated_response(_serialize(page))
+
+        return Response(_serialize(qs[:limit]))
 
 
-        return Response(response)
+class LowPerformingProductsView(generics.GenericAPIView):
+    """GET /api/v1/analytics/products/low-performing/?limit=5&category_id=&page=&page_size= — least sold active products
 
-
-class LowPerformingProductsView(APIView):
-    """GET /api/v1/analytics/products/low-performing/?limit=5 — least sold active products"""
+    FIX (Frontend audit, Sep 2026): same category_id + real pagination
+    fix as BestSellersView above — see that docstring for the full
+    rationale. The original design wanted a "Category: All" filter here
+    and it had to be removed from the UI since the backend had nowhere
+    to send it; category_id now exists for that.
+    """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
+    pagination_class = StandardResultsPagination
 
 
     def get(self, request):
         limit = int(request.query_params.get('limit', 5))
+        category_id = request.query_params.get('category_id')
 
 
         # FIX (Sep 2026 — Total Spent / Revenue consistency): see DashboardView above.
@@ -488,21 +524,34 @@ class LowPerformingProductsView(APIView):
     is_active=True,
     is_delete=False,
         )
-        ranked = sorted(products, key=lambda p: sold_map.get(p.id, 0))[:limit]
 
+        # NEW: category filter — accepts one id or comma-separated ids.
+        if category_id:
+            category_ids = [v.strip() for v in category_id.split(',') if v.strip()]
+            if category_ids:
+                products = products.filter(category_id__in=category_ids)
 
-        data = [
-            {
-                'product_id': p.id,
-                'name': p.name,
-                'total_sold': sold_map.get(p.id, 0),
-                'stock': p.stock,
-            }
-            for p in ranked
-        ]
+        ranked = sorted(products, key=lambda p: sold_map.get(p.id, 0))
 
+        def _serialize(rows):
+            return [
+                {
+                    'product_id': p.id,
+                    'name': p.name,
+                    'total_sold': sold_map.get(p.id, 0),
+                    'stock': p.stock,
+                }
+                for p in rows
+            ]
 
-        return Response(data)
+        # NEW: real pagination — only kicks in when the caller actually
+        # sends a `page` param, so existing ?limit=N callers keep
+        # getting the exact same plain-array response they always did.
+        if "page" in request.query_params:
+            page = self.paginate_queryset(ranked)
+            return self.get_paginated_response(_serialize(page))
+
+        return Response(_serialize(ranked[:limit]))
 
 
 

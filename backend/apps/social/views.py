@@ -118,8 +118,20 @@ class SocialPostViewSet(viewsets.ModelViewSet):
         """
         Returns scheduled/published posts — frontend groups these by date
         to build the month calendar view.
+
+        FIX (Frontend audit, Sep 2026 — low priority): added an optional
+        `platform` query param so the platform filter (Instagram/
+        Facebook/etc.) can be applied server-side instead of only in the
+        browser. Low priority per the audit since a month's post count
+        is naturally small, but kept consistent with every other list
+        endpoint in the app as post volume grows.
         """
         qs = self.get_queryset().filter(status__in=['scheduled', 'published'])
+
+        platform = request.query_params.get('platform')
+        if platform:
+            qs = qs.filter(platform=platform)
+
         return Response(SocialPostSerializer(qs, many=True).data)
 
 

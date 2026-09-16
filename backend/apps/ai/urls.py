@@ -1,7 +1,14 @@
 # PATH: apps/ai/urls.py
 
 from django.urls import path
-from .views import StartChatSessionView, ChatSessionHistoryView, ClearChatSessionView, AuditLogListView
+from .views import (
+    StartChatSessionView,
+    ChatSessionHistoryView,
+    ClearChatSessionView,
+    AuditLogListView,
+    AuditLogEntityListView,
+    AuditLogUserListView,
+)
 from .admin_views import StartAdminChatSessionView
 from .session_views import ChatSessionListView, AdminChatSessionListView, DeleteChatSessionView
 from .admin_action_views import ConfirmAdminActionView, CancelAdminActionView
@@ -32,5 +39,7 @@ urlpatterns = [
 ]
 
 audit_log_urlpatterns = [
+    path('entities/', AuditLogEntityListView.as_view(), name='audit-log-entities'),
+    path('users/', AuditLogUserListView.as_view(), name='audit-log-users'),
     path('', AuditLogListView.as_view(), name='audit-log-list'),
 ]

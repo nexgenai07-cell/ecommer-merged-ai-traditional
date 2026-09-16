@@ -4,11 +4,13 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
+from django.db.models import Count
 
 from .models import Category
 from .serializers import CategorySerializer
 from apps.users.permissions import IsAdmin
 from apps.ai.audit import log_manual_admin_action as log_admin_action
+from core.pagination import StandardResultsPagination
 
 
 class CategoryViewSet(viewsets.ModelViewSet):
@@ -21,16 +23,39 @@ class CategoryViewSet(viewsets.ModelViewSet):
 
     GET    /api/v1/categories/check-name/
            -> check category name availability (admin only)
+
+    Query Params on the list endpoint (NEW — Frontend audit, Sep 2026):
+    - search              (matches category name, case-insensitive partial)
+    - start_date/end_date  (YYYY-MM-DD, against created_at)
+    - ordering            (name / -name / created_at / -created_at /
+                            product_count / -product_count; defaults to
+                            'name' — same default the old Meta.ordering
+                            gave everyone before)
+    - page / page_size    (via StandardResultsPagination)
+
+    FIX: this list used to have pagination_class = None and read no
+    query params at all — admins searching, date-filtering, sorting, or
+    paging the category table were doing 100% of that in the browser
+    after downloading every category. Response shape changes from a
+    plain array to {count, next, previous, results}, same as every
+    other admin list in this app.
     """
 
     serializer_class = CategorySerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
-    pagination_class = None
+    pagination_class = StandardResultsPagination
+
+    ORDERING_MAP = {
+        "name": "name",
+        "-name": "-name",
+        "created_at": "created_at",
+        "-created_at": "-created_at",
+        "product_count": "_product_count",
+        "-product_count": "-_product_count",
+    }
 
     def get_queryset(self):
-        queryset = Category.objects.filter(
-            is_delete=False
-        ).order_by("name")
+        queryset = Category.objects.filter(is_delete=False)
 
         # Customers and guests only see active categories.
         # Admins see both active and inactive categories.
@@ -40,7 +65,61 @@ class CategoryViewSet(viewsets.ModelViewSet):
         ):
             queryset = queryset.filter(is_active=True)
 
+        params = self.request.query_params
+
+        search = params.get("search")
+        if search:
+            queryset = queryset.filter(name__icontains=search)
+
+        start_date = params.get("start_date")
+        if start_date:
+            queryset = queryset.filter(created_at__date__gte=start_date)
+
+        end_date = params.get("end_date")
+        if end_date:
+            queryset = queryset.filter(created_at__date__lte=end_date)
+
+        # product_count isn't a real column — the admin table's "Product
+        # Count" column/sort needs it, so it's annotated here the same
+        # way total_orders/total_spent are annotated for the admin
+        # customer list, purely so the DB can filter/sort by it too.
+        queryset = queryset.annotate(
+            _product_count=Count("products", distinct=True)
+        )
+
+        ordering = params.get("ordering")
+        queryset = queryset.order_by(self.ORDERING_MAP.get(ordering, "name"))
+
         return queryset
+
+    def list(self, request, *args, **kwargs):
+        """
+        IMPORTANT: pagination is opt-in here, gated on the caller
+        actually sending a `page` param.
+
+        This endpoint has more than one consumer: the navbar, footer,
+        and shop-page filter checkboxes all fetch this and expect the
+        full flat array in one call (this was the documented, deliberate
+        reason pagination_class was None before). The admin Categories
+        table is the only consumer that needs search/date/ordering/
+        pagination. Simply turning on pagination_class for the whole
+        ViewSet would have paginated ALL of those callers, silently
+        cutting the navbar/footer/filter list down to one page — so
+        list() is overridden to only return the paginated
+        {count, next, previous, results} shape when `page` is present;
+        every other caller keeps getting the exact plain array they
+        always did (search/date/ordering filters still apply either way
+        if the admin table wants to use them without paging).
+        """
+        queryset = self.filter_queryset(self.get_queryset())
+
+        if "page" in request.query_params:
+            page = self.paginate_queryset(queryset)
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
 
     def get_permissions(self):
         if self.action in ["list", "retrieve"]:
