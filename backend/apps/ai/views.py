@@ -139,9 +139,22 @@ class AuditLogListView(generics.ListAPIView):
         if action_param in ('create', 'update', 'delete'):
             qs = qs.filter(action__startswith=f'{action_param}_')
 
-        user_id = params.get('user')
-        if user_id:
-            qs = qs.filter(user_id=user_id)
+        # FIX (17 Sep 2026 — production crash): the frontend's User filter
+        # dropdown (populated from Admin — Audit Log Users, API 82.2,
+        # which returns {id, name, email}) is sending the admin's display
+        # name (e.g. "Test Admin 2") as the value instead of the numeric
+        # id. Passing that straight into user_id=... crashed with a 500
+        # (ValueError: Field 'id' expected a number) for every non-numeric
+        # value. Now: a numeric value is still treated as the id (so
+        # nothing breaks if/when the frontend switches to sending id);
+        # anything else is matched against the admin's name instead, so
+        # the filter works either way and never crashes on bad input.
+        user_param = params.get('user')
+        if user_param:
+            if user_param.isdigit():
+                qs = qs.filter(user_id=user_param)
+            else:
+                qs = qs.filter(user__name__iexact=user_param)
 
         search = params.get('search')
         if search:
