@@ -264,8 +264,8 @@ class LoginView(APIView):
         )
         
 
-# Logs out the current user by blacklisting
-# the provided refresh token.
+# Logs out the current user by blacklisting the provided refresh token
+# and removing that device's UserSession row.
 class LogoutView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -286,6 +286,17 @@ class LogoutView(APIView):
                 {"error": "Invalid or expired refresh token."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # FIX: this only ever blacklisted the JWT — it never touched the
+        # matching UserSession row, so a device the user just logged out
+        # of kept showing up in GET /sessions/ (the "Active Sessions"
+        # list) until RevokeAllSessionsView or RevokeSessionView ran.
+        # Deleting the row here, matched by the same refresh_jti, keeps
+        # the sessions list accurate immediately after a normal logout.
+        UserSession.objects.filter(
+            user=request.user,
+            refresh_jti=str(token["jti"]),
+        ).delete()
 
         return Response(
             {"message": "Logged out successfully."},
@@ -503,6 +514,65 @@ class RevokeAllSessionsView(APIView):
 
         return Response(
             {"message": "All sessions have been signed out."},
+            status=status.HTTP_200_OK,
+        )
+
+
+# Signs the user out from a SINGLE device/session, leaving every
+# other active session untouched. Used by the "Active Sessions" list on
+# the profile page — customer or admin can pick any one device
+# (including one that isn't the device they're currently using) and
+# sign just that one out, instead of the all-or-nothing choice
+# RevokeAllSessionsView gives.
+#
+# Works for both roles (admin and customer) since UserSession is on the
+# base User model, same as everywhere else session-related.
+class RevokeSessionView(APIView):
+    """
+    POST /api/v1/sessions/{session_id}/revoke/
+
+    Signs out ONE specific session by its UserSession id.
+
+    Ownership is enforced by scoping the lookup to
+    UserSession.objects.filter(user=request.user) — same pattern as
+    SessionListView.get_queryset() — so a user can never revoke someone
+    else's session, even by guessing an id. A session that doesn't
+    exist or doesn't belong to the requester returns 404, without
+    revealing which of the two is actually true.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, session_id):
+        try:
+            session = UserSession.objects.get(
+                id=session_id,
+                user=request.user,
+            )
+        except UserSession.DoesNotExist:
+            return Response(
+                {"error": "Session not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        from rest_framework_simplejwt.token_blacklist.models import (
+            OutstandingToken,
+            BlacklistedToken,
+        )
+
+        # Blacklist only THIS session's refresh token (matched by jti),
+        # leaving every other session's token untouched.
+        token = OutstandingToken.objects.filter(
+            user=request.user,
+            jti=session.refresh_jti,
+        ).first()
+
+        if token is not None:
+            BlacklistedToken.objects.get_or_create(token=token)
+
+        session.delete()
+
+        return Response(
+            {"message": "Session signed out successfully."},
             status=status.HTTP_200_OK,
         )
 

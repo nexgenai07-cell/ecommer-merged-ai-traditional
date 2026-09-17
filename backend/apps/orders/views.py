@@ -89,6 +89,20 @@ def get_or_create_customer(user, store_id=1):
     return customer
 
 
+# NEW (Buy Now): minimal stand-in for a real CartItem, used only by
+# CheckoutView's Buy Now branch below. Exposes exactly the attributes
+# (product, product_id, quantity) that the checkout logic below already
+# reads off a real CartItem, so every downstream step — stock locking,
+# subtotal calculation, OrderItem creation, stock reservation — runs
+# completely unchanged whether the order came from the persisted cart or
+# a single Buy Now click.
+class _BuyNowItem:
+    def __init__(self, product, quantity):
+        self.product = product
+        self.product_id = product.id
+        self.quantity = quantity
+
+
 def reserve_stock_for_order(order):
     """
     Transition 1: Checkout (API 55), order created as pending_payment
@@ -457,18 +471,46 @@ class CheckoutView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
+        # NEW (Buy Now): if buy_now_product_id is present, this checkout
+        # is for ONE product clicked straight from the product detail
+        # page — the persisted cart is never read or modified in this
+        # branch, so the customer's real cart survives a Buy Now
+        # purchase completely untouched.
+        buy_now_product_id = data.get("buy_now_product_id")
+        is_buy_now = bool(buy_now_product_id)
+
         cart = Cart.objects.filter(user=request.user).first()
 
-        if not cart or not cart.items.exists():
-            return Response(
-                {"error": "Your cart is empty."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        if is_buy_now:
+            try:
+                buy_now_product = Product.objects.get(
+                    id=buy_now_product_id,
+                    is_active=True,
+                    is_delete=False,
+                )
+            except Product.DoesNotExist:
+                return Response(
+                    {"error": "Product not found."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            checkout_store_id = buy_now_product.store_id
+            # Buy Now does not apply whatever coupon happens to be on the
+            # customer's cart — it's a separate, one-off purchase.
+            checkout_coupon = None
+        else:
+            if not cart or not cart.items.exists():
+                return Response(
+                    {"error": "Your cart is empty."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            checkout_store_id = cart.store_id
+            checkout_coupon = cart.coupon
 
         # Resolve the customer profile first.
         customer = get_or_create_customer(
             request.user,
-            store_id=cart.store_id,
+            store_id=checkout_store_id,
         )
 
         # ============================================================
@@ -567,9 +609,21 @@ class CheckoutView(APIView):
 
         with transaction.atomic():
 
-            cart_items = list(
-                cart.items.select_related("product").all()
-            )
+            # NEW (Buy Now): a single synthetic item instead of the
+            # cart's real items — see _BuyNowItem above. Everything below
+            # this point (stock locking, subtotal, order/OrderItem
+            # creation, stock reservation) runs unchanged either way.
+            if is_buy_now:
+                cart_items = [
+                    _BuyNowItem(
+                        product=buy_now_product,
+                        quantity=data.get("buy_now_quantity") or 1,
+                    )
+                ]
+            else:
+                cart_items = list(
+                    cart.items.select_related("product").all()
+                )
 
             product_ids = [
                 item.product_id
@@ -628,13 +682,13 @@ class CheckoutView(APIView):
 
             discount_amount = 0
 
-            if cart.coupon:
-                if cart.coupon.type == "percent":
+            if checkout_coupon:
+                if checkout_coupon.type == "percent":
                     discount_amount = (
-                        subtotal * cart.coupon.value
+                        subtotal * checkout_coupon.value
                     ) / 100
                 else:
-                    discount_amount = cart.coupon.value
+                    discount_amount = checkout_coupon.value
 
                 discount_amount = min(
                     discount_amount,
@@ -660,7 +714,7 @@ class CheckoutView(APIView):
             # ============================================================
 
             order = Order.objects.create(
-                store_id=cart.store_id,
+                store_id=checkout_store_id,
                 customer=customer,
                 order_number=generate_order_number(),
                 total_amount=total_amount,
@@ -722,11 +776,17 @@ class CheckoutView(APIView):
 
             # ============================================================
             # CLEAR CART
+            #
+            # NEW (Buy Now): skipped entirely — a Buy Now purchase never
+            # read from the persisted cart, so there is nothing on it to
+            # clear here, and the customer's actual cart is left exactly
+            # as it was before they clicked Buy Now.
             # ============================================================
 
-            cart.items.all().delete()
-            cart.coupon = None
-            cart.save()
+            if not is_buy_now and cart:
+                cart.items.all().delete()
+                cart.coupon = None
+                cart.save()
 
         # ================================================================
         # NOTIFICATION

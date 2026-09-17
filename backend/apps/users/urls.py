@@ -15,6 +15,7 @@ from .views import (
     SessionListView,
     RevokeAllSessionsView,
     # NEW
+    RevokeSessionView,
     ReactivateRequestView,
     ReactivateConfirmView,
 )
@@ -132,6 +133,14 @@ urlpatterns = [
         "sessions/revoke-all/",
         RevokeAllSessionsView.as_view(),
         name="revoke_all_sessions",
+    ),
+
+    # NEW: single-device sign-out — pick one session from the list
+    # returned by GET /sessions/ and sign just that one out.
+    path(
+        "sessions/<int:session_id>/revoke/",
+        RevokeSessionView.as_view(),
+        name="revoke_session",
     ),
 
     # ==========================================================

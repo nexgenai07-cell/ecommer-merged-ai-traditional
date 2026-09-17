@@ -283,3 +283,56 @@ class ProductStats(models.Model):
         db_table        = 'product_stats'
         unique_together = ['product', 'date']
         ordering        = ['-date']
+
+
+# NEW: Product reviews + star ratings for the product detail page
+# (rating average, "Based on N reviews" breakdown bars, individual
+# review cards with a "Verified Buyer" badge, and "Write a Review").
+#
+# One review per user per product — enforced at the DB level via the
+# partial unique constraint below (only among is_delete=False rows, same
+# soft-delete pattern already used for Product.name/sku), so re-reviewing
+# means editing the existing review (PUT), not creating a second one.
+class Review(models.Model):
+    RATING_CHOICES = [(i, str(i)) for i in range(1, 6)]
+
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.CASCADE,
+        related_name="reviews",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="product_reviews",
+    )
+    rating = models.PositiveSmallIntegerField(choices=RATING_CHOICES)
+    comment = models.TextField(blank=True, default="")
+
+    # Set automatically by the create endpoint (review_views.py) based on
+    # whether this user has a delivered order containing this product —
+    # never accepted directly from the request body.
+    is_verified_purchase = models.BooleanField(default=False)
+
+    # Lets an admin hide an inappropriate review without deleting it
+    # outright (separate from is_delete, which is the customer's own
+    # "delete my review" action).
+    is_active = models.BooleanField(default=True)
+    is_delete = models.BooleanField(default=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "product_reviews"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["product", "user"],
+                condition=models.Q(is_delete=False),
+                name="unique_active_review_per_user_per_product",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.user.email} rated {self.product.name} {self.rating}/5"

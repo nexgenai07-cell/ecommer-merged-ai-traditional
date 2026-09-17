@@ -326,6 +326,13 @@ class CheckoutSerializer(serializers.Serializer):
     ============================================================
     NEW (PDF Part 3): payment_method field
     ============================================================
+
+    NEW (Buy Now): buy_now_product_id / buy_now_quantity — when
+    buy_now_product_id is present, CheckoutView builds the order from
+    this single product+quantity instead of the persisted cart, and the
+    cart is left completely untouched. Both are optional; a normal cart
+    checkout (the existing behaviour) keeps working exactly as before
+    when they're omitted.
     """
 
     address_id = serializers.IntegerField(required=False, allow_null=True)
@@ -374,6 +381,21 @@ class CheckoutSerializer(serializers.Serializer):
         choices=["standard", "express"],
         required=True,
         help_text="Shipping method: standard (Rs. 299) or express (Rs. 999)",
+    )
+
+    # NEW (Buy Now): optional. Present only when the customer clicked
+    # "Buy Now" on a product detail page instead of checking out their
+    # cart.
+    buy_now_product_id = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        help_text="Buy Now: id of the single product to order, bypassing the cart.",
+    )
+    buy_now_quantity = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        default=1,
+        help_text="Buy Now: quantity of buy_now_product_id to order. Defaults to 1.",
     )
 
     # FIX (B19): city/address get real validation instead of none.

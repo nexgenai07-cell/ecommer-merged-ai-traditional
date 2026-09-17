@@ -7,7 +7,7 @@ from datetime import timedelta
 from django.conf import settings
 from django.core.cache import cache
 from django.db.models import (
-    Sum, Count, Min, Max, OuterRef, Subquery, IntegerField, Q, Value, DecimalField,
+    Sum, Count, Min, Max, OuterRef, Subquery, IntegerField, Q, Value, DecimalField, F,
 )
 from django.db.models.functions import (
     TruncDate,
@@ -26,6 +26,9 @@ from apps.orders.models import Order, OrderItem, Customer
 from apps.products.models import Product, Discount
 from apps.social.models import SocialPost
 from apps.returns.models import Return, Complaint
+from apps.categories.models import Category
+from apps.ai.models import AuditLog
+from apps.whatsapp.models import WhatsAppLog
 from apps.users.permissions import IsAdmin
 from core.pagination import StandardResultsPagination
 
@@ -755,12 +758,22 @@ class AnalyticsExportView(APIView):
     FIX (B1): 'type' was completely ignored before this fix - every
     request returned the exact same orders CSV no matter what type was
     passed. Now dispatches to a type-specific CSV export. The 10
-    accepted values are exactly the ones the frontend already sends
-    (confirmed, none needed renaming):
+    original accepted values are exactly the ones the frontend already
+    sends (confirmed, none needed renaming):
         sales, orders, discounts, inventory, returns, complaints,
         social_posts, customers, revenue, products
     A missing or unrecognized 'type' returns 400 with the full accepted
     list, instead of silently exporting orders.
+
+    NEW (16 Sep 2026 — Filtering Fix / frontend request): 4 more types
+    added so every admin page can export server-side instead of paging
+    through everything client-side and building the CSV in the browser:
+        categories, audit_logs, whatsapp_numbers, whatsapp_conversation
+    See each _export_<type> method below for its specific params.
+    'products' also gained the full Products-page filter set (category,
+    price range, stock status, search) it was missing — previously only
+    start_date/end_date/type/status were honoured, so this export could
+    never match what was actually filtered on screen.
 
     NOTE on column choices: the v7 doc didn't specify exact CSV columns
     per type (only that each type must export "a real CSV, not an
@@ -774,6 +787,8 @@ class AnalyticsExportView(APIView):
     ALLOWED_TYPES = {
         'sales', 'orders', 'discounts', 'inventory', 'returns',
         'complaints', 'social_posts', 'customers', 'revenue', 'products',
+        # NEW (16 Sep 2026 — Filtering Fix):
+        'categories', 'audit_logs', 'whatsapp_numbers', 'whatsapp_conversation',
     }
 
     def get(self, request):
@@ -791,6 +806,14 @@ class AnalyticsExportView(APIView):
             )
 
         start_date, end_date, _ = parse_date_range(request)
+
+        # NEW (16 Sep 2026 — Filtering Fix): whatsapp_conversation exports
+        # a single customer's message thread, so phone_number is required.
+        if export_type == 'whatsapp_conversation' and not request.query_params.get('phone_number'):
+            return Response(
+                {'error': "The 'phone_number' query parameter is required for type=whatsapp_conversation."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         response = HttpResponse(content_type='text/csv')
         response['Content-Disposition'] = f'attachment; filename="{export_type}_export.csv"'
@@ -872,26 +895,200 @@ class AnalyticsExportView(APIView):
     def _export_inventory(self, writer, start_date, end_date):
         # Inventory is a point-in-time snapshot (current stock levels),
         # so start_date/end_date are intentionally not applied here.
+        #
+        # FIX (16 Sep 2026 — Filtering Fix / export review): was exporting
+        # p.stock, the DEPRECATED field that nothing updates anymore (see
+        # Low Stock Products API 38's identical fix) — this CSV was
+        # silently exporting stale/wrong stock numbers. Uses
+        # available_stock (total_stock - reserved_stock), same as every
+        # other stock-reporting endpoint in the app.
         qs = Product.objects.filter(is_delete=False).select_related('category')
         writer.writerow(['SKU', 'Name', 'Category', 'Stock', 'Low Stock Threshold', 'Is Active'])
         for p in qs:
             writer.writerow([
                 p.sku, p.name, p.category.name if p.category else '',
-                p.stock, p.low_stock_threshold, p.is_active,
+                p.available_stock, p.low_stock_threshold, p.is_active,
             ])
 
     def _export_products(self, writer, start_date, end_date):
+        # NEW (16 Sep 2026 — Filtering Fix): previously only start_date/
+        # end_date were honoured, so this export could never match what
+        # was actually filtered on the Products page. Now accepts the
+        # same filters as GET /api/v1/products/search/ (API 29):
+        # q, category_id, min_price, max_price, in_stock, status.
         qs = Product.objects.filter(is_delete=False).select_related('category')
+
         if start_date:
             qs = qs.filter(created_at__date__gte=start_date)
         if end_date:
             qs = qs.filter(created_at__date__lte=end_date)
+
+        params = self.request.query_params
+
+        q = params.get('q')
+        if q:
+            qs = qs.filter(
+                Q(name__icontains=q) |
+                Q(description__icontains=q) |
+                Q(sku__icontains=q) |
+                Q(category__name__icontains=q)
+            )
+
+        category_id_values = params.getlist('category_id')
+        category_ids = []
+        for raw in category_id_values:
+            category_ids.extend([v.strip() for v in raw.split(',') if v.strip()])
+        if category_ids:
+            qs = qs.filter(category_id__in=category_ids)
+
+        min_price = params.get('min_price')
+        if min_price:
+            qs = qs.filter(price__gte=min_price)
+        max_price = params.get('max_price')
+        if max_price:
+            qs = qs.filter(price__lte=max_price)
+
+        in_stock = params.get('in_stock')
+        if in_stock == 'true':
+            qs = qs.filter(total_stock__gt=F('reserved_stock'))
+        elif in_stock == 'false':
+            qs = qs.filter(total_stock__lte=F('reserved_stock'))
+
+        status_values = params.getlist('status')
+        statuses = []
+        for raw in status_values:
+            statuses.extend([v.strip() for v in raw.split(',') if v.strip()])
+        if statuses:
+            qs = qs.annotate(_available_stock=F('total_stock') - F('reserved_stock'))
+            status_filter = Q()
+            if 'out_of_stock' in statuses:
+                status_filter |= Q(_available_stock__lte=0)
+            if 'low_stock' in statuses:
+                status_filter |= Q(_available_stock__gt=0, _available_stock__lte=F('low_stock_threshold'))
+            if 'healthy' in statuses:
+                status_filter |= Q(_available_stock__gt=F('low_stock_threshold'))
+            if status_filter:
+                qs = qs.filter(status_filter)
+
         writer.writerow(['SKU', 'Name', 'Category', 'Price', 'Stock', 'Is Active', 'Created At'])
         for p in qs:
             writer.writerow([
+                # FIX (16 Sep 2026 — Filtering Fix / export review): was
+                # p.stock (deprecated, frozen field) — see Low Stock
+                # Products API 38 and _export_inventory above for the
+                # same fix elsewhere. Uses available_stock instead.
                 p.sku, p.name, p.category.name if p.category else '',
-                p.price, p.stock, p.is_active, p.created_at,
+                p.price, p.available_stock, p.is_active, p.created_at,
             ])
+
+    def _export_categories(self, writer, start_date, end_date):
+        # NEW (16 Sep 2026 — Filtering Fix). Low priority per the
+        # frontend's request — Categories is a small, unpaginated list,
+        # so the previous behaviour (type not supported at all) already
+        # meant the frontend's own client-side export was complete and
+        # correct. Added anyway for consistency with the rest of the app.
+        qs = Category.objects.filter(is_delete=False)
+        if start_date:
+            qs = qs.filter(created_at__date__gte=start_date)
+        if end_date:
+            qs = qs.filter(created_at__date__lte=end_date)
+        writer.writerow(['Name', 'Is Active', 'Product Count', 'Created At'])
+        for c in qs.annotate(_product_count=Count('products', distinct=True)):
+            writer.writerow([c.name, c.is_active, c._product_count, c.created_at])
+
+    def _export_audit_logs(self, writer, start_date, end_date):
+        # NEW (16 Sep 2026 — Filtering Fix): same filters as
+        # GET /api/v1/admin/audit-logs/ (API 82) — entity, user, action,
+        # search — so the export matches what's filtered on screen.
+        qs = AuditLog.objects.select_related('user').all()
+        if start_date:
+            qs = qs.filter(created_at__date__gte=start_date)
+        if end_date:
+            qs = qs.filter(created_at__date__lte=end_date)
+
+        params = self.request.query_params
+
+        entity = params.get('entity')
+        if entity:
+            qs = qs.filter(entity=entity)
+
+        user_id = params.get('user')
+        if user_id:
+            qs = qs.filter(user_id=user_id)
+
+        action_param = params.get('action')
+        if action_param in ('create', 'update', 'delete'):
+            qs = qs.filter(action__startswith=f'{action_param}_')
+
+        search = params.get('search')
+        if search:
+            qs = qs.filter(Q(action__icontains=search))
+
+        writer.writerow(['User', 'Action', 'Entity', 'Entity ID', 'IP Address', 'Source', 'Created At'])
+        for log in qs:
+            writer.writerow([
+                log.user.email if log.user else 'system', log.action, log.entity,
+                log.entity_id or '', log.ip_address or '', log.source, log.created_at,
+            ])
+
+    def _export_whatsapp_numbers(self, writer, start_date, end_date):
+        # NEW (16 Sep 2026 — Filtering Fix): same search filter and same
+        # fields as GET /api/v1/admin/whatsapp/conversations/ (API 116.1)
+        # so the export matches what's on screen. See that endpoint for
+        # the last-10-digits phone/customer-name matching rationale.
+        rows = list(
+            WhatsAppLog.objects
+            .values('phone_number')
+            .annotate(
+                last_message_at=Max('created_at'),
+                message_count=Count('id'),
+            )
+            .order_by('-last_message_at')
+        )
+
+        def _last10(phone):
+            digits = re.sub(r'\D', '', phone or '')
+            return digits[-10:] if digits else ''
+
+        customer_names_by_digits = {
+            _last10(phone): name
+            for phone, name in Customer.objects.exclude(phone__isnull=True)
+            .exclude(phone='').values_list('phone', 'name')
+        }
+        for row in rows:
+            row['customer_name'] = customer_names_by_digits.get(_last10(row['phone_number']))
+
+        search = self.request.query_params.get('search', '').strip()
+        if search:
+            search_lower = search.lower()
+            rows = [
+                row for row in rows
+                if search_lower in row['phone_number'].lower()
+                or (row['customer_name'] and search_lower in row['customer_name'].lower())
+            ]
+
+        writer.writerow(['Phone Number', 'Customer Name', 'Message Count', 'Last Message At'])
+        for row in rows:
+            writer.writerow([
+                row['phone_number'], row['customer_name'] or '',
+                row['message_count'], row['last_message_at'],
+            ])
+
+    def _export_whatsapp_conversation(self, writer, start_date, end_date):
+        # NEW (16 Sep 2026 — Filtering Fix): full message log for one
+        # phone number (required — validated in get() above), for the
+        # WhatsApp Chat Panel's export. Low priority per the frontend's
+        # request — the whole thread already loads on screen, so the
+        # previous client-side export was already complete and correct.
+        phone_number = self.request.query_params.get('phone_number')
+        qs = WhatsAppLog.objects.filter(phone_number=phone_number).order_by('created_at')
+        if start_date:
+            qs = qs.filter(created_at__date__gte=start_date)
+        if end_date:
+            qs = qs.filter(created_at__date__lte=end_date)
+        writer.writerow(['Direction', 'Message', 'Is Admin', 'Created At'])
+        for log in qs:
+            writer.writerow([log.direction, log.message, log.is_admin, log.created_at])
 
     def _export_returns(self, writer, start_date, end_date):
         qs = Return.objects.select_related('order', 'customer')

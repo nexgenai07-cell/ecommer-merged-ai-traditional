@@ -26,6 +26,7 @@ urlpatterns = [
     path('api/v1/categories/', include('apps.categories.urls')),
     path('api/v1/products/', include('apps.products.urls')),
     path('api/v1/discounts/', include('apps.products.discount_urls')),
+    path('api/v1/', include('apps.products.review_urls')),
 
     # Module 3 — Cart, Wishlist, Orders, Returns, Complaints, Customers
     path('api/v1/cart/', include('apps.cart.urls')),

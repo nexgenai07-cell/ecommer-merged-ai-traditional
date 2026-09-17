@@ -3,6 +3,7 @@
 import re
 
 from rest_framework import serializers
+from django.db.models import Avg, Sum
 from .models import Product, ProductImage, ProductHistory, StockMovement
 
 
@@ -148,6 +149,12 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     # ============================================================
     available_stock = serializers.SerializerMethodField()
 
+    # NEW: rating + sales info for the product detail page (star rating
+    # header, "Based on N reviews" bar chart, "4,120 sold" line).
+    average_rating = serializers.SerializerMethodField()
+    review_count = serializers.SerializerMethodField()
+    total_sold = serializers.SerializerMethodField()
+
     class Meta:
         model = Product
         fields = [
@@ -169,6 +176,10 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             "low_stock_threshold",
             "publish_at",
             "images",
+            # NEW
+            "average_rating",
+            "review_count",
+            "total_sold",
             "created_at",
             "updated_at",
         ]
@@ -188,6 +199,27 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     # ============================================================
     def get_available_stock(self, obj):
         return obj.total_stock - obj.reserved_stock
+
+    # NEW: average of every active, non-deleted review's rating.
+    # Rounded to 1 decimal place (e.g. 4.8), 0.0 when there are no
+    # reviews yet.
+    def get_average_rating(self, obj):
+        avg = obj.reviews.filter(
+            is_active=True, is_delete=False
+        ).aggregate(avg=Avg("rating"))["avg"]
+        return round(avg, 1) if avg is not None else 0.0
+
+    # NEW: count of active, non-deleted reviews — the "2,450" in
+    # "4.8 (2,450 reviews)".
+    def get_review_count(self, obj):
+        return obj.reviews.filter(is_active=True, is_delete=False).count()
+
+    # NEW: total units sold, summed across every ProductStats row for
+    # this product (ProductStats already tracks this daily for the
+    # analytics dashboard — this just totals it for the product page).
+    def get_total_sold(self, obj):
+        total = obj.stats.aggregate(total=Sum("total_sold"))["total"]
+        return total or 0
 
 
 # ============================================================
