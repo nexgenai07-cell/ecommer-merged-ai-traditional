@@ -64,6 +64,7 @@ def generate_order_number(): # Generates a unique order number for every new ord
     return f"ORD-{year}-{new_seq:05d}"
 
 # Finds an existing customer profile or creates one for the current user.
+# Finds an existing customer profile or creates one for the current user.
 def get_or_create_customer(user, store_id=1):
     try:
         customer, _ = Customer.objects.get_or_create(
@@ -76,18 +77,41 @@ def get_or_create_customer(user, store_id=1):
             },
         )
     except IntegrityError:
-        # NEW (Sep 2026 — defensive safety net): the (phone, store)
-        # blank-phone collision this used to hit is already fixed at the
-        # database level (see Customer.Meta.constraints in models.py —
-        # blank phone no longer participates in that uniqueness check).
-        # This catch only remains for the genuine, much rarer case of
-        # two simultaneous requests for the SAME user+store both racing
-        # get_or_create() at once (not something a blank phone can cause
-        # anymore) — one of them wins the insert, the other lands here
-        # and just needs to re-fetch the row the first one created.
-        customer = Customer.objects.get(user=user, store_id=store_id)
+        # This IntegrityError can happen for two different reasons:
+        #
+        # (a) A genuine race — two simultaneous requests for the SAME
+        #     user+store both hit get_or_create() at once. One wins the
+        #     insert; this one just needs to re-fetch the row the first
+        #     one created. Re-fetching below succeeds immediately.
+        #
+        # (b) FIX (backfill crash — Sep 2026): this user's phone number is
+        #     already used by a DIFFERENT customer in this store (e.g.
+        #     two accounts registered with the same/shared phone number,
+        #     or leftover test data). The (phone, store) uniqueness
+        #     constraint (customers_phone_store_nonblank_uniq) blocks
+        #     that even though (user, store) is still completely free —
+        #     so the re-fetch below finds nothing and raises
+        #     Customer.DoesNotExist. Previously this crashed the whole
+        #     request (and, in bulk, the whole backfill_customers run,
+        #     stopping partway through and leaving remaining users
+        #     unprocessed). Now it retries once with phone left blank, so
+        #     the customer still gets a profile — and shows up on the
+        #     admin dashboard — instead of the whole operation failing.
+        #     The real phone can be corrected later from the customer's
+        #     own address book.
+        try:
+            customer = Customer.objects.get(user=user, store_id=store_id)
+        except Customer.DoesNotExist:
+            customer, _ = Customer.objects.get_or_create(
+                user=user,
+                store_id=store_id,
+                defaults={
+                    "name": user.name,
+                    "phone": "",
+                    "email": user.email,
+                },
+            )
     return customer
-
 
 # NEW (Buy Now): minimal stand-in for a real CartItem, used only by
 # CheckoutView's Buy Now branch below. Exposes exactly the attributes
@@ -589,9 +613,13 @@ class CheckoutView(APIView):
         # NEW (Sep 2026 — Checkout OTP verification): block order
         # creation until the customer has requested AND verified the
         # code emailed to their account address (see otp_views.py).
-        # A verification is single-use — consumed further down, right
-        # after the order is actually created — so placing another
-        # order later needs a fresh send-otp/verify-otp round trip.
+        #
+        # FIX (Bug report, Sep 2026): verification is now permanent
+        # (see CheckoutOTP.is_verification_usable()) — a customer only
+        # has to do this once for their account. This check still runs
+        # on every order, but it will simply keep passing for a
+        # customer who already verified previously, with no new email
+        # sent and no re-verification prompt.
         # ============================================================
         checkout_otp = CheckoutOTP.objects.filter(user=request.user).first()
 
@@ -631,16 +659,25 @@ class CheckoutView(APIView):
                 if item.product_id
             ]
 
-            # Lock Product rows so concurrent checkouts cannot both
-            # read the same stale stock values.
+            # FIX (Bug report, Sep 2026): this used to lock/read
+            # Product rows with no is_delete/is_active filter at all, so
+            # a product an admin had already deleted was still treated
+            # as "available" here (as long as its stock numbers looked
+            # fine) and a customer could complete checkout with it.
+            # Deleted/inactive products are now excluded from
+            # locked_products entirely, which makes the `if not product`
+            # branch below correctly treat them as unavailable.
             locked_products = {
                 p.id: p
                 for p in Product.objects.select_for_update().filter(
-                    id__in=product_ids
+                    id__in=product_ids,
+                    is_delete=False,
+                    is_active=True,
                 )
             }
 
             out_of_stock = []
+            unavailable_product_ids = []
 
             for item in cart_items:
                 product = locked_products.get(item.product_id)
@@ -659,7 +696,22 @@ class CheckoutView(APIView):
                         else "Unknown product"
                     )
 
+                if not product:
+                    unavailable_product_ids.append(item.product_id)
+
             if out_of_stock:
+                # FIX (Bug report, Sep 2026): as a safety net (e.g. for
+                # any cart rows left over from before this fix), also
+                # drop the no-longer-existing/deleted products out of the
+                # customer's actual persisted cart here, so retrying
+                # checkout right after this error doesn't hit the same
+                # wall — this never touches Buy Now, which doesn't use a
+                # persisted cart.
+                if not is_buy_now and unavailable_product_ids:
+                    cart.items.filter(
+                        product_id__in=unavailable_product_ids
+                    ).delete()
+
                 return Response(
                     {
                         "error": (
@@ -729,10 +781,11 @@ class CheckoutView(APIView):
                 notes=data.get("notes", ""),
             )
 
-            # Spend this verification now that the order actually exists,
-            # so it can't be reused to authorize a second order.
-            checkout_otp.consumed_at = timezone.now()
-            checkout_otp.save(update_fields=["consumed_at", "updated_at"])
+            # FIX (Bug report, Sep 2026): verification is permanent now
+            # (see CheckoutOTP.is_verification_usable()) — it is
+            # intentionally NOT marked as "consumed" here anymore, so
+            # this same verified row keeps authorizing every future
+            # order this customer places, with no re-verification.
 
             # ============================================================
             # CREATE ORDER ITEMS

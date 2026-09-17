@@ -7,6 +7,12 @@
 # isn't usable — that's the actual enforcement point. These two views are
 # only how the customer requests + verifies that code.
 #
+# FIX (Bug report, Sep 2026): verification is a ONE-TIME thing per
+# account now, not per order. SendCheckoutOTPView below now short-circuits
+# (no email sent) if this user already has a permanently-usable
+# verification, so the frontend can call it as normal on every checkout
+# and simply get told "already verified" instead of a fresh code.
+#
 # SMS/phone delivery is a deliberate follow-up, not covered here — email
 # is the only channel wired up for now, same pattern as the existing
 # email-OTP flows in apps/users (2FA login code, email-change code).
@@ -80,6 +86,11 @@ class SendCheckoutOTPView(APIView):
     Sends (or resends) a 6-digit verification code to the logged-in
     customer's account email. Call this before /checkout/verify-otp/ and
     before POSTing to /checkout/ itself.
+
+    FIX (Bug report, Sep 2026): verification is permanent per account —
+    if this user already has a usable (previously verified) row, no new
+    email is sent; the response just confirms they're already verified
+    so the frontend can skip straight to placing the order.
     """
     permission_classes = [permissions.IsAuthenticated, IsCustomer]
 
@@ -93,6 +104,17 @@ class SendCheckoutOTPView(APIView):
             )
 
         existing = CheckoutOTP.objects.filter(user=user).first()
+
+        # FIX (Bug report, Sep 2026): already permanently verified —
+        # nothing to send, nothing to re-verify.
+        if existing and existing.is_verification_usable():
+            return Response(
+                {
+                    "message": "Your account is already verified.",
+                    "already_verified": True,
+                },
+                status=status.HTTP_200_OK,
+            )
 
         # Resend cooldown — stop this endpoint being hammered.
         if existing and existing.updated_at:
@@ -154,7 +176,11 @@ class VerifyCheckoutOTPView(APIView):
     Marks the pending code as verified. The order itself is still only
     created by POST /orders/checkout/ — that endpoint checks
     CheckoutOTP.is_verification_usable() and 400s if this step was
-    skipped or the verification window has since expired.
+    skipped.
+
+    FIX (Bug report, Sep 2026): this verification is permanent — once
+    successful, this customer never has to send/verify a code again for
+    any future order on this account.
     """
     permission_classes = [permissions.IsAuthenticated, IsCustomer]
 
@@ -198,8 +224,12 @@ class VerifyCheckoutOTPView(APIView):
 
         return Response(
             {
-                "message": "Phone/email verified. You can now place your order.",
-                "valid_for_minutes": CheckoutOTP.VERIFICATION_WINDOW_MINUTES,
+                "message": (
+                    "Phone/email verified. You can now place your order, "
+                    "and every order after this one — no need to verify "
+                    "again."
+                ),
+                "already_verified": True,
             },
             status=status.HTTP_200_OK,
         )

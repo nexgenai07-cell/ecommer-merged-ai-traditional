@@ -14,6 +14,11 @@ PHONE_RE = re.compile(r'^(\+92|0)\d{9,10}$')
 # this only runs when the customer actually typed something in.
 POSTAL_CODE_RE = re.compile(r'^\d{4,6}$')
 
+# City must be letters/spaces only (e.g. "Rahim Yar Khan") — no digits,
+# no symbols. Max length enforced separately via CharField(max_length=...).
+CITY_RE = re.compile(r'^[A-Za-z\s]+$')
+CITY_MAX_LENGTH = 30
+
 # Converts each order item into API response format.
 # Used inside OrderDetailSerializer.
 class OrderItemSerializer(serializers.ModelSerializer):
@@ -345,7 +350,7 @@ class CheckoutSerializer(serializers.Serializer):
     city = serializers.CharField(
         required=False,
         allow_blank=True,
-        max_length=100,
+        max_length=CITY_MAX_LENGTH,
     )
     # FIX (B18): explicitly optional — checkout must not block on this.
     postal_code = serializers.CharField(
@@ -409,9 +414,9 @@ class CheckoutSerializer(serializers.Serializer):
 
     def validate_city(self, value):
         value = value.strip()
-        if value and any(ch.isdigit() for ch in value):
+        if value and not CITY_RE.match(value):
             raise serializers.ValidationError(
-                "City name should not contain numbers."
+                "City name should contain letters only (no numbers or symbols)."
             )
         return value
 
@@ -523,9 +528,10 @@ class CheckoutPrefillSerializer(serializers.Serializer):
 
 
 # Validates the customer's saved-address update request.
+# Validates the customer's saved-address update request.
 class SaveAddressSerializer(serializers.Serializer):
     shipping_address = serializers.CharField(max_length=500)
-    city = serializers.CharField(max_length=100)
+    city = serializers.CharField(max_length=CITY_MAX_LENGTH)
     postal_code = serializers.CharField(
         required=False,
         allow_blank=True,
@@ -536,3 +542,30 @@ class SaveAddressSerializer(serializers.Serializer):
         allow_blank=True,
         max_length=20,
     )
+
+    # FIX: this serializer had no field validation at all — city and
+    # postal_code were saved straight to the Customer record as typed,
+    # so letters in postal_code or digits/symbols in city went through.
+    def validate_city(self, value):
+        value = value.strip()
+        if value and not CITY_RE.match(value):
+            raise serializers.ValidationError(
+                "City name should contain letters only (no numbers or symbols)."
+            )
+        return value
+
+    def validate_postal_code(self, value):
+        value = (value or "").strip()
+        if value and not POSTAL_CODE_RE.match(value):
+            raise serializers.ValidationError(
+                "Postal code should be 4-6 digits (leave blank if unknown)."
+            )
+        return value
+
+    def validate_phone(self, value):
+        cleaned = re.sub(r'[\s-]', '', value or "")
+        if cleaned and not PHONE_RE.match(cleaned):
+            raise serializers.ValidationError(
+                "Enter a valid phone number, e.g. 03001234567 or +923001234567."
+            )
+        return cleaned

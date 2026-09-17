@@ -24,6 +24,9 @@ class CategoryViewSet(viewsets.ModelViewSet):
     GET    /api/v1/categories/check-name/
            -> check category name availability (admin only)
 
+    POST   /api/v1/categories/bulk-delete/
+           -> soft delete multiple categories at once (admin only)
+
     Query Params on the list endpoint (NEW — Frontend audit, Sep 2026):
     - search              (matches category name, case-insensitive partial)
     - start_date/end_date  (YYYY-MM-DD, against created_at)
@@ -176,6 +179,69 @@ class CategoryViewSet(viewsets.ModelViewSet):
 
         return Response(
             {"exists": queryset.exists()},
+            status=status.HTTP_200_OK,
+        )
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="bulk-delete",
+        permission_classes=[permissions.IsAuthenticated, IsAdmin],
+    )
+    def bulk_delete(self, request):
+        """
+        POST /api/v1/categories/bulk-delete/
+        Body: {"ids": [1, 2, 3]}
+
+        Soft-deletes every category whose id is in `ids`.
+
+        FIX (Bug report, Sep 2026): there was no bulk-delete endpoint at
+        all — only DELETE /{id}/ existed. The admin "Delete Categories"
+        bulk action had nothing to call.
+
+        This intentionally does NOT behave like a loop of single
+        DELETE /{id}/ calls, because that would 404 (and abort) the
+        entire batch the moment one stale/already-deleted id was in the
+        selection. Instead:
+        - Only ids that currently exist and are not already soft-deleted
+          are deleted.
+        - Any id in the request that doesn't match a live category is
+          reported back in `missing_ids` instead of raising an error,
+          so the frontend can reconcile its selection state (e.g. a
+          category that was deleted a moment ago by someone else, or a
+          stale id left over in local selection state) instead of the
+          whole bulk action failing.
+        """
+
+        ids = request.data.get("ids")
+
+        if not isinstance(ids, list) or not ids:
+            return Response(
+                {"detail": "ids must be a non-empty list of category ids."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Only real, not-yet-deleted categories are eligible for deletion.
+        queryset = Category.objects.filter(pk__in=ids, is_delete=False)
+
+        found_ids = list(queryset.values_list("id", flat=True))
+        missing_ids = [
+            category_id for category_id in ids if category_id not in found_ids
+        ]
+
+        deleted_ids = []
+        for instance in queryset:
+            self.perform_destroy(instance)
+            deleted_ids.append(instance.id)
+
+        return Response(
+            {
+                "deleted_ids": deleted_ids,
+                "missing_ids": missing_ids,
+                "message": (
+                    f"{len(deleted_ids)} category(ies) deleted successfully."
+                ),
+            },
             status=status.HTTP_200_OK,
         )
 

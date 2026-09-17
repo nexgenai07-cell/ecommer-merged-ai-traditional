@@ -3,6 +3,7 @@
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.conf import settings
+from django.utils import timezone
 
 
 class Return(models.Model):
@@ -14,6 +15,11 @@ class Return(models.Model):
         ("rejected", "Rejected"),
         ("completed", "Completed"),
     ]
+
+    # Once a return lands in one of these, it's a final admin decision —
+    # it should never flip to the other one (approved -> rejected or
+    # rejected -> approved).
+    RESOLVED_STATUSES = {"approved", "rejected"}
 
     order = models.ForeignKey(
         "orders.Order",
@@ -54,10 +60,37 @@ class Return(models.Model):
     def __str__(self):
         return f"Return for {self.order.order_number}"
 
-    # Ensures customer is always linked to the same customer as the order.
+    # Locks the decision once an admin has approved/rejected a return:
+    # a resolved status can never be changed to a different status
+    # (in particular, approved <-> rejected is blocked).
+    def clean(self):
+        if self.pk:
+            try:
+                old_status = Return.objects.only("status").get(pk=self.pk).status
+            except Return.DoesNotExist:
+                old_status = None
+
+            if old_status in self.RESOLVED_STATUSES and self.status != old_status:
+                raise ValidationError(
+                    {
+                        "status": (
+                            f"This return has already been {old_status} "
+                            "and its status cannot be changed."
+                        )
+                    }
+                )
+
+    # Ensures customer is always linked to the same customer as the order,
+    # enforces the status-lock above, and stamps resolved_at the moment
+    # a return is finalized.
     def save(self, *args, **kwargs):
         if not self.customer and self.order:
             self.customer = self.order.customer
+
+        self.full_clean()
+
+        if self.status in self.RESOLVED_STATUSES and not self.resolved_at:
+            self.resolved_at = timezone.now()
 
         super().save(*args, **kwargs)
 

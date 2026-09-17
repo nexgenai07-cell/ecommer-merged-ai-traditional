@@ -1,6 +1,7 @@
 # PATH: apps/returns/views.py
 
 from django.db.models import Q
+from django.utils import timezone
 from rest_framework import viewsets, permissions, status, mixins
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -10,13 +11,14 @@ from apps.users.permissions import IsAdmin
 from apps.notifications.models import Notification
 from apps.notifications.serializers import NotificationSerializer
 from apps.stores.models import Store
-from .models import Complaint, ComplaintMessage
+from .models import Return, Complaint, ComplaintMessage
 from .serializers import (
     ComplaintSerializer,
     ComplaintDetailSerializer,
     ComplaintMessageSerializer,
     ComplaintMessageCreateSerializer,
     ComplaintStatusUpdateSerializer,
+    AdminReturnStatusSerializer,
 )
 
 
@@ -233,6 +235,68 @@ class AdminComplaintStatusViewSet(viewsets.GenericViewSet):
         return Response({
             "id": complaint.id,
             "status": complaint.status,
+            "message": f"Status updated to {new_status}"
+        })
+
+
+class AdminReturnStatusViewSet(viewsets.GenericViewSet):
+    """
+    Admin-only endpoint for returns.
+
+    PUT /api/v1/admin/returns/{id}/status/ - Approve or reject a return.
+
+    BUG FIX: once a return has been approved or rejected, that decision
+    is final — it can no longer be flipped to the opposite status.
+    This is enforced twice: here (so the API returns a clear 400
+    instead of a generic error) and again in Return.save() itself
+    (so the rule holds even if something else ever writes to this
+    model directly, e.g. the Django admin).
+    """
+
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+    queryset = Return.objects.all()
+
+    @action(detail=True, methods=["put"], url_path="status")
+    def update_status(self, request, pk=None):
+        ret = self.get_object()
+
+        if ret.status in Return.RESOLVED_STATUSES:
+            return Response(
+                {
+                    "error": (
+                        f"This return has already been {ret.status} and "
+                        "its status cannot be changed."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = AdminReturnStatusSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        new_status = serializer.validated_data["status"]
+
+        ret.status = new_status
+        ret.resolved_at = timezone.now()
+        ret.save()
+
+        # Notify the customer, same pattern as complaint status updates.
+        if ret.customer and ret.customer.user:
+            Notification.objects.create(
+                store=Store.objects.first(),
+                user=ret.customer.user,
+                title=f"Return #{ret.id} status updated",
+                message=f"Your return request has been {new_status}.",
+                type="system",
+                sent_via="in_app",
+                reference_type="return",
+                reference_id=str(ret.id),
+            )
+
+        return Response({
+            "id": ret.id,
+            "status": ret.status,
             "message": f"Status updated to {new_status}"
         })
 

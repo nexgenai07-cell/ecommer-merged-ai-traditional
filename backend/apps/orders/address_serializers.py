@@ -9,6 +9,8 @@ from .models import Address
 # matches checkout validation exactly.
 PHONE_RE = re.compile(r'^(\+92|0)\d{9,10}$')
 POSTAL_CODE_RE = re.compile(r'^\d{4,6}$')
+CITY_RE = re.compile(r'^[A-Za-z\s]+$')
+CITY_MAX_LENGTH = 30
 
 
 # GET /api/v1/addresses/ list items, and the response shape for
@@ -41,6 +43,7 @@ class AddressWriteSerializer(serializers.ModelSerializer):
             "is_default",
         ]
         extra_kwargs = {
+            "city": {"max_length": CITY_MAX_LENGTH},
             "postal_code": {"required": False, "allow_blank": True},
             "phone": {"required": False, "allow_blank": True},
             "is_default": {"required": False, "default": False},
@@ -62,9 +65,9 @@ class AddressWriteSerializer(serializers.ModelSerializer):
 
     def validate_city(self, value):
         value = value.strip()
-        if any(ch.isdigit() for ch in value):
+        if value and not CITY_RE.match(value):
             raise serializers.ValidationError(
-                "City name should not contain numbers."
+                "City name should contain letters only (no numbers or symbols)."
             )
         return value
 

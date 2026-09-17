@@ -88,15 +88,34 @@ class ProductViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         """
         Soft delete product.
+
+        FIX (Bug report, Sep 2026): a soft-deleted product's row is never
+        actually removed from the DB (is_delete=True is just a flag), so
+        CartItem's on_delete=CASCADE never fires — every customer who had
+        this product in their cart kept it there forever, and (until the
+        CheckoutView fix) could even still check out with it. Any
+        CartItem referencing this product is now deleted right here, the
+        moment an admin deletes the product, so it disappears from every
+        customer's cart immediately.
         """
-        instance.is_active = False
-        instance.is_delete = True
-        instance.save(
-            update_fields=[
-                "is_active",
-                "is_delete",
-            ]
-        )
+        from django.db import transaction
+
+        with transaction.atomic():
+            instance.is_active = False
+            instance.is_delete = True
+            instance.save(
+                update_fields=[
+                    "is_active",
+                    "is_delete",
+                ]
+            )
+
+            # Local import to avoid a module-load-time dependency between
+            # the products and cart apps (same pattern as the local
+            # ValidationError import elsewhere in this codebase).
+            from apps.cart.models import CartItem
+
+            CartItem.objects.filter(product=instance).delete()
 
         # FIX (Frontend Bug Report — Audit Logs, Sep 2026): Create/Update/
         # Delete Product never wrote to the shared AuditLog table that

@@ -462,17 +462,30 @@ class Payment(models.Model):
         return f"Payment for {self.order.order_number}"
 
 
-# NEW (Sep 2026 — Checkout OTP verification): a customer must verify a
-# 6-digit code emailed to them before an order can be placed. One row per
-# user — sending a fresh code overwrites the previous one, and each
-# successful verification can be "spent" on exactly one order (see
-# consumed_at) so it can't silently authorize an unlimited number of
-# future checkouts. Phone/SMS delivery is a planned follow-up (out of
-# scope for now) — this only guards email delivery.
+# UPDATED (Sep 2026 — Checkout OTP verification made permanent): a
+# customer must verify a 6-digit code emailed to them ONCE, the very
+# first time they check out. One row per user — sending a fresh code
+# overwrites the previous one while verification is still pending.
+#
+# FIX (Bug report, Sep 2026): verification used to be single-use and
+# time-boxed (see the now-unused `consumed_at` field and
+# VERIFICATION_WINDOW_MINUTES below) — every single order forced a
+# fresh send-otp/verify-otp round trip, even for a customer who had
+# already verified minutes or days earlier. That was never the intent;
+# once `is_verified` is True it now stays usable forever, so a customer
+# only ever verifies once for their account and every order afterwards
+# (this one and all future ones) reuses that same verified row.
+# `consumed_at` / VERIFICATION_WINDOW_MINUTES are kept on the model
+# (no migration needed) but are no longer read by is_verification_usable().
+#
+# Phone/SMS delivery is a planned follow-up (out of scope for now) —
+# this only guards email delivery.
 class CheckoutOTP(models.Model):
     """
     Gate on CheckoutView: an order can only be created once this user has
-    a usable (verified, unexpired-for-use, unconsumed) row here.
+    a usable (verified) row here. Verification, once completed, never
+    expires and is never "spent" — it authorizes every order this
+    customer places from then on.
     """
 
     # How long a code is valid to be entered (send -> verify).
@@ -529,11 +542,14 @@ class CheckoutOTP(models.Model):
 
     def is_verification_usable(self):
         """
-        True if this row can currently authorize placing ONE order:
-        verified, not already spent on a previous order, and still
-        within the post-verification usable window.
+        True if this customer has ever completed checkout verification.
+
+        FIX (Bug report, Sep 2026): this used to also require
+        `not self.consumed_at` (unused-on-a-previous-order) and being
+        inside a post-verification time window — meaning a customer had
+        to re-verify before every single order. Verification is now
+        permanent: once `is_verified` is set, it authorizes this order
+        and every future order for this account, with no expiry and no
+        "one order per code" limit.
         """
-        if not self.is_verified or self.consumed_at or not self.verified_at:
-            return False
-        window_end = self.verified_at + timedelta(minutes=self.VERIFICATION_WINDOW_MINUTES)
-        return timezone.now() < window_end
+        return bool(self.is_verified)
