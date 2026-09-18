@@ -417,3 +417,28 @@ class AdminComplaintRespondView(APIView):
                 "status": complaint.status,
             }
         )
+
+
+class ComplaintOpenCountView(APIView):
+    """
+    GET /api/v1/complaints/open-count/
+
+    Returns the count of "open" complaints visible to the current user —
+    admins get the count across every complaint they can see, customers
+    get the count of their own. Used by the frontend for the Support
+    Tickets badge (see Network tab: complaints/open-count/ was 404ing
+    because this route/view didn't exist yet).
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        if request.user.role == "admin":
+            qs = Complaint.objects.filter(status="open")
+        else:
+            qs = Complaint.objects.filter(
+                customer__user=request.user,
+                status="open",
+            )
+
+        return Response({"count": qs.count()})

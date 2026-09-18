@@ -28,6 +28,7 @@ from .complaint_views import (
     CreateComplaintView,
     ComplaintDetailView,
     ComplaintMessageView,
+    ComplaintOpenCountView,
     AdminComplaintStatusUpdateView,
     AdminComplaintRespondView,
 )
@@ -132,6 +133,15 @@ admin_return_urlpatterns = [
 # Mount at /api/v1/complaints/
 complaint_urlpatterns = [
     path("", CreateComplaintView.as_view(), name="complaint-create-list"),
+    # NEW (Sep 2026 — Support Tickets open-count badge): must stay ABOVE
+    # "<int:pk>/" below for the same reason "stats/" stays above
+    # "<str:order_number>/" in urlpatterns — a literal path segment has
+    # to be matched before a dynamic one that could otherwise shadow it.
+    path(
+        "open-count/",
+        ComplaintOpenCountView.as_view(),
+        name="complaint-open-count",
+    ),
     path(
         "<int:pk>/",
         ComplaintDetailView.as_view(),
