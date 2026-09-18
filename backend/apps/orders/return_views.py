@@ -49,7 +49,7 @@ class CreateReturnView(APIView):
 
         if Return.objects.filter(
             order=order,
-            status__in=["pending", "approved"],
+            status__in=["requested", "approved"],
         ).exists():
             return Response(
                 {"error": "A return request already exists for this order."},
@@ -63,7 +63,7 @@ class CreateReturnView(APIView):
             order=order,
             customer=order.customer,
             reason=serializer.validated_data["reason"],
-            status="pending",
+            status="requested",
         )
 
         # NEW (Notification Triggers Addendum, Item 15): "New return
@@ -125,11 +125,11 @@ class ReturnListView(generics.ListAPIView):
 
         params = self.request.query_params
 
-        # 1. status — final accepted values only: pending, approved,
-        # rejected (matches what CreateReturnView actually writes;
-        # anything else is ignored rather than erroring).
+        # 1. status — final accepted values only: requested, approved,
+        # rejected, completed (matches Return.STATUS_CHOICES; anything
+        # else is ignored rather than erroring).
         status_param = params.get("status")
-        if status_param in ("pending", "approved", "rejected"):
+        if status_param in ("requested", "approved", "rejected", "completed"):
             qs = qs.filter(status=status_param)
 
         # 2. search — order number, reason text, customer name, and the

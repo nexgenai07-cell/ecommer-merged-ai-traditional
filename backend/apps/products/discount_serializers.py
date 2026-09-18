@@ -34,6 +34,24 @@ class DiscountSerializer(serializers.ModelSerializer):
         # soft-deleted coupon via this serializer. Confirmed already
         # correct; left as-is.
 
+    # Prevents duplicate discount codes — only among discounts that are
+    # still "alive" (is_delete=False). A soft-deleted discount's code no
+    # longer blocks a new discount from reusing it, matching the
+    # is_delete=False condition on the DB-level unique constraint (see
+    # products/migrations/0018_discount_code_reuse_after_soft_delete.py).
+    def validate_code(self, value):
+        qs = Discount.objects.filter(code=value, is_delete=False)
+
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+
+        if qs.exists():
+            raise serializers.ValidationError(
+                "A discount with this code already exists."
+            )
+
+        return value
+
     # Validates that the discount end date
     # is later than the start date.
     def validate(self, data):

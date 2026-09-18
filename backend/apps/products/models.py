@@ -241,7 +241,7 @@ class Discount(models.Model):
     ]
 
     store            = models.ForeignKey('stores.Store', on_delete=models.CASCADE, related_name='discounts')
-    code             = models.CharField(max_length=50, unique=True)
+    code             = models.CharField(max_length=50)
     type             = models.CharField(max_length=10, choices=TYPE_CHOICES)
     value            = models.DecimalField(max_digits=10, decimal_places=2)
     min_order_amount = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
@@ -254,6 +254,22 @@ class Discount(models.Model):
 
     class Meta:
         db_table = 'discounts'
+        # FIX (Soft-delete code reuse bug report, Sep 2026): "code" used
+        # to be globally unique=True, which blocked creating a new
+        # discount with the same code as a *soft-deleted* one forever —
+        # the deleted row still occupied the code in the DB even though
+        # it's invisible everywhere else (same issue already fixed for
+        # Product.name / Product.sku — see products/migrations/0014 and
+        # 0015). Replaced with a partial unique constraint that only
+        # applies among non-deleted rows, so a deleted discount's code
+        # genuinely frees up for reuse.
+        constraints = [
+            models.UniqueConstraint(
+                fields=['code'],
+                condition=models.Q(is_delete=False),
+                name='unique_active_discount_code',
+            ),
+        ]
 
     def __str__(self):
         return self.code

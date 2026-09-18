@@ -42,7 +42,7 @@ from .serializers import (
 )
 
 from apps.cart.models import Cart
-from apps.products.models import Product, StockMovement
+from apps.products.models import Product, StockMovement, Discount
 from apps.products.services import check_low_stock_notification
 from apps.stores.models import Store
 from apps.users.permissions import IsAdmin, IsCustomer
@@ -490,6 +490,45 @@ class CheckoutView(APIView):
     # Validates cart, creates order, and creates a pending payment.
     # Stock is reserved at checkout but is only deducted from total_stock
     # after payment is actually confirmed.
+    # NEW (Checkout coupon field): shared validation for a coupon_code
+    # sent at checkout time — used for both a normal cart checkout and a
+    # Buy Now checkout. Mirrors cart.views.ApplyCouponView's checks
+    # exactly (same rules, same error messages) so every entry point that
+    # can apply a coupon behaves identically. Returns (discount, None) on
+    # success, or (None, Response(...)) with the 400 to return as-is.
+    def _resolve_coupon(self, coupon_code, subtotal):
+        try:
+            discount = Discount.objects.get(
+                code=coupon_code,
+                is_active=True,
+            )
+        except Discount.DoesNotExist:
+            return None, Response(
+                {"error": "Invalid or inactive coupon code."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        now = timezone.now()
+        if not (discount.start_date <= now <= discount.end_date):
+            return None, Response(
+                {"error": "This coupon has expired or is not active yet."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if discount.min_order_amount and subtotal < discount.min_order_amount:
+            return None, Response(
+                {
+                    "error": (
+                        f"Minimum order amount of Rs. "
+                        f"{discount.min_order_amount} required for this "
+                        f"coupon."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return discount, None
+
     def post(self, request):
         serializer = CheckoutSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -504,6 +543,7 @@ class CheckoutView(APIView):
         is_buy_now = bool(buy_now_product_id)
 
         cart = Cart.objects.filter(user=request.user).first()
+        coupon_code = data.get("coupon_code")
 
         if is_buy_now:
             try:
@@ -519,9 +559,24 @@ class CheckoutView(APIView):
                 )
 
             checkout_store_id = buy_now_product.store_id
-            # Buy Now does not apply whatever coupon happens to be on the
-            # customer's cart — it's a separate, one-off purchase.
             checkout_coupon = None
+
+            # UPDATED (Supervisor request, Sep 2026): a coupon can now be
+            # applied to a Buy Now purchase too — previously this was
+            # rejected outright. It is validated against the Buy Now
+            # product's own price × quantity (there's no persisted cart
+            # to read a subtotal from), and is NOT written to
+            # cart.coupon — a Buy Now purchase never touches the
+            # customer's real cart, coupon included.
+            if coupon_code:
+                buy_now_quantity = data.get("buy_now_quantity") or 1
+                buy_now_subtotal = buy_now_product.price * buy_now_quantity
+
+                checkout_coupon, coupon_error = self._resolve_coupon(
+                    coupon_code, buy_now_subtotal
+                )
+                if coupon_error:
+                    return coupon_error
         else:
             if not cart or not cart.items.exists():
                 return Response(
@@ -530,6 +585,29 @@ class CheckoutView(APIView):
                 )
             checkout_store_id = cart.store_id
             checkout_coupon = cart.coupon
+
+            # NEW (Checkout coupon field): coupon_code, when present,
+            # lets the customer apply/replace a coupon straight from the
+            # checkout page, instead of only via the cart page's
+            # separate POST /api/v1/cart/apply-coupon/ action. A valid
+            # code is also persisted onto cart.coupon (not just used for
+            # this one checkout), so it's still applied if the
+            # customer's payment fails and they retry.
+            if coupon_code:
+                coupon_check_subtotal = sum(
+                    item.product.price * item.quantity
+                    for item in cart.items.all()
+                )
+
+                coupon_discount, coupon_error = self._resolve_coupon(
+                    coupon_code, coupon_check_subtotal
+                )
+                if coupon_error:
+                    return coupon_error
+
+                cart.coupon = coupon_discount
+                cart.save()
+                checkout_coupon = coupon_discount
 
         # Resolve the customer profile first.
         customer = get_or_create_customer(
@@ -1275,6 +1353,23 @@ class AdminOrderStatusUpdateView(APIView):
         new_status = serializer.validated_data["status"]
         old_status = order.status
 
+        # NEW (Admin dashboard bug report, Sep 2026): a delivered order is
+        # final — no status change of any kind (not just "cancelled") is
+        # allowed from here once an order has reached "delivered". This
+        # replaces the old delivered+cancelled-only check below, since it
+        # covers that case too, plus every other one (e.g. an admin
+        # trying to bounce it back to "shipped").
+        if old_status == "delivered":
+            return Response(
+                {
+                    "error": (
+                        "This order has already been delivered — its "
+                        "status is final and cannot be changed."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # FIX (Admin dashboard bug report, Sep 2026): once a customer has
         # actually paid (payment.status == "paid"), the order must never
         # be moved back to "pending_payment" — doing so left the order
@@ -1318,12 +1413,6 @@ class AdminOrderStatusUpdateView(APIView):
                     },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-
-        if order.status == "delivered" and new_status == "cancelled":
-            return Response(
-                {"error": "Delivered orders cannot be cancelled."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
 
         # FIX (B29): admin could previously mark an order "shipped" or
         # "delivered" even though it had never actually been paid for.

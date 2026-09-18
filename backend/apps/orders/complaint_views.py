@@ -347,6 +347,20 @@ class AdminComplaintStatusUpdateView(APIView):
 
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
+    # NEW (Complaint status workflow, Sep 2026): status changes must now
+    # follow a fixed path instead of jumping to any of the 4 values
+    # freely:
+    #   open        -> in_progress                 (admin starts review)
+    #   in_progress -> resolved  OR  back to open   (admin's call)
+    #   resolved    -> closed only
+    #   closed      -> final; no further changes allowed
+    ALLOWED_TRANSITIONS = {
+        "open": ["in_progress"],
+        "in_progress": ["resolved", "open"],
+        "resolved": ["closed"],
+        "closed": [],
+    }
+
     # Changes the status of a complaint.
     def put(self, request, pk):
         try:
@@ -361,7 +375,32 @@ class AdminComplaintStatusUpdateView(APIView):
         serializer.is_valid(raise_exception=True)
 
         old_status = complaint.status
-        complaint.status = serializer.validated_data["status"]
+        new_status = serializer.validated_data["status"]
+
+        allowed_next = self.ALLOWED_TRANSITIONS.get(old_status, [])
+
+        if new_status != old_status and new_status not in allowed_next:
+            if old_status == "closed":
+                error_message = (
+                    "This complaint is closed and cannot be updated further."
+                )
+            elif not allowed_next:
+                error_message = (
+                    f"A '{old_status}' complaint cannot be updated further."
+                )
+            else:
+                error_message = (
+                    f"Cannot move a '{old_status}' complaint to "
+                    f"'{new_status}'. Allowed next status: "
+                    f"{' or '.join(allowed_next)}."
+                )
+
+            return Response(
+                {"error": error_message},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        complaint.status = new_status
         complaint.save()
 
         # FIX (Frontend Bug Report — Audit Logs, Sep 2026): no admin write

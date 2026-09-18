@@ -403,6 +403,21 @@ class CheckoutSerializer(serializers.Serializer):
         help_text="Buy Now: quantity of buy_now_product_id to order. Defaults to 1.",
     )
 
+    # NEW (Checkout coupon field): optional. Lets the customer apply a
+    # coupon directly from the checkout page, instead of only from the
+    # cart page's separate "apply coupon" action.
+    # UPDATED (Supervisor request, Sep 2026): now also applies to Buy
+    # Now checkouts (validated against the Buy Now product's own
+    # price × quantity) — it is only NOT written to the persisted cart
+    # in that case, since Buy Now never touches the cart.
+    coupon_code = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        max_length=50,
+        help_text="Optional coupon code to apply at checkout (cart or Buy Now).",
+    )
+
     # FIX (B19): city/address get real validation instead of none.
     def validate_shipping_address(self, value):
         value = value.strip()
