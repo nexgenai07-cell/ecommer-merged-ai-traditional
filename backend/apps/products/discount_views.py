@@ -89,19 +89,11 @@ class DiscountViewSet(viewsets.ModelViewSet):
         Query Params:
         - search   (matches coupon code, case-insensitive partial)
         - type     (percent / fixed)
-        - status   (active / inactive / expired — derived, not a stored
-                     column)
+        - status   (active / inactive / expired — derived, not a stored column)
 
-        FIX (bug report, Sep 2026): "status=expired" used to also catch
-        every manually-deactivated coupon (is_active=False), so an admin
-        had no way to see "coupons I turned off" separately from
-        "coupons that ran out of time." Split into three mutually
-        exclusive buckets:
-          - active   = is_active=True  AND end_date is still in the future
-          - inactive = is_active=False (admin manually turned it off,
-                       regardless of its end_date)
-          - expired  = is_active=True  AND end_date has already passed
-                       (it was never turned off, it just ran out of time)
+        - active   = is_active=True  AND end_date is still in the future
+        - inactive = is_active=False (admin manually turned it off, regardless of end_date)
+        - expired  = is_active=True  AND end_date has already passed
         """
         qs = Discount.objects.filter(is_delete=False)
 
