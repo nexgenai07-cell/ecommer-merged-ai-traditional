@@ -1,5 +1,7 @@
 # PATH: apps/products/discount_serializers.py
 
+from datetime import time
+
 from rest_framework import serializers
 from django.utils import timezone
 
@@ -52,9 +54,38 @@ class DiscountSerializer(serializers.ModelSerializer):
 
         return value
 
-    # Validates that the discount end date
-    # is later than the start date.
+    # Validates the discount's date range.
+    #
+    # FIX (bug report, Sep 2026) — three issues fixed here together:
+    #
+    # 1. Past start_date: creating (or editing) a discount with a
+    #    start_date before today's date was previously allowed with no
+    #    check at all. Now blocked, whenever "start_date" is actually
+    #    being submitted. Compared by DATE only (not exact time), so a
+    #    discount starting "today" is still allowed even if the picked
+    #    time is earlier than the current moment.
+    #
+    # 2. Same-day / few-hours discounts couldn't be created: when the
+    #    frontend sends only a DATE for end_date (no time), Django was
+    #    storing it as 00:00:00 (midnight / start of that day). So a
+    #    discount with start_date = today 10:00 AM and end_date = today
+    #    (00:00:00) looked like "end is before start" and got rejected
+    #    by the check below.
+    #
+    # 3. Discounts expiring at 12:00 AM instead of 11:59 PM: for the
+    #    same reason as #2 — an end_date of "today" stored as midnight
+    #    means the coupon is technically already "expired" the moment
+    #    the day starts, not when it ends.
+    #
+    # Fix: if end_date's time component is exactly midnight (meaning
+    # only a date was picked, no specific time), we treat that as
+    # "valid through the end of that day" and bump it to 23:59:59.999999
+    # before running the start < end check and saving. If the frontend
+    # DOES send a specific end time (e.g. "today, 6:00 PM" for an
+    # hours-long discount), that exact time is respected and left as-is.
     def validate(self, data):
+        now = timezone.now()
+
         start = data.get(
             "start_date",
             getattr(self.instance, "start_date", None),
@@ -63,6 +94,22 @@ class DiscountSerializer(serializers.ModelSerializer):
             "end_date",
             getattr(self.instance, "end_date", None),
         )
+
+        # --- Fix 1: no past start dates ---
+        if "start_date" in data and start:
+            if timezone.localtime(start).date() < timezone.localtime(now).date():
+                raise serializers.ValidationError(
+                    {"start_date": "Start date cannot be in the past."}
+                )
+
+        # --- Fix 2 & 3: end_date with no time = end of that day ---
+        if end is not None:
+            local_end = timezone.localtime(end)
+            if local_end.time() == time.min:
+                end = local_end.replace(
+                    hour=23, minute=59, second=59, microsecond=999999
+                )
+                data["end_date"] = end
 
         if start and end and start >= end:
             raise serializers.ValidationError(

@@ -13,7 +13,6 @@ from .views import (
     OrderTrackView,
     AdminOrderListView,
     AdminOrderStatusUpdateView,
-    AdminOrderReinstateView,
     AdminOrderFilterView,
 )
 from .customer_stats_views import MyOrderStatsView
@@ -104,11 +103,6 @@ admin_order_urlpatterns = [
         "<str:order_number>/status/",
         AdminOrderStatusUpdateView.as_view(),
         name="admin-order-status",
-    ),
-    path(
-        "<str:order_number>/reinstate/",
-        AdminOrderReinstateView.as_view(),
-        name="admin-order-reinstate",
     ),
 ]
 

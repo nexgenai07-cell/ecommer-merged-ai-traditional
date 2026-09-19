@@ -1,6 +1,7 @@
 # PATH: apps/orders/return_views.py
 
 import re
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import status, permissions, generics
@@ -49,7 +50,7 @@ class CreateReturnView(APIView):
 
         if Return.objects.filter(
             order=order,
-            status__in=["requested", "approved"],
+            status__in=["pending", "approved"],
         ).exists():
             return Response(
                 {"error": "A return request already exists for this order."},
@@ -63,7 +64,7 @@ class CreateReturnView(APIView):
             order=order,
             customer=order.customer,
             reason=serializer.validated_data["reason"],
-            status="requested",
+            status="pending",
         )
 
         # NEW (Notification Triggers Addendum, Item 15): "New return
@@ -125,11 +126,15 @@ class ReturnListView(generics.ListAPIView):
 
         params = self.request.query_params
 
-        # 1. status — final accepted values only: requested, approved,
-        # rejected, completed (matches Return.STATUS_CHOICES; anything
-        # else is ignored rather than erroring).
+        # 1. status — accepted values: pending, approved, rejected
+        # (matches Return.STATUS_CHOICES; anything else is ignored
+        # rather than erroring). UPDATED (Sep 2026): "requested" is now
+        # "pending"; the old "requested" value is still accepted as an
+        # alias so an older frontend build keeps working.
         status_param = params.get("status")
-        if status_param in ("requested", "approved", "rejected", "completed"):
+        if status_param == "requested":
+            status_param = "pending"
+        if status_param in ("pending", "approved", "rejected"):
             qs = qs.filter(status=status_param)
 
         # 2. search — order number, reason text, customer name, and the
@@ -186,6 +191,8 @@ class AdminReturnStatusUpdateView(APIView):
 
     # Updates a return to approved/rejected and creates the exact
     # customer notification required for that decision.
+    # UPDATED (Sep 2026): only a "pending" return can be updated; once it
+    # is approved or rejected the decision is final.
     def put(self, request, pk):
         try:
             return_request = Return.objects.get(id=pk)
@@ -195,13 +202,32 @@ class AdminReturnStatusUpdateView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        if not return_request.can_update_status:
+            return Response(
+                {
+                    "error": (
+                        f"This return has already been "
+                        f"{return_request.status} and its status cannot "
+                        "be changed."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         serializer = AdminReturnStatusSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         old_status = return_request.status
         return_request.status = serializer.validated_data["status"]
         return_request.resolved_at = timezone.now()
-        return_request.save()
+        try:
+            return_request.save()
+        except DjangoValidationError as exc:
+            # Safety net if the model's own status lock rejects the change.
+            return Response(
+                {"error": "; ".join(exc.messages)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         notification_text = {
             "approved": (

@@ -8,10 +8,38 @@ class ReturnSerializer(serializers.ModelSerializer):
     order_number = serializers.CharField(source='order.order_number', read_only=True)
     customer_name = serializers.CharField(source='customer.name', read_only=True)
 
+    # NEW (Sep 2026): drives the admin "Update Status" button on the return
+    # detail screen. Only ever true/non-empty for an admin looking at a
+    # return that is still "pending"; for approved/rejected returns (and
+    # for customers) can_update_status is False and allowed_statuses is [].
+    can_update_status = serializers.SerializerMethodField()
+    allowed_statuses = serializers.SerializerMethodField()
+
     class Meta:
         model = Return
-        fields = ['id', 'order', 'order_number', 'customer', 'customer_name', 'reason', 'status', 'resolved_at', 'created_at']
+        fields = [
+            'id', 'order', 'order_number', 'customer', 'customer_name',
+            'reason', 'status', 'resolved_at', 'created_at',
+            'can_update_status', 'allowed_statuses',
+        ]
         read_only_fields = ['id', 'status', 'resolved_at', 'created_at']
+
+    def _request_user_is_admin(self):
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        return bool(
+            user
+            and user.is_authenticated
+            and getattr(user, 'role', None) == 'admin'
+        )
+
+    def get_can_update_status(self, obj):
+        return self._request_user_is_admin() and obj.can_update_status
+
+    def get_allowed_statuses(self, obj):
+        if self._request_user_is_admin():
+            return obj.allowed_statuses
+        return []
 
 
 class CreateReturnSerializer(serializers.Serializer):

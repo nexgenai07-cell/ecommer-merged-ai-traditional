@@ -24,7 +24,6 @@ from apps.orders.views import (
     deduct_stock_for_order,
     confirm_stock_for_order,
     release_reserved_stock_for_order,
-    reserve_stock_for_order,
 )
 from apps.users.permissions import IsAdmin
 from apps.stores.models import Store
@@ -34,9 +33,11 @@ from core.pagination import StandardResultsPagination
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
-# NEW (Supervisor Scenario 7, Sep 2026): a QR proof can be rejected and
-# re-uploaded this many times before the order is permanently cancelled
-# and re-upload is refused outright.
+# NEW (Supervisor Scenario 7, Sep 2026): a QR proof can be rejected this
+# many times in total.
+# UPDATED (Sep 2026 — QR rejection flow change): rejections 1 and 2 keep
+# the order in "pending_payment" (customer can re-upload). The 3rd
+# rejection permanently cancels the order and re-upload is refused.
 MAX_QR_REJECTION_ATTEMPTS = 3
 
 
@@ -272,12 +273,13 @@ class QRProofUploadView(APIView):
             order.status stays pending_payment
             No stock change (stays reserved)
 
-    UPDATED (Supervisor Scenario 3, Sep 2026): if this order was
-    previously rejected (payment.status == "rejected") and is currently
-    "cancelled" as a result, this endpoint still accepts a fresh
-    upload — it reopens the order back to pending_payment and
-    re-reserves stock, instead of refusing with "This order has been
-    cancelled." Any other cancelled order is still refused as before.
+    UPDATED (Sep 2026 — QR rejection flow change): after the 1st or 2nd
+    rejection the order is still "pending_payment" (payment.status ==
+    "rejected"), so a fresh upload is simply accepted — payment goes back
+    to under_review, order stays pending_payment, stock stays reserved
+    (nothing was released, so nothing to re-reserve). After the 3rd
+    rejection the order is permanently cancelled and any further upload
+    is refused. Any other cancelled order is refused too.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -337,29 +339,27 @@ class QRProofUploadView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # UPDATED (Supervisor Scenario 3, Sep 2026): a rejected QR proof
-        # now cancels the order (see AdminQRPaymentRejectView) — but that
-        # cancellation is specifically meant to be retryable, unlike a
-        # customer/admin-initiated cancellation. So a re-upload is still
-        # allowed here as long as the *reason* the order is cancelled is
-        # a rejected QR payment. Any other cancelled order (customer
-        # cancelled it, admin cancelled it for a different reason, etc.)
-        # is still blocked below, same as before.
+        # UPDATED (Sep 2026 — QR rejection flow change): a cancelled order
+        # is always final here. The only cancellation that comes from a
+        # QR rejection is the 3rd one (MAX_QR_REJECTION_ATTEMPTS), so if
+        # the order is cancelled and its payment is "rejected", it is the
+        # permanent "max attempts reached" case — the customer gets a
+        # specific message pointing them to support. Any other cancelled
+        # order (customer/admin cancelled it, timeout, ...) gets the
+        # generic message.
         #
-        # UPDATED (Supervisor Scenario 7, Sep 2026): that retry is capped
-        # at MAX_QR_REJECTION_ATTEMPTS rejections — once qr_rejection_count
-        # reaches it, the order is permanently cancelled and re-upload is
-        # refused outright, pointing the customer to support instead of
-        # looping forever.
-        was_rejected = order.status == "cancelled" and payment.status == "rejected"
-        max_attempts_reached = (
-            was_rejected and payment.qr_rejection_count >= MAX_QR_REJECTION_ATTEMPTS
+        # An order that is still pending_payment with payment "rejected"
+        # (rejection 1 or 2) passes this check and is treated as a
+        # normal retry below.
+        is_retry_after_rejection = (
+            order.status != "cancelled" and payment.status == "rejected"
         )
-        is_retryable_after_rejection = was_rejected and not max_attempts_reached
 
-        # Check if order is cancelled
-        if order.status == "cancelled" and not is_retryable_after_rejection:
-            if max_attempts_reached:
+        if order.status == "cancelled":
+            if (
+                payment.status == "rejected"
+                and payment.qr_rejection_count >= MAX_QR_REJECTION_ATTEMPTS
+            ):
                 return Response(
                     {
                         "error": (
@@ -412,44 +412,19 @@ class QRProofUploadView(APIView):
         screenshot_url = default_storage.url(file_path)
 
         # ============================================================
-        # Update payment (and, if this is a retry after rejection,
-        # reopen the order + re-reserve stock — all in one transaction,
-        # so a stock failure rolls back the payment fields too instead
-        # of leaving payment "under_review" while the order stays
-        # cancelled with no stock reserved).
+        # Update payment
+        # (Sep 2026 — QR rejection flow change: no order/stock changes
+        # needed here anymore. The order never left "pending_payment"
+        # after a 1st/2nd rejection and its stock was never released.)
         # ============================================================
-        try:
-            with transaction.atomic():
-                payment.status = "under_review"
-                payment.qr_screenshot_url = screenshot_url
-                payment.qr_transaction_id = transaction_id or None
-                payment.qr_submitted_at = timezone.now()
-                payment.qr_image_hash = file_hash
-                payment.qr_duplicate_warning = duplicate_warning
-                payment.qr_reject_reason = None  # Clear previous rejection reason
-                payment.save()
-
-                # UPDATED (Supervisor Scenario 4, Sep 2026): re-upload
-                # after a rejection re-opens the order — but into
-                # "on_hold" (not "pending_payment"), so the admin queue
-                # can tell this apart as a *retry* review, and
-                # re-reserves stock (it was released when the order got
-                # cancelled on rejection).
-                if is_retryable_after_rejection:
-                    order.status = "on_hold"
-                    order.save()
-                    reserve_stock_for_order(order)
-        except Exception:
-            return Response(
-                {
-                    "error": (
-                        "One or more items in this order are no longer "
-                        "in stock, so it can't be reopened for a new "
-                        "payment attempt. Please contact support."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        payment.status = "under_review"
+        payment.qr_screenshot_url = screenshot_url
+        payment.qr_transaction_id = transaction_id or None
+        payment.qr_submitted_at = timezone.now()
+        payment.qr_image_hash = file_hash
+        payment.qr_duplicate_warning = duplicate_warning
+        payment.qr_reject_reason = None  # Clear previous rejection reason
+        payment.save()
 
         # ============================================================
         # Notification to customer
@@ -496,7 +471,9 @@ class QRProofUploadView(APIView):
                 "screenshot_url": screenshot_url,
             },
             "duplicate_warning": duplicate_warning,
-            "reopened_after_rejection": is_retryable_after_rejection,
+            # Kept under the same key for frontend compatibility: True
+            # when this upload is a retry after an earlier rejection.
+            "reopened_after_rejection": is_retry_after_rejection,
         }, status=status.HTTP_200_OK)
 
 
@@ -663,23 +640,24 @@ class AdminQRPaymentRejectView(APIView):
     """
     PUT /api/v1/admin/payments/qr/{order_number}/reject/
     Request body: {"reason": "string"} (mandatory)
-    Effect (UPDATED — Supervisor Scenario 3, Sep 2026):
+    Effect (UPDATED — Sep 2026, QR rejection flow change):
         payment.status -> rejected
         payment.qr_rejection_count += 1
-        order.status -> cancelled
-        Reserved stock is released (order is not paid for, so it must
-        not keep holding stock hostage while cancelled)
-        Customer notification tells them to re-upload proof — re-upload
-        is still allowed on this specific "rejected" cancellation via
-        QRProofUploadView, which re-opens the order (into "on_hold" on
-        a retry) and re-reserves stock.
 
-    Works identically whether this is the very first review
-    (order.status was "pending_payment") or a retry review after an
-    earlier rejection (order.status was "on_hold") — Scenario 6: this
-    view doesn't check order.status at all, only payment.status ==
-    "under_review", so rejecting a retry loops right back into the same
-    cancelled -> re-upload -> on_hold cycle as Scenario 3/4.
+        Rejection 1 and 2:
+            order.status -> pending_payment (stays / goes back to it)
+            Reserved stock is KEPT (order is still alive)
+            Customer is told to re-upload proof (attempts left shown)
+
+        Rejection 3 (qr_rejection_count >= MAX_QR_REJECTION_ATTEMPTS):
+            order.status -> cancelled (permanent)
+            Reserved stock is released
+            QRProofUploadView refuses any further upload
+            The customer's Track Order / Cancel Order options disappear
+            (can_track / can_cancel are False for cancelled orders)
+
+    Works identically for a first review and a retry review: this view
+    only checks payment.status == "under_review", not order.status.
     """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
@@ -721,6 +699,8 @@ class AdminQRPaymentRejectView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        old_order_status = order.status
+
         with transaction.atomic():
             # Update payment
             payment.status = "rejected"
@@ -728,25 +708,33 @@ class AdminQRPaymentRejectView(APIView):
             payment.qr_rejection_count += 1
             payment.save()
 
-            # UPDATED (Supervisor Scenario 3): order is now cancelled on
-            # rejection instead of staying pending_payment, and its
-            # reserved stock is released — the customer can still get
-            # the order moving again by re-uploading proof (see
-            # QRProofUploadView), which re-reserves stock and reopens
-            # the order.
-            order.status = "cancelled"
-            order.save()
-            release_reserved_stock_for_order(order)
+            max_attempts_reached = (
+                payment.qr_rejection_count >= MAX_QR_REJECTION_ATTEMPTS
+            )
+
+            if max_attempts_reached:
+                # 3rd rejection: order is permanently cancelled and its
+                # reserved stock goes back to available.
+                order.status = "cancelled"
+                order.cancellation_reason = (
+                    f"QR payment proof was rejected "
+                    f"{MAX_QR_REJECTION_ATTEMPTS} times."
+                )
+                order.save()
+                release_reserved_stock_for_order(order)
+            else:
+                # 1st / 2nd rejection: order goes back to (or stays in)
+                # pending_payment so the customer can upload a new proof.
+                # Stock stays reserved — nothing to release.
+                order.status = "pending_payment"
+                order.save()
 
         # ============================================================
-        # Customer notification includes reason text + re-upload prompt
-        # (UPDATED — Supervisor Scenario 7): once the rejection count
-        # has hit the 3-attempt cap, the order is permanently cancelled
-        # (QRProofUploadView will refuse any further re-upload for it),
-        # so the customer is told to contact support instead of being
-        # invited to retry again.
+        # Customer notification includes reason text + what happens next.
+        # After the final rejection the order is permanently cancelled,
+        # so the customer is told to contact support instead.
         # ============================================================
-        max_attempts_reached = payment.qr_rejection_count >= MAX_QR_REJECTION_ATTEMPTS
+        attempts_left = MAX_QR_REJECTION_ATTEMPTS - payment.qr_rejection_count
 
         if max_attempts_reached:
             customer_message = (
@@ -759,9 +747,9 @@ class AdminQRPaymentRejectView(APIView):
         else:
             customer_message = (
                 f"Your QR payment for order #{order_number} has been "
-                f"rejected. Reason: {reason}. Please re-upload your "
-                "payment proof to retry, or the order will remain "
-                "cancelled."
+                f"rejected. Reason: {reason}. Please re-upload a valid "
+                f"payment proof — you have {attempts_left} attempt(s) "
+                "left before this order is cancelled."
             )
 
         create_notification(
@@ -780,11 +768,11 @@ class AdminQRPaymentRejectView(APIView):
             action="reject_qr_payment",
             entity="payment",
             entity_id=payment.id,
-            old_data={"status": "under_review", "order_status": "pending_payment"},
+            old_data={"status": "under_review", "order_status": old_order_status},
             new_data={
                 "status": "rejected",
                 "reason": reason,
-                "order_status": "cancelled",
+                "order_status": order.status,
                 "rejection_count": payment.qr_rejection_count,
                 "permanently_cancelled": max_attempts_reached,
             },
@@ -798,10 +786,15 @@ class AdminQRPaymentRejectView(APIView):
             "rejection_count": payment.qr_rejection_count,
             "permanently_cancelled": max_attempts_reached,
             "reason": reason,
+            "attempts_left": attempts_left,
             "message": (
-                f"QR payment rejected. Maximum attempts reached — order "
+                "QR payment rejected. Maximum attempts reached — order "
                 "is permanently cancelled."
                 if max_attempts_reached
-                else "QR payment rejected. Order has been cancelled — customer can re-upload proof to retry."
+                else (
+                    "QR payment rejected. Order is still pending payment — "
+                    f"customer can re-upload proof ({attempts_left} "
+                    "attempt(s) left)."
+                )
             ),
         }, status=status.HTTP_200_OK)

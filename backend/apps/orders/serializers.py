@@ -19,6 +19,27 @@ POSTAL_CODE_RE = re.compile(r'^\d{4,6}$')
 CITY_RE = re.compile(r'^[A-Za-z\s]+$')
 CITY_MAX_LENGTH = 30
 
+# NEW (Bug fix, Sep 2026): single source of truth for whether the customer
+# should still be offered "Cancel Order" / "Track Order" on an order.
+#   - Cancel: only while the order hasn't shipped yet, and obviously not
+#     once it's already cancelled (by the customer, by an admin, or
+#     automatically after 3 rejected QR proofs).
+#   - Track: hidden once the order is cancelled — there is nothing left
+#     to track.
+# Used by OrderListSerializer / OrderDetailSerializer below (so the
+# frontend just reads can_cancel / can_track) and by OrderTrackView in
+# views.py (so the API itself also refuses, even if a button is shown).
+CUSTOMER_CANCELLABLE_STATUSES = ("pending_payment", "on_hold", "confirmed")
+
+
+def order_can_cancel(order):
+    return order.status in CUSTOMER_CANCELLABLE_STATUSES
+
+
+def order_can_track(order):
+    return order.status != "cancelled"
+
+
 # Converts each order item into API response format.
 # Used inside OrderDetailSerializer.
 class OrderItemSerializer(serializers.ModelSerializer):
@@ -191,6 +212,11 @@ class OrderListSerializer(serializers.ModelSerializer):
     items = serializers.SerializerMethodField()
     item_count = serializers.SerializerMethodField()
 
+    # NEW (Bug fix, Sep 2026): tells the frontend whether to show the
+    # "Cancel Order" / "Track Order" buttons for this order.
+    can_cancel = serializers.SerializerMethodField()
+    can_track = serializers.SerializerMethodField()
+
     class Meta:
         model = Order
         fields = [
@@ -204,7 +230,15 @@ class OrderListSerializer(serializers.ModelSerializer):
             "item_count",
             "created_at",
             "items",
+            "can_cancel",
+            "can_track",
         ]
+
+    def get_can_cancel(self, obj):
+        return order_can_cancel(obj)
+
+    def get_can_track(self, obj):
+        return order_can_track(obj)
 
     def get_items(self, obj):
         # Only the first 3 items are needed for the My Orders preview.
@@ -263,6 +297,12 @@ class OrderDetailSerializer(serializers.ModelSerializer):
         read_only=True,
     )
 
+    # NEW (Bug fix, Sep 2026): same flags as OrderListSerializer, so the
+    # order detail / tracking page also knows whether to show the
+    # "Cancel Order" / "Track Order" buttons.
+    can_cancel = serializers.SerializerMethodField()
+    can_track = serializers.SerializerMethodField()
+
     class Meta:
         model = Order
         fields = [
@@ -287,7 +327,15 @@ class OrderDetailSerializer(serializers.ModelSerializer):
 
             "items",
             "payment",
+            "can_cancel",
+            "can_track",
         ]
+
+    def get_can_cancel(self, obj):
+        return order_can_cancel(obj)
+
+    def get_can_track(self, obj):
+        return order_can_track(obj)
 
 # Returns complete customer information for the order.
     def get_customer(self, obj):

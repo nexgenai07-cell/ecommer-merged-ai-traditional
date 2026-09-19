@@ -1,5 +1,6 @@
 # PATH: apps/returns/views.py
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import viewsets, permissions, status, mixins
@@ -245,8 +246,9 @@ class AdminReturnStatusViewSet(viewsets.GenericViewSet):
 
     PUT /api/v1/admin/returns/{id}/status/ - Approve or reject a return.
 
-    BUG FIX: once a return has been approved or rejected, that decision
-    is final — it can no longer be flipped to the opposite status.
+    UPDATED (Sep 2026): only a "pending" return can be updated, and only
+    to "approved" or "rejected". Once a return is approved or rejected,
+    that decision is final — it can never be changed again.
     This is enforced twice: here (so the API returns a clear 400
     instead of a generic error) and again in Return.save() itself
     (so the rule holds even if something else ever writes to this
@@ -260,7 +262,7 @@ class AdminReturnStatusViewSet(viewsets.GenericViewSet):
     def update_status(self, request, pk=None):
         ret = self.get_object()
 
-        if ret.status in Return.RESOLVED_STATUSES:
+        if not ret.can_update_status:
             return Response(
                 {
                     "error": (
@@ -279,7 +281,15 @@ class AdminReturnStatusViewSet(viewsets.GenericViewSet):
 
         ret.status = new_status
         ret.resolved_at = timezone.now()
-        ret.save()
+        try:
+            ret.save()
+        except DjangoValidationError as exc:
+            # Safety net (e.g. two admins clicking at the same moment):
+            # the model's own lock rejected the change.
+            return Response(
+                {"error": "; ".join(exc.messages)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # Notify the customer, same pattern as complaint status updates.
         if ret.customer and ret.customer.user:

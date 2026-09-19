@@ -9,16 +9,22 @@ from django.utils import timezone
 class Return(models.Model):
     """Customer return request linked to a delivered order."""
 
+    # UPDATED (Sep 2026): only three statuses now.
+    #   - "requested" was renamed back to "pending".
+    #   - "completed" was removed (old completed rows were migrated to
+    #     "approved" — see migration 0007).
     STATUS_CHOICES = [
-        ("requested", "Requested"),
+        ("pending", "Pending"),
         ("approved", "Approved"),
         ("rejected", "Rejected"),
-        ("completed", "Completed"),
     ]
 
+    # The only status an admin can still act on.
+    PENDING_STATUS = "pending"
+
     # Once a return lands in one of these, it's a final admin decision —
-    # it should never flip to the other one (approved -> rejected or
-    # rejected -> approved).
+    # it can never change again (not approved -> rejected, not
+    # rejected -> approved, and not back to pending).
     RESOLVED_STATUSES = {"approved", "rejected"}
 
     order = models.ForeignKey(
@@ -41,13 +47,13 @@ class Return(models.Model):
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
-        default="requested",
+        default="pending",
     )
 
     resolved_at = models.DateTimeField(
         null=True,
         blank=True,
-        help_text="Time the return was approved, rejected, or completed.",
+        help_text="Time the return was approved or rejected.",
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -59,6 +65,21 @@ class Return(models.Model):
 
     def __str__(self):
         return f"Return for {self.order.order_number}"
+
+    # NEW (Sep 2026): the admin can only update a return while it is
+    # still pending, and only to approved or rejected. Exposed on the
+    # return API response (see ReturnSerializer) so the frontend knows
+    # whether to show the "Update Status" button and which options to
+    # offer.
+    @property
+    def can_update_status(self):
+        return self.status == self.PENDING_STATUS
+
+    @property
+    def allowed_statuses(self):
+        if self.can_update_status:
+            return ["approved", "rejected"]
+        return []
 
     # Locks the decision once an admin has approved/rejected a return:
     # a resolved status can never be changed to a different status

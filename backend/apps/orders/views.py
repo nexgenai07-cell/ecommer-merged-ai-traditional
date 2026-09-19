@@ -39,6 +39,7 @@ from .serializers import (
     CheckoutPrefillSerializer,
     SaveAddressSerializer,
     AdminOrderStatusSerializer,
+    order_can_track,
 )
 
 from apps.cart.models import Cart
@@ -1287,6 +1288,22 @@ class OrderTrackView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        # NEW (Bug fix, Sep 2026): once an order is cancelled — whether
+        # the customer cancelled it, an admin cancelled it, or it was
+        # auto-cancelled after 3 rejected QR proofs — there is nothing
+        # left to track, so customers are refused here even if some
+        # client still shows the button. Admins can still look it up.
+        if not request.user.is_staff and not order_can_track(order):
+            return Response(
+                {
+                    "error": (
+                        "This order has been cancelled and can no "
+                        "longer be tracked."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         return Response(
             {
                 "order_number": order.order_number,
@@ -1330,21 +1347,47 @@ class AdminOrderStatusUpdateView(APIView):
         serializer = AdminOrderStatusSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        # NEW (Sep 2026): a cancelled order is final. Without this guard
+        # an admin could still push a cancelled order back to
+        # "pending_payment" from here (and without re-reserving its
+        # stock). The old Reinstate endpoint has been removed entirely.
+        if order.status == "cancelled":
+            return Response(
+                {
+                    "error": (
+                        "This order has been cancelled — its status is "
+                        "final and cannot be changed."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # FIX (Admin dashboard bug report, Sep 2026): once an order's
         # payment has been refunded OR its QR proof was rejected, the
         # order's story is over — no further status changes are allowed
         # via this endpoint at all (any new_status, not just a specific
-        # one). The only way back for a refunded/rejected/cancelled order
-        # is the dedicated Reinstate endpoint, which explicitly resets
-        # the payment record first.
+        # one).
+        #
+        # UPDATED (Sep 2026 — QR rejection flow change): a rejected QR
+        # proof no longer cancels the order on the 1st/2nd rejection —
+        # the order stays "pending_payment" while the customer
+        # re-uploads, so "rejected" alone must NOT lock the order (the
+        # admin still needs to be able to cancel it). It only counts as
+        # "story over" when the order is actually cancelled (i.e. after
+        # the 3rd rejection).
         existing_payment = getattr(order, "payment", None)
-        if existing_payment and existing_payment.status in ("refunded", "rejected"):
+        if existing_payment and (
+            existing_payment.status == "refunded"
+            or (
+                existing_payment.status == "rejected"
+                and order.status == "cancelled"
+            )
+        ):
             return Response(
                 {
                     "error": (
                         f"This order's payment is '{existing_payment.status}' — its "
-                        "status can no longer be updated. Use the "
-                        "reinstate action if it needs to be reopened."
+                        "status can no longer be updated."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
@@ -1564,59 +1607,6 @@ class AdminOrderStatusUpdateView(APIView):
 
         return Response(response_data)
 
-
-# NEW (B29): "ability to re-pay for a reinstated order" — lets an admin
-# undo a cancellation and put the order back into pending_payment so the
-# customer can pay for it again via the existing, already-working Pay Now
-# flow (CreatePaymentIntentView in payments/views.py already supports any
-# order_number whose payment isn't "paid" yet — B31 needed no backend
-# change, this is what makes it usable for a previously-cancelled order).
-class AdminOrderReinstateView(APIView):
-    """PUT /api/v1/admin/orders/{order_number}/reinstate/"""
-    permission_classes = [permissions.IsAuthenticated, IsAdmin]
-
-    def put(self, request, order_number):
-        try:
-            order = Order.objects.get(order_number=order_number)
-        except Order.DoesNotExist:
-            return Response(
-                {"error": "Order not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        if order.status != "cancelled":
-            return Response(
-                {"error": "Only a cancelled order can be reinstated."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        order.status = "pending_payment"
-        order.cancellation_reason = None
-        order.save()
-
-        if hasattr(order, "payment"):
-            # A fresh PaymentIntent must be created next time the customer
-            # pays — clearing the old id prevents CreatePaymentIntentView's
-            # "already paid" check from getting confused by stale data, and
-            # avoids ever reusing a Stripe intent tied to the old attempt.
-            order.payment.status = "pending"
-            order.payment.stripe_payment_intent_id = None
-            order.payment.paid_at = None
-            order.payment.refunded_at = None
-            order.payment.save()
-
-        create_notification(
-            user=order.customer.user,
-            store=order.store,
-            title="Order Reinstated",
-            message=(
-                f"Your order #{order.order_number} has been reinstated. "
-                "You can complete payment to proceed with it."
-            ),
-            notification_type="order",
-        )
-
-        return Response(OrderDetailSerializer(order).data)
 
 # Returns filtered order list for administrators.
 class AdminOrderFilterView(generics.ListAPIView):

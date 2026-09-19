@@ -1,6 +1,7 @@
 # PATH: apps/orders/management/commands/cancel_stale_payments.py
 #
-# Backend Change Request v2 — two separate scheduled timeout jobs:
+# Backend Change Request v2 — scheduled timeout jobs (two original ones
+# below, plus a third one added Sep 2026 for rejected QR proofs):
 #
 #   1. Item 5, transition 4: Stripe payment timeout — exactly 30 minutes
 #      from order creation with no successful Stripe webhook.
@@ -9,7 +10,14 @@
 #      "pending" — once proof is uploaded it moves to "under_review" and
 #      this timeout no longer applies, per spec).
 #
-# Both: order.status -> cancelled, release reserved_stock (Transition 3),
+#   3. NEW (Sep 2026 — QR rejection flow change): a QR proof was rejected
+#      (1st or 2nd time, so the order stayed "pending_payment" with
+#      payment.status == "rejected") and the customer never re-uploaded
+#      within 24 hours of that rejection. Without this, such an order
+#      would sit in pending_payment forever, holding reserved stock,
+#      because job 2 above only matches payment.status == "pending".
+#
+# All three: order.status -> cancelled, release reserved_stock (Transition 3),
 # send the customer the existing cancellation notification. This is a
 # backend cron/scheduled task — the frontend never triggers it.
 #
@@ -37,11 +45,16 @@ from django.db import transaction
 from django.utils import timezone
 from datetime import timedelta
 
-from apps.orders.models import Order
+from apps.notifications.utils import create_notification
+from apps.orders.models import Order, Payment
 from apps.orders.views import release_reserved_stock_for_order
 
 STRIPE_TIMEOUT = timedelta(minutes=30)
 QR_TIMEOUT = timedelta(hours=24)
+# NEW (Sep 2026): how long a customer gets to re-upload a QR proof after
+# a rejection before the order is auto-cancelled. Change this one value
+# if you want a shorter/longer window.
+QR_REJECTED_TIMEOUT = timedelta(hours=24)
 
 
 def _cancel_order_for_timeout(order, reason):
@@ -123,11 +136,86 @@ def cancel_expired_qr_orders(now=None):
     return cancelled_count
 
 
+def cancel_expired_rejected_qr_orders(now=None):
+    """
+    NEW (Sep 2026 — QR rejection flow change): auto-cancel QR orders
+    whose proof was rejected (1st/2nd rejection) and never re-uploaded
+    within QR_REJECTED_TIMEOUT.
+
+    Matches: order.status == "pending_payment", payment method "qr",
+    payment.status == "rejected". Payment.updated_at is used as "when it
+    was rejected" — nothing else touches the payment row between a
+    rejection and the customer's next upload (which flips it to
+    "under_review" and takes it out of this queryset), so no new field /
+    migration is needed.
+
+    payment.status stays "rejected" on purpose: together with the
+    cancelled order it makes QRProofUploadView answer "This order has
+    been cancelled." (the qr_rejection_count is still below the 3-attempt
+    cap, so it is not the "max attempts" message). Like every other
+    cancelled order it is final — nothing can change its status again.
+    """
+    now = now or timezone.now()
+    cutoff = now - QR_REJECTED_TIMEOUT
+
+    stale_orders = Order.objects.filter(
+        status="pending_payment",
+        payment__payment_method="qr",
+        payment__status="rejected",
+        payment__updated_at__lte=cutoff,
+    ).select_related("customer", "customer__user", "store", "payment")
+
+    cancelled_count = 0
+    for order in stale_orders:
+        with transaction.atomic():
+            # Lock the order AND its payment, then re-check both: if the
+            # customer re-uploaded a proof (payment -> "under_review") or
+            # the order was cancelled/confirmed in the tiny window since
+            # the queryset was built, do nothing.
+            locked_order = Order.objects.select_for_update().get(pk=order.pk)
+            locked_payment = Payment.objects.select_for_update().get(
+                order=locked_order
+            )
+
+            if (
+                locked_order.status != "pending_payment"
+                or locked_payment.status != "rejected"
+            ):
+                continue
+
+            release_reserved_stock_for_order(locked_order)
+            locked_order.status = "cancelled"
+            locked_order.cancellation_reason = (
+                "QR payment proof was rejected and no new proof was "
+                "submitted within 24 hours."
+            )
+            locked_order.save()
+
+        create_notification(
+            user=order.customer.user,
+            store=order.store,
+            title="Order cancelled",
+            message=(
+                f"Your order {order.order_number} has been cancelled because "
+                "no new payment proof was submitted within 24 hours of the "
+                "rejection."
+            ),
+            notification_type="order",
+            reference_type="order",
+            reference_id=order.order_number,
+        )
+
+        cancelled_count += 1
+
+    return cancelled_count
+
+
 class Command(BaseCommand):
     help = (
         "Auto-cancels stale pending_payment orders: Stripe orders after "
         "30 minutes with no successful webhook, QR orders after 24 hours "
-        "with no proof uploaded. Releases their reserved stock and "
+        "with no proof uploaded, QR orders whose rejected proof was not "
+        "re-uploaded within 24 hours. Releases their reserved stock and "
         "notifies the customer. Intended to run on a schedule (e.g. every "
         "5 minutes via cron) — see the module docstring for how to wire "
         "that up on this deployment."
@@ -138,11 +226,13 @@ class Command(BaseCommand):
 
         stripe_cancelled = cancel_expired_stripe_orders(now=now)
         qr_cancelled = cancel_expired_qr_orders(now=now)
+        rejected_cancelled = cancel_expired_rejected_qr_orders(now=now)
 
         self.stdout.write(
             self.style.SUCCESS(
                 f"cancel_stale_payments: {stripe_cancelled} Stripe order(s) "
                 f"cancelled (30-min timeout), {qr_cancelled} QR order(s) "
-                f"cancelled (24-hr timeout)."
+                f"cancelled (24-hr timeout), {rejected_cancelled} QR order(s) "
+                f"cancelled (rejected proof not re-uploaded in 24 hrs)."
             )
         )
