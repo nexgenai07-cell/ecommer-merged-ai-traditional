@@ -31,6 +31,12 @@ from .complaint_views import (
     AdminComplaintStatusUpdateView,
     AdminComplaintRespondView,
 )
+# NEW (Sep 2026 — Bulk Actions): real bulk endpoints for admin pages.
+from .bulk_views import (
+    AdminOrderBulkStatusUpdateView,
+    AdminReturnBulkStatusUpdateView,
+    AdminComplaintBulkStatusUpdateView,
+)
 
 
 # Mount at /api/v1/orders/
@@ -89,6 +95,14 @@ urlpatterns = [
 # Mount at /api/v1/admin/orders/
 admin_order_urlpatterns = [
     path("", AdminOrderListView.as_view(), name="admin-order-list"),
+    # NEW (Sep 2026 — Bulk Actions): must stay ABOVE "<str:order_number>/"
+    # below — that pattern matches any single string, so "bulk-status/"
+    # would otherwise be swallowed by it (same reason "filter/" is above).
+    path(
+        "bulk-status/",
+        AdminOrderBulkStatusUpdateView.as_view(),
+        name="admin-order-bulk-status",
+    ),
     path(
         "filter/",
         AdminOrderFilterView.as_view(),
@@ -116,6 +130,12 @@ return_urlpatterns = [
 
 # Mount at /api/v1/admin/returns/
 admin_return_urlpatterns = [
+    # NEW (Sep 2026 — Bulk Actions): approve/reject many returns at once.
+    path(
+        "bulk-status/",
+        AdminReturnBulkStatusUpdateView.as_view(),
+        name="admin-return-bulk-status",
+    ),
     path(
         "<int:pk>/status/",
         AdminReturnStatusUpdateView.as_view(),
@@ -151,6 +171,12 @@ complaint_urlpatterns = [
 
 # Mount at /api/v1/admin/complaints/
 admin_complaint_urlpatterns = [
+    # NEW (Sep 2026 — Bulk Actions): update status of many complaints at once.
+    path(
+        "bulk-status/",
+        AdminComplaintBulkStatusUpdateView.as_view(),
+        name="admin-complaint-bulk-status",
+    ),
     path(
         "<int:pk>/status/",
         AdminComplaintStatusUpdateView.as_view(),

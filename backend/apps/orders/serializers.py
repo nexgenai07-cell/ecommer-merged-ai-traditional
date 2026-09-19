@@ -4,6 +4,7 @@ import re
 
 from rest_framework import serializers
 from .models import Customer, Order, OrderItem, Payment
+from .locations import check_city_province
 
 # Pakistani mobile/landline numbers: optional +92 or leading 0, then 9-11
 # digits. Kept permissive on purpose (spaces/dashes stripped before check)
@@ -380,6 +381,16 @@ class CheckoutSerializer(serializers.Serializer):
     NEW (PDF Part 3): payment_method field
     ============================================================
 
+    NEW (Sep 2026 — city/province check): province (the dropdown value)
+    is now sent together with a manually typed city, and the two must
+    match — e.g. city "Gujranwala" with province "Sindh" is rejected
+    (Gujranwala is in Punjab). See validate() at the bottom of this class
+    and apps/orders/locations.py for the city list. This only runs when
+    the address is typed in manually: if the customer picked a saved
+    address (address_id) or the city is left blank (falls back to their
+    default saved address), there is no typed city/province pair to
+    compare. A city that isn't in our list is not rejected.
+
     NEW (Buy Now): buy_now_product_id / buy_now_quantity — when
     buy_now_product_id is present, CheckoutView builds the order from
     this single product+quantity instead of the persisted cart, and the
@@ -399,6 +410,15 @@ class CheckoutSerializer(serializers.Serializer):
         required=False,
         allow_blank=True,
         max_length=CITY_MAX_LENGTH,
+    )
+    # NEW (Sep 2026): the province dropdown value. Required whenever a
+    # city is typed in manually (enforced in validate() below) so the
+    # city/province pair can be checked. It is only used for that check —
+    # it is not stored on the order.
+    province = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=50,
     )
     # FIX (B18): explicitly optional — checkout must not block on this.
     postal_code = serializers.CharField(
@@ -504,6 +524,35 @@ class CheckoutSerializer(serializers.Serializer):
                 "Enter a valid phone number, e.g. 03001234567 or +923001234567."
             )
         return cleaned
+
+    # NEW (Sep 2026): the typed city must belong to the selected province.
+    def validate(self, attrs):
+        # A saved Address Book entry was chosen — CheckoutView uses that
+        # entry's city and ignores any typed city, so there's nothing to
+        # compare here.
+        if attrs.get("address_id"):
+            return attrs
+
+        city = (attrs.get("city") or "").strip()
+
+        # No city typed: CheckoutView will fall back to the customer's
+        # default saved address (or 400 with its own "missing city"
+        # message). Nothing typed to compare, so nothing to check.
+        if not city:
+            return attrs
+
+        province = (attrs.get("province") or "").strip()
+        if not province:
+            raise serializers.ValidationError(
+                {"province": "Please select your province."}
+            )
+
+        canonical_province, error = check_city_province(city, province)
+        if error:
+            raise serializers.ValidationError({"province": error})
+
+        attrs["province"] = canonical_province
+        return attrs
 
 
 # NEW (Backend Change Request v2, Part 2 — Item 1 / Issue 3): optional

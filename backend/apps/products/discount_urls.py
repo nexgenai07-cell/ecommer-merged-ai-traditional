@@ -8,11 +8,19 @@ from .discount_views import (
     DiscountValidateView,
     DiscountCodeAvailabilityView,
 )
+from .bulk_views import DiscountBulkDeleteView
 
 router = DefaultRouter()
 router.register('', DiscountViewSet, basename='discount')
 
 urlpatterns = [
+    # NEW (Sep 2026 — Bulk Actions): must stay ABOVE the router include
+    # below (its "<pk>/" pattern would otherwise swallow "bulk-delete/").
+    path(
+        'bulk-delete/',
+        DiscountBulkDeleteView.as_view(),
+        name='discount-bulk-delete',
+    ),
     path(
         'validate/',
         DiscountValidateView.as_view(),

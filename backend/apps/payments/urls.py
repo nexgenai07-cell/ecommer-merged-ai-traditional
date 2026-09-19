@@ -1,3 +1,5 @@
+# PATH: apps/payments/urls.py
+
 from django.urls import path
 
 from .views import (
@@ -7,6 +9,11 @@ from .views import (
     AdminQRPaymentPendingView,
     AdminQRPaymentApproveView,
     AdminQRPaymentRejectView,
+)
+# NEW (Sep 2026 — Bulk Actions)
+from .bulk_views import (
+    AdminQRPaymentBulkApproveView,
+    AdminQRPaymentBulkRejectView,
 )
 
 
@@ -50,6 +57,20 @@ admin_payment_urlpatterns = [
         "qr/pending/",
         AdminQRPaymentPendingView.as_view(),
         name="admin-qr-payment-pending",
+    ),
+    # NEW (Sep 2026 — Bulk Actions): approve / reject many QR payment
+    # proofs at once. These have only 2 path segments ("qr/bulk-approve/"),
+    # so they can never clash with the 3-segment
+    # "qr/<order_number>/approve/" patterns below.
+    path(
+        "qr/bulk-approve/",
+        AdminQRPaymentBulkApproveView.as_view(),
+        name="admin-qr-payment-bulk-approve",
+    ),
+    path(
+        "qr/bulk-reject/",
+        AdminQRPaymentBulkRejectView.as_view(),
+        name="admin-qr-payment-bulk-reject",
     ),
     path(
         "qr/<str:order_number>/approve/",

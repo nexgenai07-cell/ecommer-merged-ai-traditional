@@ -19,6 +19,7 @@ from apps.ai.audit import log_manual_admin_action as log_admin_action
 from .models import Order
 from apps.users.permissions import IsAdmin
 from core.pagination import StandardResultsPagination
+from core.date_range import filter_by_date_range
 
 
 class CreateReturnView(APIView):
@@ -154,13 +155,9 @@ class ReturnListView(generics.ListAPIView):
             qs = qs.filter(search_filter)
 
         # 3. start_date / end_date (YYYY-MM-DD) against created_at.
-        start_date = params.get("start_date")
-        if start_date:
-            qs = qs.filter(created_at__date__gte=start_date)
-
-        end_date = params.get("end_date")
-        if end_date:
-            qs = qs.filter(created_at__date__lte=end_date)
+        # UPDATED (Sep 2026): validated in one shared place (start_date
+        # may equal end_date but not be after it; bad dates give a 400).
+        qs = filter_by_date_range(qs, params)
 
         # 4. ordering — whitelisted values only; default stays
         # -created_at when the param is missing/invalid.

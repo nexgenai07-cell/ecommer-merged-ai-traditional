@@ -23,6 +23,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 
 from core.pagination import StandardResultsPagination
+from core.date_range import filter_by_date_range
 from apps.notifications.utils import (
     create_notification,
     notify_store_admins,
@@ -1128,13 +1129,10 @@ class OrderListView(generics.ListAPIView):
                 status_param = "pending_payment"
             qs = qs.filter(status=status_param)
 
-        start_date = params.get("start_date")
-        if start_date:
-            qs = qs.filter(created_at__date__gte=start_date)
-
-        end_date = params.get("end_date")
-        if end_date:
-            qs = qs.filter(created_at__date__lte=end_date)
+        # UPDATED (Sep 2026): start_date/end_date now validated in one
+        # shared place — start_date after end_date (equal is fine) or a
+        # malformed date returns 400 instead of an empty list / a crash.
+        qs = filter_by_date_range(qs, params)
 
         return qs
 
@@ -1674,14 +1672,9 @@ class AdminOrderFilterView(generics.ListAPIView):
         if customer_id:
             qs = qs.filter(customer_id=customer_id)
 
-        # Date filters
-        start_date = params.get("start_date")
-        if start_date:
-            qs = qs.filter(created_at__date__gte=start_date)
-
-        end_date = params.get("end_date")
-        if end_date:
-            qs = qs.filter(created_at__date__lte=end_date)
+        # Date filters — UPDATED (Sep 2026): validated in one shared
+        # place (start_date may equal end_date but not be after it).
+        qs = filter_by_date_range(qs, params)
 
         # Search
         search = params.get("search")

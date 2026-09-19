@@ -11,6 +11,7 @@ from .serializers import CategorySerializer
 from apps.users.permissions import IsAdmin
 from apps.ai.audit import log_manual_admin_action as log_admin_action
 from core.pagination import StandardResultsPagination
+from core.date_range import filter_by_date_range
 
 
 class CategoryViewSet(viewsets.ModelViewSet):
@@ -29,7 +30,8 @@ class CategoryViewSet(viewsets.ModelViewSet):
 
     Query Params on the list endpoint (NEW — Frontend audit, Sep 2026):
     - search              (matches category name, case-insensitive partial)
-    - start_date/end_date  (YYYY-MM-DD, against created_at)
+    - start_date/end_date  (YYYY-MM-DD, against created_at; start_date
+                            can't be after end_date, equal is fine)
     - ordering            (name / -name / created_at / -created_at /
                             product_count / -product_count; defaults to
                             'name' — same default the old Meta.ordering
@@ -74,13 +76,11 @@ class CategoryViewSet(viewsets.ModelViewSet):
         if search:
             queryset = queryset.filter(name__icontains=search)
 
-        start_date = params.get("start_date")
-        if start_date:
-            queryset = queryset.filter(created_at__date__gte=start_date)
-
-        end_date = params.get("end_date")
-        if end_date:
-            queryset = queryset.filter(created_at__date__lte=end_date)
+        # UPDATED (Sep 2026): start_date/end_date validated in one shared
+        # place (core/date_range.py) — start_date may equal end_date but
+        # not be after it, and a malformed date returns 400 instead of
+        # crashing. Same created_at__date filtering as before.
+        queryset = filter_by_date_range(queryset, params)
 
         # product_count isn't a real column — the admin table's "Product
         # Count" column/sort needs it, so it's annotated here the same

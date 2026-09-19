@@ -3,6 +3,7 @@ import calendar
 import datetime as dt
 import re
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation
 
 from django.conf import settings
 from django.core.cache import cache
@@ -21,6 +22,7 @@ from django.utils import timezone
 from rest_framework import permissions, status, generics
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from rest_framework.exceptions import ValidationError
 
 from apps.orders.models import Order, OrderItem, Customer
 from apps.products.models import Product, Discount
@@ -31,6 +33,7 @@ from apps.ai.models import AuditLog
 from apps.whatsapp.models import WhatsAppLog
 from apps.users.permissions import IsAdmin
 from core.pagination import StandardResultsPagination
+from core.date_range import get_date_range
 
 def parse_date_range(request):
     """
@@ -142,6 +145,26 @@ def format_phone_for_csv(phone):
         normalized = '+92' + digits
 
     return f'="{normalized}"'
+
+
+def csv_safe_text(value):
+    """
+    NEW (19 Sep 2026 - export audit): guards against CSV / spreadsheet
+    formula injection. A text value that starts with =, +, - or @ (or a
+    tab / carriage return) is executed as a FORMULA by Excel / Google
+    Sheets the moment the admin opens the exported file - so anyone who
+    can put text into the database (a WhatsApp message they send, the
+    name they register with) could run a formula on the admin's machine
+    (e.g. =HYPERLINK(...) leaking data, or DDE). Prefixing a single
+    quote makes the spreadsheet treat the cell as plain text.
+
+    Only used for free text that outside people control (WhatsApp
+    messages, customer names in the WhatsApp exports) - NOT for phone
+    numbers, which deliberately use format_phone_for_csv() above.
+    """
+    if isinstance(value, str) and value and value[0] in ('=', '+', '-', '@', '\t', '\r'):
+        return "'" + value
+    return value
 
 
 def get_trunc_function(period):
@@ -775,6 +798,26 @@ class AnalyticsExportView(APIView):
     start_date/end_date/type/status were honoured, so this export could
     never match what was actually filtered on screen.
 
+    AUDIT (19 Sep 2026 - export review): the 4 types above and the Products
+    filters were checked against the on-screen list endpoints they are
+    supposed to match, and these gaps were fixed:
+      - start_date/end_date are now validated once, for every type, with
+        the same rules as every list page (core/date_range.py): a
+        malformed date or start_date after end_date returns 400 instead
+        of crashing with a 500 / silently exporting nothing.
+      - audit_logs: ?user= accepts the admin's NAME as well as the id,
+        exactly like GET /admin/audit-logs/ (17 Sep 2026 fix) - a name
+        used to crash the export with a 500.
+      - products: same price validation as /products/search/ (400 for
+        bad / negative / reversed prices instead of a 500), the
+        "in_stock" status alias, case-insensitive in_stock=true/false,
+        and ?ordering= (so the CSV rows come in the same order as the
+        screen).
+      - categories: ?search= and ?ordering= (incl. product_count), same
+        as GET /categories/.
+      - WhatsApp exports: message text / customer names are made safe
+        against spreadsheet formula injection (see csv_safe_text()).
+
     NOTE on column choices: the v7 doc didn't specify exact CSV columns
     per type (only that each type must export "a real CSV, not an
     error, not an empty file"), so the columns below are my best-effort
@@ -805,7 +848,12 @@ class AnalyticsExportView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        start_date, end_date, _ = parse_date_range(request)
+        # UPDATED (19 Sep 2026 - export review): validated with the same
+        # shared helper every list page uses (core/date_range.py) instead
+        # of the raw parse_date_range() - a malformed date used to crash
+        # with a 500, and start_date after end_date silently exported an
+        # empty file. Returns real date objects (or None when blank).
+        start_date, end_date = get_date_range(request.query_params)
 
         # NEW (16 Sep 2026 — Filtering Fix): whatsapp_conversation exports
         # a single customer's message thread, so phone_number is required.
@@ -915,7 +963,10 @@ class AnalyticsExportView(APIView):
         # end_date were honoured, so this export could never match what
         # was actually filtered on the Products page. Now accepts the
         # same filters as GET /api/v1/products/search/ (API 29):
-        # q, category_id, min_price, max_price, in_stock, status.
+        # q, category_id, min_price, max_price, in_stock, status, ordering.
+        #
+        # UPDATED (19 Sep 2026 - export review): brought fully in line
+        # with that endpoint - see the AUDIT note in the class docstring.
         qs = Product.objects.filter(is_delete=False).select_related('category')
 
         if start_date:
@@ -939,16 +990,46 @@ class AnalyticsExportView(APIView):
         for raw in category_id_values:
             category_ids.extend([v.strip() for v in raw.split(',') if v.strip()])
         if category_ids:
+            # A non-numeric id used to crash the query with a 500.
+            if not all(v.isdigit() for v in category_ids):
+                raise ValidationError({'error': 'category_id must contain only valid ids.'})
             qs = qs.filter(category_id__in=category_ids)
 
-        min_price = params.get('min_price')
-        if min_price:
+        # Same validation + messages as /products/search/: bad number,
+        # negative, or a reversed range -> 400 (used to be a 500 / an
+        # empty file).
+        def _parse_price(key):
+            raw = params.get(key)
+            if raw is None or raw == '':
+                return None
+            try:
+                value = Decimal(raw)
+            except (InvalidOperation, ValueError):
+                raise ValidationError({'error': f'{key} must be a valid number.'})
+            if not value.is_finite():
+                raise ValidationError({'error': f'{key} must be a valid number.'})
+            if value < 0:
+                raise ValidationError({'error': f'{key} cannot be negative.'})
+            return value
+
+        min_price = _parse_price('min_price')
+        max_price = _parse_price('max_price')
+
+        if min_price is not None and max_price is not None and min_price > max_price:
+            raise ValidationError({
+                'error': (
+                    'min_price cannot be greater than max_price. '
+                    'The range must go from the smaller value to the '
+                    'larger value, e.g. min_price=5000&max_price=10000.'
+                )
+            })
+
+        if min_price is not None:
             qs = qs.filter(price__gte=min_price)
-        max_price = params.get('max_price')
-        if max_price:
+        if max_price is not None:
             qs = qs.filter(price__lte=max_price)
 
-        in_stock = params.get('in_stock')
+        in_stock = (params.get('in_stock') or '').lower()
         if in_stock == 'true':
             qs = qs.filter(total_stock__gt=F('reserved_stock'))
         elif in_stock == 'false':
@@ -965,10 +1046,20 @@ class AnalyticsExportView(APIView):
                 status_filter |= Q(_available_stock__lte=0)
             if 'low_stock' in statuses:
                 status_filter |= Q(_available_stock__gt=0, _available_stock__lte=F('low_stock_threshold'))
-            if 'healthy' in statuses:
+            # "in_stock" is accepted as an alias of "healthy" by
+            # /products/search/ (the frontend uses either name for the
+            # "In Stock" tab) - it was missing here, so that tab exported
+            # EVERY product instead of only the in-stock ones.
+            if 'healthy' in statuses or 'in_stock' in statuses:
                 status_filter |= Q(_available_stock__gt=F('low_stock_threshold'))
             if status_filter:
                 qs = qs.filter(status_filter)
+
+        # Same whitelist as /products/search/ - anything else is ignored
+        # and the model's default ordering (-created_at) is kept.
+        ordering = params.get('ordering')
+        if ordering in ('created_at', '-created_at', 'price', '-price', 'name', '-name'):
+            qs = qs.order_by(ordering)
 
         writer.writerow(['SKU', 'Name', 'Category', 'Price', 'Stock', 'Is Active', 'Created At'])
         for p in qs:
@@ -992,8 +1083,30 @@ class AnalyticsExportView(APIView):
             qs = qs.filter(created_at__date__gte=start_date)
         if end_date:
             qs = qs.filter(created_at__date__lte=end_date)
+
+        # UPDATED (19 Sep 2026 - export review): same ?search= and
+        # ?ordering= as GET /api/v1/categories/ (the admin Categories
+        # table). Only the dates were honoured before, so searching or
+        # sorting on screen and then exporting gave a different list.
+        params = self.request.query_params
+
+        search = params.get('search')
+        if search:
+            qs = qs.filter(name__icontains=search)
+
+        ordering_map = {
+            'name': 'name',
+            '-name': '-name',
+            'created_at': 'created_at',
+            '-created_at': '-created_at',
+            'product_count': '_product_count',
+            '-product_count': '-_product_count',
+        }
+        qs = qs.annotate(_product_count=Count('products', distinct=True))
+        qs = qs.order_by(ordering_map.get(params.get('ordering'), 'name'))
+
         writer.writerow(['Name', 'Is Active', 'Product Count', 'Created At'])
-        for c in qs.annotate(_product_count=Count('products', distinct=True)):
+        for c in qs:
             writer.writerow([c.name, c.is_active, c._product_count, c.created_at])
 
     def _export_audit_logs(self, writer, start_date, end_date):
@@ -1012,9 +1125,18 @@ class AnalyticsExportView(APIView):
         if entity:
             qs = qs.filter(entity=entity)
 
-        user_id = params.get('user')
-        if user_id:
-            qs = qs.filter(user_id=user_id)
+        # FIX (19 Sep 2026 - export review): same rule as
+        # AuditLogListView (17 Sep 2026 production-crash fix). The
+        # frontend's User dropdown can send the admin's display NAME
+        # instead of the numeric id - filter(user_id="Test Admin 2")
+        # crashed this export with a 500. A number is still treated as
+        # the id; anything else is matched against the admin's name.
+        user_param = params.get('user')
+        if user_param:
+            if user_param.isdigit():
+                qs = qs.filter(user_id=user_param)
+            else:
+                qs = qs.filter(user__name__iexact=user_param)
 
         action_param = params.get('action')
         if action_param in ('create', 'update', 'delete'):
@@ -1070,7 +1192,7 @@ class AnalyticsExportView(APIView):
         writer.writerow(['Phone Number', 'Customer Name', 'Message Count', 'Last Message At'])
         for row in rows:
             writer.writerow([
-                row['phone_number'], row['customer_name'] or '',
+                row['phone_number'], csv_safe_text(row['customer_name'] or ''),
                 row['message_count'], row['last_message_at'],
             ])
 
@@ -1088,7 +1210,9 @@ class AnalyticsExportView(APIView):
             qs = qs.filter(created_at__date__lte=end_date)
         writer.writerow(['Direction', 'Message', 'Is Admin', 'Created At'])
         for log in qs:
-            writer.writerow([log.direction, log.message, log.is_admin, log.created_at])
+            # csv_safe_text: the message text is written by whoever
+            # messaged the bot - never trust it as a spreadsheet cell.
+            writer.writerow([log.direction, csv_safe_text(log.message), log.is_admin, log.created_at])
 
     def _export_returns(self, writer, start_date, end_date):
         qs = Return.objects.select_related('order', 'customer')

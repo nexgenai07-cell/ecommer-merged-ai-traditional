@@ -86,14 +86,22 @@ class DiscountViewSet(viewsets.ModelViewSet):
         """
         Only non-deleted discounts.
 
-        Query Params (NEW):
+        Query Params:
         - search   (matches coupon code, case-insensitive partial)
         - type     (percent / fixed)
-        - status   (active / expired — derived, not a stored column:
-                     "active" = is_active AND end_date in the future;
-                     everything else, including a manually deactivated
-                     coupon or one past its end_date, is "expired")
-        - ordering (see ORDERING_MAP above; defaults to -created_at)
+        - status   (active / inactive / expired — derived, not a stored
+                     column)
+
+        FIX (bug report, Sep 2026): "status=expired" used to also catch
+        every manually-deactivated coupon (is_active=False), so an admin
+        had no way to see "coupons I turned off" separately from
+        "coupons that ran out of time." Split into three mutually
+        exclusive buckets:
+          - active   = is_active=True  AND end_date is still in the future
+          - inactive = is_active=False (admin manually turned it off,
+                       regardless of its end_date)
+          - expired  = is_active=True  AND end_date has already passed
+                       (it was never turned off, it just ran out of time)
         """
         qs = Discount.objects.filter(is_delete=False)
 
@@ -108,12 +116,14 @@ class DiscountViewSet(viewsets.ModelViewSet):
             qs = qs.filter(type=discount_type)
 
         status_param = params.get('status')
+        now = timezone.now()
+
         if status_param == 'active':
-            qs = qs.filter(is_active=True, end_date__gte=timezone.now())
+            qs = qs.filter(is_active=True, end_date__gte=now)
+        elif status_param == 'inactive':
+            qs = qs.filter(is_active=False)
         elif status_param == 'expired':
-            qs = qs.filter(
-                Q(is_active=False) | Q(end_date__lt=timezone.now())
-            )
+            qs = qs.filter(is_active=True, end_date__lt=now)
 
         ordering = params.get('ordering')
         qs = qs.order_by(self.ORDERING_MAP.get(ordering, '-created_at'))
@@ -166,14 +176,14 @@ class DiscountViewSet(viewsets.ModelViewSet):
         """
         instance.is_active = False
         instance.is_delete = True
- 
+
         instance.save(
-    update_fields=[
-        "is_active",
-        "is_delete",
-        "updated_at",
-    ]
-)
+            update_fields=[
+                "is_active",
+                "is_delete",
+                "updated_at",
+            ]
+        )
 
         log_admin_action(
             store=instance.store,
@@ -225,7 +235,8 @@ class DiscountValidateView(APIView):
             },
             status=status.HTTP_200_OK,
         )
-        
+
+
 class DiscountCodeAvailabilityView(APIView):
     """
     GET /api/v1/discounts/check-code/
