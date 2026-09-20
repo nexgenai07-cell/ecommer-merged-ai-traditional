@@ -6,6 +6,7 @@ import hashlib
 import os
 
 from django.conf import settings
+from django.core.cache import cache
 from django.db import transaction
 from django.utils import timezone
 from django.core.files.base import ContentFile
@@ -39,6 +40,22 @@ stripe.api_key = settings.STRIPE_SECRET_KEY
 # the order in "pending_payment" (customer can re-upload). The 3rd
 # rejection permanently cancels the order and re-upload is refused.
 MAX_QR_REJECTION_ATTEMPTS = 3
+
+
+# FIX (Sep 2026 — Dashboard revenue not updating after payment approval):
+# DashboardView (apps/analytics/dashboard_views.py) caches its response
+# under this exact key for 5 minutes (cache.set('analytics_dashboard',
+# data, timeout=300)) so the homepage doesn't hit the DB on every load.
+# That's fine for normal browsing, but it meant a newly-confirmed (or
+# newly-cancelled) order's revenue didn't show up on the dashboard until
+# the cache happened to expire — up to 5 minutes later — even though the
+# order/payment change itself was saved correctly and instantly. Every
+# place below that flips an order into/out of Order.REVENUE_STATUSES
+# (confirmed via QR approval, Stripe, or a free/zero-amount order; or
+# cancelled via the 3rd QR rejection) now clears this cache key
+# immediately after saving, so the very next dashboard load recalculates
+# fresh numbers instead of serving the stale cached ones.
+DASHBOARD_CACHE_KEY = "analytics_dashboard"
 
 
 class CreatePaymentIntentView(APIView):
@@ -103,6 +120,10 @@ class CreatePaymentIntentView(APIView):
                 # FIX (B59): this is one of the two real "payment confirmed"
                 # moments — stock must be deducted now, not back at checkout.
                 confirm_stock_for_order(order)
+
+            # FIX (Dashboard revenue caching — see DASHBOARD_CACHE_KEY note
+            # above): this order just entered Order.REVENUE_STATUSES.
+            cache.delete(DASHBOARD_CACHE_KEY)
 
             return Response(
                 {
@@ -210,6 +231,11 @@ class StripeWebhookView(APIView):
                     # moment — real Stripe payments go through here. Stock
                     # is deducted only now, not at checkout time.
                     confirm_stock_for_order(order)
+
+                    # FIX (Dashboard revenue caching — see
+                    # DASHBOARD_CACHE_KEY note above): this order just
+                    # entered Order.REVENUE_STATUSES.
+                    cache.delete(DASHBOARD_CACHE_KEY)
 
                     # Notification
                     # Notification: Stripe payment confirmed
@@ -601,6 +627,13 @@ class AdminQRPaymentApproveView(APIView):
             # ============================================================
             confirm_stock_for_order(order)
 
+            # FIX (Dashboard revenue caching — see DASHBOARD_CACHE_KEY note
+            # above): this order just entered Order.REVENUE_STATUSES —
+            # without this the admin Dashboard's Total Revenue card kept
+            # showing the pre-approval number for up to 5 minutes even
+            # though the order was correctly confirmed right away.
+            cache.delete(DASHBOARD_CACHE_KEY)
+
         # ============================================================
         # Customer notification (reference_type: "order")
         # ============================================================
@@ -722,6 +755,15 @@ class AdminQRPaymentRejectView(APIView):
                 )
                 order.save()
                 release_reserved_stock_for_order(order)
+
+                # FIX (Dashboard revenue caching — see DASHBOARD_CACHE_KEY
+                # note above): a cancellation can never remove revenue that
+                # was never counted in the first place here (the order was
+                # still pending_payment/under_review, never confirmed), but
+                # clearing the cache keeps every order-status-changing path
+                # consistent rather than leaving this one silently
+                # dependent on the others to eventually refresh it.
+                cache.delete(DASHBOARD_CACHE_KEY)
             else:
                 # 1st / 2nd rejection: order goes back to (or stays in)
                 # pending_payment so the customer can upload a new proof.

@@ -7,6 +7,7 @@ import stripe
 from decimal import Decimal
 from apps.ai.audit import log_manual_admin_action as log_admin_action
 from django.conf import settings
+from django.core.cache import cache
 import random
 import string
 
@@ -48,6 +49,17 @@ from apps.products.models import Product, StockMovement, Discount
 from apps.products.services import check_low_stock_notification
 from apps.stores.models import Store
 from apps.users.permissions import IsAdmin, IsCustomer
+
+# FIX (Sep 2026 — Dashboard revenue not updating after status change):
+# DashboardView (apps/analytics/dashboard_views.py) caches its response
+# under this exact key for 5 minutes. Any place in this file that moves
+# an order into or out of Order.REVENUE_STATUSES (confirmed / shipped /
+# out_for_delivery / delivered) must clear this key right after saving,
+# so the admin Dashboard's Total Revenue card reflects the change on its
+# very next load instead of up to 5 minutes late. See the identical fix
+# (with the full explanation) in apps/payments/views.py.
+DASHBOARD_CACHE_KEY = "analytics_dashboard"
+
 
 def generate_order_number(): # Generates a unique order number for every new order.
     year = timezone.now().year
@@ -1528,6 +1540,13 @@ class AdminOrderStatusUpdateView(APIView):
             ]
 
         order.save()
+
+        # FIX (Dashboard revenue caching — see DASHBOARD_CACHE_KEY note
+        # above): new_status can be "confirmed" (or move further along
+        # Order.REVENUE_STATUSES) or "cancelled" — both change what the
+        # Dashboard's Total Revenue card should show, so the stale cached
+        # value is cleared here regardless of which way the status moved.
+        cache.delete(DASHBOARD_CACHE_KEY)
 
         status_titles = {
     "pending_payment": "Awaiting Payment",
