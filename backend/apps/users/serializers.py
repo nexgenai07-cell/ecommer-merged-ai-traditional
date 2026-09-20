@@ -47,20 +47,33 @@ class RegisterSerializer(serializers.ModelSerializer):
       return value
 
     def validate_phone(self, value):
-       if value and not value.isdigit():
-        raise serializers.ValidationError(
-            "Phone number must contain digits only." #phone number validation added
-        )
+        # FIX (Sep 2026 — international format registration bug): a local
+        # Pakistani number like 03001234567 passed .isdigit() and
+        # registered fine, but the SAME number as +923001234567 failed
+        # with "must contain digits only" — .isdigit() returns False the
+        # moment a '+' is in the string, so every +92 signup was silently
+        # rejected. A leading '+' is now stripped before the digit/length
+        # checks (a bare '+' with nothing after it still correctly fails),
+        # so both 03XXXXXXXXX and +923XXXXXXXXX / 923XXXXXXXXX register.
+        if not value:
+            return value
 
-       if value and len(value) < 10:
-        raise serializers.ValidationError(
-            "Phone number must be at least 10 digits."
-        )
+        digits = value[1:] if value.startswith('+') else value
 
-       if value and len(value) > 15:
-        raise serializers.ValidationError(
-            "Phone number must not exceed 15 digits."
-        )
+        if not digits or not digits.isdigit():
+            raise serializers.ValidationError(
+                "Phone number must contain digits only, optionally starting with '+'."
+            )
+
+        if len(digits) < 10:
+            raise serializers.ValidationError(
+                "Phone number must be at least 10 digits."
+            )
+
+        if len(digits) > 15:
+            raise serializers.ValidationError(
+                "Phone number must not exceed 15 digits."
+            )
 
         return value
 
