@@ -8,23 +8,24 @@
 #   POST /api/v1/admin/payments/qr/bulk-approve/
 #   POST /api/v1/admin/payments/qr/bulk-reject/
 #
+# Response shape follows Bulk Delete Categories (API 27.2) — see the
+# contract at the top of core/bulk.py: 200 OK with approved_ids /
+# rejected_ids, missing_ids and message, plus "failed" / "results" for
+# orders that exist but that the normal rules refused.
+#
 # Every order is processed by calling the EXISTING single-item view
 # (AdminQRPaymentApproveView / AdminQRPaymentRejectView), so all of its
 # rules run unchanged for each one: QR-only, payment must be
 # "under_review", approve -> payment paid + order confirmed + stock
 # confirmed, reject -> the 3-strike rule (3rd rejection cancels the order
 # and releases stock), customer notification and audit log per order.
-#
-# Orders are independent: one that cannot be approved/rejected (e.g. its
-# payment is no longer under_review) is reported in "failed" with the
-# reason while the rest still go through. See core/bulk.py for the
-# response shape.
 
 from rest_framework import permissions
 from rest_framework.views import APIView
 
 from apps.users.permissions import IsAdmin
 from core.bulk import (
+    MISSING,
     parse_bulk_identifiers,
     call_single_view,
     extract_error_message,
@@ -41,25 +42,36 @@ class AdminQRPaymentBulkApproveView(APIView):
     POST /api/v1/admin/payments/qr/bulk-approve/
 
     Body: {"order_numbers": ["ORD-2026-00001", "ORD-2026-00002"]}
+
+    Response (200 OK):
+        {
+          "approved_ids": ["ORD-2026-00001"],
+          "missing_ids":  [],
+          "failed":       [{"id": "ORD-2026-00002", "error": "Payment status is paid, not under_review."}],
+          "message":      "1 QR payment(s) approved successfully. 1 could not be approved.",
+          "results":      [{"id": "...", "order_number": "...", "payment_status": "paid", "order_status": "confirmed"}]
+        }
     """
 
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
     def post(self, request):
         order_numbers = parse_bulk_identifiers(
-            request.data, "order_numbers", kind="str"
+            request.data, "order_numbers", kind="str", label="order numbers"
         )
 
         single_view = AdminQRPaymentApproveView()
 
         def process(order_number):
-            ok, data = call_single_view(
+            outcome, data = call_single_view(
                 single_view.put,
                 request,
                 {},
                 order_number=order_number,
             )
-            if not ok:
+            if outcome == MISSING:
+                return MISSING, None
+            if outcome is not True:
                 return False, extract_error_message(data)
 
             return True, {
@@ -68,8 +80,11 @@ class AdminQRPaymentBulkApproveView(APIView):
                 "order_status": data.get("order_status"),
             }
 
-        succeeded, failed = run_bulk(order_numbers, process)
-        return bulk_response(succeeded, failed, "QR payments", "approved")
+        done, missing_ids, failed = run_bulk(order_numbers, process)
+        return bulk_response(
+            done, missing_ids, failed,
+            ids_key="approved_ids", noun="QR payment(s)", verb="approved",
+        )
 
 
 class AdminQRPaymentBulkRejectView(APIView):
@@ -77,6 +92,10 @@ class AdminQRPaymentBulkRejectView(APIView):
     POST /api/v1/admin/payments/qr/bulk-reject/
 
     Body: {"order_numbers": ["ORD-2026-00001", ...], "reason": "string"}
+
+    Response (200 OK): {rejected_ids, missing_ids, failed, message, results}
+    (same shape as bulk-approve; each result also carries rejection_count
+    and permanently_cancelled, exactly like the single reject endpoint).
 
     The same reason (mandatory, exactly like the single reject endpoint)
     is applied to every order and shown to each customer.
@@ -86,7 +105,7 @@ class AdminQRPaymentBulkRejectView(APIView):
 
     def post(self, request):
         order_numbers = parse_bulk_identifiers(
-            request.data, "order_numbers", kind="str"
+            request.data, "order_numbers", kind="str", label="order numbers"
         )
 
         # reason is mandatory — validated once up front so nothing is
@@ -98,13 +117,15 @@ class AdminQRPaymentBulkRejectView(APIView):
         single_view = AdminQRPaymentRejectView()
 
         def process(order_number):
-            ok, data = call_single_view(
+            outcome, data = call_single_view(
                 single_view.put,
                 request,
                 {"reason": reason},
                 order_number=order_number,
             )
-            if not ok:
+            if outcome == MISSING:
+                return MISSING, None
+            if outcome is not True:
                 return False, extract_error_message(data)
 
             return True, {
@@ -115,5 +136,8 @@ class AdminQRPaymentBulkRejectView(APIView):
                 "permanently_cancelled": data.get("permanently_cancelled"),
             }
 
-        succeeded, failed = run_bulk(order_numbers, process)
-        return bulk_response(succeeded, failed, "QR payments", "rejected")
+        done, missing_ids, failed = run_bulk(order_numbers, process)
+        return bulk_response(
+            done, missing_ids, failed,
+            ids_key="rejected_ids", noun="QR payment(s)", verb="rejected",
+        )

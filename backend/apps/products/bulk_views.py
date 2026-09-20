@@ -7,7 +7,12 @@
 #   POST /api/v1/products/bulk-delete/
 #   POST /api/v1/discounts/bulk-delete/
 #
-# Body (both):  {"ids": [1, 2, 3]}
+# Request : {"ids": [1, 2, 3]}
+# Response: EXACTLY the Bulk Delete Categories (API 27.2) shape —
+#   200 OK  {"deleted_ids": [1, 2], "missing_ids": [3], "message": "2 product(s) deleted successfully."}
+#   400     {"detail": "ids must be a non-empty list of product ids."}
+# (an id that doesn't exist / is already deleted goes to missing_ids; it
+# never fails the batch).
 #
 # Each item is deleted by calling the EXISTING perform_destroy() of the
 # single-delete viewset, so it is the same soft delete as before:
@@ -15,14 +20,12 @@
 #               customer's cart, audit log written.
 #   - Discount: is_active=False, is_delete=True, updated_at saved,
 #               audit log written.
-# Ids that don't exist / are already deleted are reported in "failed"
-# (the rest are still deleted). See core/bulk.py for the response shape.
 
 from rest_framework import permissions
 from rest_framework.views import APIView
 
 from apps.users.permissions import IsAdmin
-from core.bulk import parse_bulk_identifiers, run_bulk, bulk_response
+from core.bulk import MISSING, parse_bulk_identifiers, run_bulk, bulk_response
 
 from .models import Product, Discount
 from .views import ProductViewSet
@@ -35,7 +38,9 @@ class ProductBulkDeleteView(APIView):
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
     def post(self, request):
-        ids = parse_bulk_identifiers(request.data, "ids", kind="int")
+        ids = parse_bulk_identifiers(
+            request.data, "ids", kind="int", label="product ids"
+        )
 
         # perform_destroy() only needs self.request, so a bare viewset
         # instance is enough to reuse the exact single-delete logic.
@@ -52,14 +57,17 @@ class ProductBulkDeleteView(APIView):
         def process(product_id):
             product = products.get(product_id)
             if product is None:
-                return False, "Product not found or already deleted."
+                return MISSING, None
 
-            name = product.name
             viewset.perform_destroy(product)
-            return True, {"name": name}
+            return True, None
 
-        succeeded, failed = run_bulk(ids, process)
-        return bulk_response(succeeded, failed, "products", "deleted")
+        done, missing_ids, failed = run_bulk(ids, process)
+        return bulk_response(
+            done, missing_ids, failed,
+            ids_key="deleted_ids", noun="product(s)", verb="deleted",
+            include_details=False,
+        )
 
 
 class DiscountBulkDeleteView(APIView):
@@ -68,7 +76,9 @@ class DiscountBulkDeleteView(APIView):
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
     def post(self, request):
-        ids = parse_bulk_identifiers(request.data, "ids", kind="int")
+        ids = parse_bulk_identifiers(
+            request.data, "ids", kind="int", label="discount ids"
+        )
 
         viewset = DiscountViewSet()
         viewset.request = request
@@ -81,11 +91,14 @@ class DiscountBulkDeleteView(APIView):
         def process(discount_id):
             discount = discounts.get(discount_id)
             if discount is None:
-                return False, "Discount not found or already deleted."
+                return MISSING, None
 
-            code = discount.code
             viewset.perform_destroy(discount)
-            return True, {"code": code}
+            return True, None
 
-        succeeded, failed = run_bulk(ids, process)
-        return bulk_response(succeeded, failed, "discounts", "deleted")
+        done, missing_ids, failed = run_bulk(ids, process)
+        return bulk_response(
+            done, missing_ids, failed,
+            ids_key="deleted_ids", noun="discount(s)", verb="deleted",
+            include_details=False,
+        )

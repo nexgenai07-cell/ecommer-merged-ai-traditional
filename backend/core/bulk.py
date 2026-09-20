@@ -6,25 +6,35 @@
 # had no real bulk endpoint — the frontend was firing one request per id
 # (Promise.all / Promise.allSettled). Each of those bulk endpoints now
 # lives in its own app (see the *bulk_views.py files), and they all share
-# the small helpers below so every one of them:
+# the small helpers below.
 #
-#   - validates the incoming id list the same way,
-#   - processes each id INDEPENDENTLY (one bad id never stops the rest —
-#     exactly like N separate single-endpoint calls would behave),
-#   - returns the SAME response shape:
+# RESPONSE CONTRACT — follows Bulk Delete Categories (API 27.2), which is
+# the bulk shape the frontend already integrates and asked to keep:
 #
-#         {
-#           "message":       "3 of 5 orders updated.",
-#           "total":         5,
-#           "success_count": 3,
-#           "failed_count":  2,
-#           "succeeded": [ {"id": ..., ...extra info...}, ... ],
-#           "failed":    [ {"id": ..., "error": "why it failed"}, ... ]
-#         }
+#   POST  { "ids": [1, 2, 3] }            (orders / QR use "order_numbers")
 #
-#     HTTP status: 200 when at least one id succeeded (frontend should
-#     look at "failed" for the ones that did not), 400 when EVERY id
-#     failed (so a normal error toast fires on the frontend).
+#   200 OK  (always, once the request itself is valid — a bad id never
+#            fails the whole batch)
+#   {
+#     "<verb>_ids":  [1, 2],     # exactly what was actually processed
+#                                # (deleted_ids / updated_ids / approved_ids /
+#                                #  rejected_ids — same idea as deleted_ids
+#                                #  in API 27.2)
+#     "missing_ids": [3],        # ids that don't exist (or are already
+#                                # deleted) — quietly reconcile these
+#     "failed": [                # status endpoints only: ids that exist but
+#       {"id": 2, "error": "..."}#  the normal business rules refused (e.g.
+#     ],                         #  "already delivered") — same error text
+#                                #  the single endpoint would have returned
+#     "message": "2 order(s) updated successfully.",
+#     "results": [ ... ]         # status endpoints only: per-id extra info
+#   }
+#
+#   400 Bad Request — the request itself is invalid (missing / empty /
+#   too long / malformed id list):  { "detail": "ids must be a non-empty list of ... ids." }
+#   (same {"detail": ...} shape as API 27.2). Invalid shared fields such as
+#   an unknown "status", a cancel without a reason, or a QR reject without
+#   a reason return the same field-keyed 400 the single endpoint gives.
 #
 # IMPORTANT DESIGN CHOICE — the business rules are NOT copied here.
 # Each bulk view calls the existing single-item view / method for every
@@ -32,7 +42,8 @@
 # So every rule that already exists for the single action (forward-only
 # order status, stock release on cancel, notifications, audit log, QR
 # 3-strike rule, ...) runs identically in bulk, and any future change to
-# a single endpoint automatically applies to its bulk version too.
+# a single endpoint automatically applies to its bulk version too. Each id
+# is processed independently, exactly like N separate single calls.
 
 import logging
 
@@ -46,17 +57,26 @@ logger = logging.getLogger(__name__)
 # from someone sending thousands of ids at once).
 MAX_BULK_ITEMS = 100
 
+# What process_one() returns as its first value when the id does not exist
+# (goes into "missing_ids"), instead of True (done) / False (rule refused).
+MISSING = "missing"
 
-def parse_bulk_identifiers(data, key, kind="int", max_items=MAX_BULK_ITEMS):
+
+def _bad_list(message):
+    return ValidationError({"detail": message})
+
+
+def parse_bulk_identifiers(data, key, kind="int", label="ids", max_items=MAX_BULK_ITEMS):
     """Reads and validates the list of ids from request.data[key].
 
     kind="int"  -> ids like [1, 2, 3]            (also accepts "1", "2")
     kind="str"  -> order numbers like ["ORD-2026-00001", ...]
+    label       -> used in the error text, e.g. "product ids"
 
     Returns a de-duplicated list (original order kept). Raises a 400
-    ValidationError {"error": "..."} when the list is missing, empty,
-    too long, or contains an invalid value — nothing is processed in
-    that case.
+    ValidationError {"detail": "..."} (same shape as API 27.2) when the
+    list is missing, empty, too long, or contains an invalid value —
+    nothing is processed in that case.
     """
     if hasattr(data, "getlist"):
         # Form-encoded request (QueryDict): [1,2] arrives as repeated keys.
@@ -65,14 +85,10 @@ def parse_bulk_identifiers(data, key, kind="int", max_items=MAX_BULK_ITEMS):
         raw = data.get(key)
 
     if not isinstance(raw, (list, tuple)) or len(raw) == 0:
-        raise ValidationError(
-            {"error": f"'{key}' must be a non-empty list."}
-        )
+        raise _bad_list(f"{key} must be a non-empty list of {label}.")
 
     if len(raw) > max_items:
-        raise ValidationError(
-            {"error": f"You can process at most {max_items} items at a time."}
-        )
+        raise _bad_list(f"You can process at most {max_items} items at a time.")
 
     cleaned = []
     seen = set()
@@ -81,20 +97,14 @@ def parse_bulk_identifiers(data, key, kind="int", max_items=MAX_BULK_ITEMS):
         if kind == "int":
             # bool is a subclass of int in Python — reject it explicitly.
             if isinstance(value, bool):
-                raise ValidationError(
-                    {"error": f"'{key}' must contain only valid ids."}
-                )
+                raise _bad_list(f"{key} must contain only valid {label}.")
             try:
                 value = int(value)
             except (TypeError, ValueError):
-                raise ValidationError(
-                    {"error": f"'{key}' must contain only valid ids."}
-                )
+                raise _bad_list(f"{key} must contain only valid {label}.")
         else:
             if not isinstance(value, str) or not value.strip():
-                raise ValidationError(
-                    {"error": f"'{key}' must contain only non-empty strings."}
-                )
+                raise _bad_list(f"{key} must contain only valid {label}.")
             value = value.strip()
 
         if value not in seen:
@@ -144,72 +154,95 @@ class ItemRequest:
 
 def call_single_view(handler, request, data, *args, **kwargs):
     """Calls an existing single-item handler (e.g. view.put) with a
-    per-item payload and reports whether it succeeded.
+    per-item payload.
 
-    Returns (ok, response_data):
-        ok             True when the handler returned a 2xx response.
-        response_data  the handler's response body (dict) — on failure
-                       pass it through extract_error_message().
+    Returns (outcome, response_data):
+        outcome  True     -> the handler returned a 2xx response
+                 MISSING  -> the handler returned 404 (id doesn't exist)
+                 False    -> any other error (a business rule refused it)
+        response_data  the handler's response body (dict) — on False pass
+                       it through extract_error_message().
     """
     response = handler(ItemRequest(request, data), *args, **kwargs)
-    ok = 200 <= response.status_code < 300
-    return ok, response.data
+
+    if 200 <= response.status_code < 300:
+        return True, response.data
+    if response.status_code == status.HTTP_404_NOT_FOUND:
+        return MISSING, response.data
+    return False, response.data
 
 
 def run_bulk(identifiers, process_one):
     """Runs process_one(identifier) for every identifier, independently.
 
-    process_one must return (ok, detail):
-        ok=True   detail = dict of extra info to include in the success
-                  entry (or None)
-        ok=False  detail = error message string
+    process_one must return (outcome, detail):
+        (True, dict_or_None)   done — dict = extra info for "results"
+        (False, "message")     exists, but the rules refused it -> "failed"
+        (MISSING, None)        doesn't exist                    -> "missing_ids"
 
-    An exception in one item is caught, logged, and reported for that
-    item only — the remaining items are still processed.
+    An exception in one item is caught, logged, and reported as "failed"
+    for that item only — the remaining items are still processed.
 
-    Returns (succeeded, failed) lists ready for bulk_response().
+    Returns (done, missing_ids, failed) ready for bulk_response().
     """
-    succeeded = []
+    done = []
+    missing_ids = []
     failed = []
 
     for identifier in identifiers:
         try:
-            ok, detail = process_one(identifier)
+            outcome, detail = process_one(identifier)
         except ValidationError as exc:
-            ok, detail = False, extract_error_message(exc.detail)
+            outcome, detail = False, extract_error_message(exc.detail)
         except Exception:
             logger.exception("Bulk action failed for item %r", identifier)
-            ok, detail = False, "Something went wrong while processing this item."
+            outcome, detail = False, "Something went wrong while processing this item."
 
-        if ok:
+        if outcome is True:
             entry = {"id": identifier}
             if detail:
                 entry.update(detail)
-            succeeded.append(entry)
+            done.append(entry)
+        elif outcome == MISSING:
+            missing_ids.append(identifier)
         else:
             failed.append({"id": identifier, "error": detail})
 
-    return succeeded, failed
+    return done, missing_ids, failed
 
 
-def bulk_response(succeeded, failed, noun, verb):
-    """Builds the common bulk response.
+def bulk_response(done, missing_ids, failed, ids_key, noun, verb, include_details=True):
+    """Builds the common bulk response (see the contract at the top).
 
-    noun  e.g. "orders"     verb  e.g. "updated" / "deleted" / "approved"
+    ids_key          e.g. "deleted_ids" / "updated_ids" / "approved_ids"
+    noun, verb       e.g. "order(s)", "updated"
+    include_details  True  -> also send "failed" and "results" (status
+                              endpoints, where business rules can refuse an id)
+                     False -> exact Bulk Delete Categories shape:
+                              {<ids_key>, missing_ids, message} ("failed" only
+                              appears if something unexpected went wrong)
     """
-    total = len(succeeded) + len(failed)
+    message = f"{len(done)} {noun} {verb} successfully."
+    not_done = len(missing_ids) + len(failed)
+    # The delete endpoints keep the exact API 27.2 message (successes only,
+    # missing ids are already listed in "missing_ids").
+    if not_done and (include_details or failed):
+        message += f" {not_done} could not be {verb}."
 
     body = {
-        "message": f"{len(succeeded)} of {total} {noun} {verb}.",
-        "total": total,
-        "success_count": len(succeeded),
-        "failed_count": len(failed),
-        "succeeded": succeeded,
-        "failed": failed,
+        ids_key: [entry["id"] for entry in done],
+        "missing_ids": missing_ids,
     }
 
-    http_status = (
-        status.HTTP_200_OK if succeeded else status.HTTP_400_BAD_REQUEST
-    )
+    # "failed" is always sent when something actually failed, even for the
+    # delete endpoints — otherwise an unexpected error on one id would be
+    # silently invisible (it would just be absent from <ids_key>).
+    if include_details or failed:
+        body["failed"] = failed
 
-    return Response(body, status=http_status)
+    body["message"] = message
+
+    if include_details:
+        body["results"] = done
+
+    return Response(body, status=status.HTTP_200_OK)

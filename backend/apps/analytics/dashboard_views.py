@@ -449,7 +449,7 @@ class OrdersAnalyticsView(APIView):
 
 
 class BestSellersView(generics.GenericAPIView):
-    """GET /api/v1/analytics/products/best-sellers/?start_date=&end_date=&limit=5&category_id=&page=&page_size=
+    """GET /api/v1/analytics/products/best-sellers/?start_date=&end_date=&limit=5&category_id=&ordering=&page=&page_size=
 
     FIX (Frontend audit, Sep 2026): added category_id (accepts a single
     id or comma-separated ids, same convention as elsewhere in the app)
@@ -460,16 +460,51 @@ class BestSellersView(generics.GenericAPIView):
     it's omitted, the old `limit`-sliced plain-array behaviour is kept
     unchanged for existing callers (e.g. dashboard widgets using
     ?limit=5).
+
+    FIX (API 95 — ordering param, Sep 2026): added `ordering` so
+    "Top Products by Revenue" can rank by total_revenue instead of
+    being limited to whatever the units-sold ranking already let
+    through (previously a Rs 120,000 / 2-units product could rank
+    ~70th by units and never survive `limit=50`, even though it had
+    the highest revenue). Ordering is applied to the queryset BEFORE
+    `limit`/pagination via .order_by(), with a deterministic tie-break
+    (total_sold desc, then product_id asc) so paginated pages never
+    overlap or skip items. Default stays `-total_sold` — the exact
+    previous behaviour — so existing callers (e.g. the dashboard
+    widget using ?limit=5) are unaffected. An unrecognized value
+    returns 400 instead of silently falling back, per the frontend's
+    request, so a typo doesn't quietly reorder the page.
     """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
     pagination_class = StandardResultsPagination
 
+    ORDERING_MAP = {
+        "-total_sold": ("-total_sold", "product_id"),
+        "total_sold": ("total_sold", "product_id"),
+        "-total_revenue": ("-total_revenue", "-total_sold", "product_id"),
+        "total_revenue": ("total_revenue", "-total_sold", "product_id"),
+    }
 
     def get(self, request):
         start_date = request.query_params.get("start_date")
         end_date = request.query_params.get("end_date")
         limit = int(request.query_params.get("limit", 5))
         category_id = request.query_params.get("category_id")
+        ordering = request.query_params.get("ordering", "-total_sold")
+
+        # NEW: reject an unrecognized ordering value with 400 rather than
+        # silently falling back — the frontend explicitly asked for this
+        # so a typo'd `ordering` doesn't quietly reorder the widget.
+        if ordering not in self.ORDERING_MAP:
+            return Response(
+                {
+                    "error": (
+                        f"Invalid ordering '{ordering}'. Allowed values: "
+                        f"{', '.join(self.ORDERING_MAP.keys())}"
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
 
         # FIX (Sep 2026 — Total Spent / Revenue consistency): see DashboardView above.
@@ -494,7 +529,7 @@ class BestSellersView(generics.GenericAPIView):
                   total_sold=Sum("quantity"),
                   total_revenue=Sum("total_price"),
               )
-              .order_by("-total_sold")
+              .order_by(*self.ORDERING_MAP[ordering])
         )
 
         def _serialize(rows):
