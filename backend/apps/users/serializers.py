@@ -1,16 +1,115 @@
 # PATH: apps/users/serializers.py
+import logging
+import re
+
 from .models import User, UserSession, TwoFactorAuth
 from rest_framework import serializers
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 
+logger = logging.getLogger(__name__)
+
+# Same rules as apps/orders/address_serializers.py, so an address given at
+# registration is held to exactly the same standard as one added later
+# from the Address Book.
+_CITY_RE = re.compile(r'^[A-Za-z\s]+$')
+_POSTAL_CODE_RE = re.compile(r'^\d{4,6}$')
+_CITY_MAX_LENGTH = 30
+
+# Other names the frontend register form might send the "Primary Address"
+# field under. "address" is the main one; these are accepted as fallbacks.
+_ADDRESS_KEY_ALIASES = ("primary_address", "shipping_address")
+
+
+def _detect_city_from_address(address_text):
+    """
+    Registration only has ONE free-text "Primary Address" box, but an
+    Address Book entry (and checkout) also needs a city. If no separate
+    city was sent, look for a known Pakistani city inside the address text
+    (e.g. "House 5, Street 3, Gujranwala" -> "Gujranwala"), scanning from
+    the END of the text, since the city is normally written last.
+    Returns "" when no known city is found (nothing is guessed).
+    """
+    from apps.orders.locations import provinces_for_city
+
+    words = re.findall(r"[A-Za-z]+", address_text or "")
+    for end in range(len(words), 0, -1):
+        for size in (3, 2, 1):
+            start = end - size
+            if start < 0:
+                continue
+            candidate = " ".join(words[start:end])
+            if provinces_for_city(candidate):
+                return candidate.title()
+    return ""
+
+
+def _save_registration_address(user, address_text, city, postal_code):
+    """
+    Saves the address entered at registration as this customer's DEFAULT
+    Address Book entry, so it shows up at checkout automatically (before
+    the customer adds any new address).
+
+    Registration must never fail because of this step, so any problem is
+    logged and swallowed — the account itself is already created.
+    """
+    try:
+        from apps.orders.models import Address
+        from apps.orders.views import get_or_create_customer
+        from apps.stores.models import Store
+
+        store = Store.objects.first()
+        if store is None:
+            return
+
+        customer = get_or_create_customer(user, store_id=store.id)
+
+        Address.objects.create(
+            customer=customer,
+            label="Primary",
+            shipping_address=address_text,
+            city=city or _detect_city_from_address(address_text),
+            postal_code=postal_code or None,
+            phone=re.sub(r'[\s-]', '', user.phone or "") or None,
+            is_default=True,
+        )
+    except Exception:
+        logger.exception(
+            "Could not save registration address for user %s", user.pk
+        )
 
 
 class RegisterSerializer(serializers.ModelSerializer):
     """
     Used for public registration.
     Role is always forced to 'customer' — admin cannot be created here.
+
+    NEW (Sep 2026 — checkout prefill): the register form has a "Primary
+    Address" box, but this serializer used to ignore it completely, so the
+    address was never saved anywhere and could never show up at checkout.
+    It is now accepted (optional) and stored as the customer's default
+    Address Book entry. City / postal code are optional extras: if the
+    frontend doesn't send a city, it is looked up from the address text.
     """
+
+    address = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        max_length=500,
+    )
+    city = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        max_length=_CITY_MAX_LENGTH,
+    )
+    postal_code = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        max_length=20,
+    )
 
     password = serializers.CharField(
         write_only=True,
@@ -27,6 +126,9 @@ class RegisterSerializer(serializers.ModelSerializer):
             'name',
             'email',
             'phone',
+            'address',
+            'city',
+            'postal_code',
             'password',
             'confirm_password'
         ]
@@ -35,6 +137,41 @@ class RegisterSerializer(serializers.ModelSerializer):
                 'validators': []
             }
         }
+
+    def to_internal_value(self, data):
+        # Accept the address under a few common key names (see
+        # _ADDRESS_KEY_ALIASES) and map it to "address".
+        if hasattr(data, 'get') and not data.get('address'):
+            for alias in _ADDRESS_KEY_ALIASES:
+                if data.get(alias):
+                    data = data.copy()
+                    data['address'] = data.get(alias)
+                    break
+        return super().to_internal_value(data)
+
+    def validate_address(self, value):
+        value = (value or '').strip()
+        if value and len(value) < 8:
+            raise serializers.ValidationError(
+                "Address looks too short — please enter a full address."
+            )
+        return value
+
+    def validate_city(self, value):
+        value = (value or '').strip()
+        if value and not _CITY_RE.match(value):
+            raise serializers.ValidationError(
+                "City name should contain letters only (no numbers or symbols)."
+            )
+        return value
+
+    def validate_postal_code(self, value):
+        value = (value or '').strip()
+        if value and not _POSTAL_CODE_RE.match(value):
+            raise serializers.ValidationError(
+                "Postal code should be 4-6 digits (leave blank if unknown)."
+            )
+        return value
 
     def validate_email(self, value):
       value = value.lower().strip()
@@ -94,6 +231,12 @@ class RegisterSerializer(serializers.ModelSerializer):
             'confirm_password'
         )
 
+        # These three are not User fields — they belong to the Address
+        # Book, so they are taken out before the User is created.
+        address_text = validated_data.pop('address', '')
+        city = validated_data.pop('city', '')
+        postal_code = validated_data.pop('postal_code', '')
+
         user = User.objects.create_user(
             email=validated_data['email'],
             password=validated_data['password'],
@@ -104,6 +247,9 @@ class RegisterSerializer(serializers.ModelSerializer):
             ),
             role='customer',
         )
+
+        if address_text:
+            _save_registration_address(user, address_text, city, postal_code)
 
         return user
 

@@ -29,6 +29,16 @@ class MyOrderStatsView(APIView):
     A user can have more than one Customer profile (one per store, see
     Customer.unique_together) — this sums across all of that user's own
     profiles, not just one store.
+
+    UPDATED (Sep 2026 — dashboard "Total Orders" count bug): total_orders
+    used to be counted from the same paid-only queryset as total_spent, so
+    a customer with 3 orders (cancelled + pending payment + delivered)
+    saw "Total Orders: 1" on their dashboard. total_orders now counts
+    EVERY order the customer has placed, whatever its status (pending,
+    on hold, confirmed, shipped, delivered, cancelled, ...). total_spent
+    is unchanged — it still only adds up paid, non-cancelled orders
+    (Order.REVENUE_STATUSES), because money that was never paid or was
+    refunded must not count as "spent".
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -37,19 +47,18 @@ class MyOrderStatsView(APIView):
             user=request.user
         ).values_list("id", flat=True)
 
-        orders = Order.objects.filter(
-            customer_id__in=customer_ids,
-            status__in=Order.REVENUE_STATUSES,
-        )
+        all_orders = Order.objects.filter(customer_id__in=customer_ids)
+
+        paid_orders = all_orders.filter(status__in=Order.REVENUE_STATUSES)
 
         total_spent = sum(
-            (order.total_amount for order in orders),
+            (order.total_amount for order in paid_orders),
             Decimal("0.00"),
         )
 
         return Response(
             {
-                "total_orders": orders.count(),
+                "total_orders": all_orders.count(),
                 "total_spent": total_spent,
             }
         )

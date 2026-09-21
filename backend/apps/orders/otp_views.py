@@ -41,24 +41,29 @@ def generate_otp():
 
 def send_checkout_otp_email(email, code):
     """
-    Emails the 6-digit checkout verification code. Same 6-digit /
+    Emails the 6-digit checkout OTP. Same 6-digit /
     plain-text-plus-html pattern as send_2fa_code_email /
     send_email_change_code in apps/users/email_service.py.
+
+    FIX (Sep 2026 — email wording): the email is now clearly an ORDER
+    CONFIRMATION OTP. It no longer talks about any "verification" (and
+    never mentions phone) — it only asks the customer to enter this
+    code to confirm their order.
     """
-    subject = "Your order verification code"
+    subject = "Your Order Confirmation OTP"
     message = (
-        f"Your order verification code is: {code}\n\n"
-        f"Enter this code to confirm your order. This code is valid for "
+        f"Your Order Confirmation OTP is: {code}\n\n"
+        f"Enter this OTP to confirm your order. This OTP is valid for "
         f"{CheckoutOTP.OTP_VALIDITY_MINUTES} minutes. If you did not "
         "request this, you can safely ignore this email."
     )
     html_message = f"""
         <html>
             <body>
-                <h2>Your order verification code</h2>
-                <p>Enter this code to confirm and place your order:</p>
+                <h2>Order Confirmation OTP</h2>
+                <p>Enter this OTP to confirm and place your order:</p>
                 <h1 style="letter-spacing: 4px;">{code}</h1>
-                <p>This code is valid for {CheckoutOTP.OTP_VALIDITY_MINUTES} minutes.</p>
+                <p>This OTP is valid for {CheckoutOTP.OTP_VALIDITY_MINUTES} minutes.</p>
                 <p>If you did not request this, you can safely ignore this email.</p>
             </body>
         </html>
@@ -161,7 +166,7 @@ class SendCheckoutOTPView(APIView):
 
         return Response(
             {
-                "message": f"A verification code has been sent to {masked_email}.",
+                "message": f"An order confirmation OTP has been sent to {masked_email}.",
                 "expires_in_minutes": CheckoutOTP.OTP_VALIDITY_MINUTES,
             },
             status=status.HTTP_200_OK,
@@ -224,10 +229,13 @@ class VerifyCheckoutOTPView(APIView):
 
         return Response(
             {
+                # FIX (Sep 2026): used to say "Phone/email verified." —
+                # this OTP is only an order confirmation OTP sent to the
+                # account email, so the wording no longer mentions phone.
                 "message": (
-                    "Phone/email verified. You can now place your order, "
-                    "and every order after this one — no need to verify "
-                    "again."
+                    "Order confirmation OTP verified. You can now place "
+                    "your order, and every order after this one — no need "
+                    "to verify again."
                 ),
                 "already_verified": True,
             },
