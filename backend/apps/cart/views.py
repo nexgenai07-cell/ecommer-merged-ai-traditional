@@ -1,4 +1,5 @@
 # PATH: apps/cart/views.py
+
 import uuid
 from rest_framework import status, permissions
 from django.db import transaction
@@ -155,7 +156,17 @@ class CartView(APIView):
     def get(self, request):
        cart, session_key, is_new_session = get_or_create_cart_for_request(request)
 
+       # NEW (Sep 2026 — coupon re-check): if the coupon on this cart is
+       # no longer valid (minimum order amount no longer met, expired, or
+       # deactivated), remove it now so the totals below never show a
+       # discount that checkout would refuse.
+       coupon_removed_message = cart.remove_coupon_if_invalid()
+
        data = CartSerializer(cart).data
+
+       # Only present when a coupon was just removed by this request.
+       if coupon_removed_message:
+         data["coupon_removed_message"] = coupon_removed_message
 
     # Guest cart session key must be returned so frontend
     # can store it in localStorage and send it on future requests.
@@ -246,10 +257,17 @@ class UpdateCartItemView(APIView):
         if quantity == 0:
             cart_item.delete()
 
+            # NEW (Sep 2026 — coupon re-check): removing the item may drop
+            # the cart below the coupon's minimum order amount.
+            coupon_removed_message = cart.remove_coupon_if_invalid()
+
             response_data = {
                 'message': 'Cart updated.',
                 'item_total': '0.00',
             }
+
+            if coupon_removed_message:
+                response_data['coupon_removed_message'] = coupon_removed_message
 
             if session_key:
                 response_data['session_key'] = session_key
@@ -264,10 +282,17 @@ class UpdateCartItemView(APIView):
 
         item_total = cart_item.product.price * cart_item.quantity
 
+        # NEW (Sep 2026 — coupon re-check): lowering a quantity may drop
+        # the cart below the coupon's minimum order amount.
+        coupon_removed_message = cart.remove_coupon_if_invalid()
+
         response_data = {
             'message': 'Cart updated.',
             'item_total': str(item_total),
         }
+
+        if coupon_removed_message:
+            response_data['coupon_removed_message'] = coupon_removed_message
 
         if session_key:
             response_data['session_key'] = session_key
@@ -308,9 +333,16 @@ class RemoveCartItemView(APIView):
 
         cart_item.delete()
 
+        # NEW (Sep 2026 — coupon re-check): removing the item may drop the
+        # cart below the coupon's minimum order amount.
+        coupon_removed_message = cart.remove_coupon_if_invalid()
+
         response_data = {
             'message': 'Item removed from cart.'
         }
+
+        if coupon_removed_message:
+            response_data['coupon_removed_message'] = coupon_removed_message
 
         if session_key:
             response_data['session_key'] = session_key

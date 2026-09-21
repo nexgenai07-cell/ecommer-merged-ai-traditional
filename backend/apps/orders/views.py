@@ -623,6 +623,34 @@ class CheckoutView(APIView):
                 cart.save()
                 checkout_coupon = coupon_discount
 
+            # NEW (Sep 2026 — coupon re-check): a coupon that was applied
+            # earlier on the cart page (and no new coupon_code was sent
+            # here) used to be trusted as-is — the customer could remove
+            # items after applying it, drop below its minimum order
+            # amount (or let it expire / be deactivated) and still get the
+            # discount. It is now re-checked with the same rules as
+            # Apply Coupon. If it is no longer valid, the coupon is
+            # removed from the cart and this checkout is stopped with a
+            # 400, so the customer sees the real total and places the
+            # order again knowingly. (When coupon_code IS sent, it was
+            # just validated above.)
+            if not coupon_code and checkout_coupon:
+                coupon_problem = cart.get_coupon_problem()
+                if coupon_problem:
+                    cart.coupon = None
+                    cart.save()
+                    return Response(
+                        {
+                            "error": (
+                                f"{coupon_problem} The coupon has been "
+                                "removed from your cart — please check "
+                                "your total and place the order again."
+                            ),
+                            "coupon_removed": True,
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
         # Resolve the customer profile first.
         customer = get_or_create_customer(
             request.user,

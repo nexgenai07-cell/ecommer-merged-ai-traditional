@@ -1,5 +1,8 @@
+# PATH: apps/cart/models.py
+
 from django.db import models
 from django.conf import settings
+from django.utils import timezone
 
 
 class Cart(models.Model):
@@ -73,6 +76,44 @@ class Cart(models.Model):
     @property
     def total(self):
         return max(self.subtotal - self.discount_amount, 0)
+
+    # NEW (Sep 2026 — coupon re-check): a coupon is only checked when it is
+    # first applied (ApplyCouponView). After that, removing items, an
+    # expiry, or an admin deactivating the coupon left it sitting on the
+    # cart, still giving a discount — even at checkout. These two methods
+    # re-run the SAME rules ApplyCouponView uses (active, inside its date
+    # range, minimum order amount) against the cart as it is right now.
+    def get_coupon_problem(self):
+        """Returns None if there is no coupon, or the coupon is still valid
+        for this cart. Otherwise returns the reason (same wording as
+        ApplyCouponView's error messages)."""
+        coupon = self.coupon
+        if coupon is None:
+            return None
+
+        if not coupon.is_active or getattr(coupon, "is_delete", False):
+            return "Invalid or inactive coupon code."
+
+        now = timezone.now()
+        if not (coupon.start_date <= now <= coupon.end_date):
+            return "This coupon has expired or is not active yet."
+
+        if coupon.min_order_amount and self.subtotal < coupon.min_order_amount:
+            return (
+                f"Minimum order amount of Rs. "
+                f"{coupon.min_order_amount} required for this coupon."
+            )
+
+        return None
+
+    def remove_coupon_if_invalid(self):
+        """Removes the coupon from this cart if it is no longer valid.
+        Returns the reason it was removed, or None if nothing was removed."""
+        problem = self.get_coupon_problem()
+        if problem:
+            self.coupon = None
+            self.save(update_fields=["coupon", "updated_at"])
+        return problem
 
 
 class CartItem(models.Model):
