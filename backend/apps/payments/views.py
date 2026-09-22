@@ -5,6 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from datetime import timedelta
 import hashlib
 import os
+import threading
 
 from django.conf import settings
 from django.core.cache import cache
@@ -21,7 +22,9 @@ from rest_framework.decorators import (
     permission_classes,
 )
 
-from apps.orders.models import Order, Payment
+from apps.orders.models import Order, Payment, OrderStatusHistory
+from apps.orders.status_email import send_order_status_email
+from apps.cart.models import Cart
 from apps.orders.views import (
     deduct_stock_for_order,
     confirm_stock_for_order,
@@ -117,6 +120,9 @@ class CreatePaymentIntentView(APIView):
 
                 order.status = "confirmed"
                 order.save()
+
+                # NEW (Sep 2026 — order status history)
+                OrderStatusHistory.record(order, "confirmed", note="Order total is Rs. 0 — confirmed automatically")
 
                 # FIX (B59): this is one of the two real "payment confirmed"
                 # moments — stock must be deducted now, not back at checkout.
@@ -228,6 +234,9 @@ class StripeWebhookView(APIView):
                     order.status = "confirmed"
                     order.save()
 
+                    # NEW (Sep 2026 — order status history)
+                    OrderStatusHistory.record(order, "confirmed", note="Payment confirmed via Stripe")
+
                     # FIX (B59): the second, and main, "payment confirmed"
                     # moment — real Stripe payments go through here. Stock
                     # is deducted only now, not at checkout time.
@@ -251,6 +260,19 @@ class StripeWebhookView(APIView):
                         notification_type="order",
                         reference_type="order",
                         reference_id=order.order_number,
+                    )
+
+                    # NEW (Sep 2026 — order status update emails): a
+                    # Stripe webhook has no HTTP client waiting on this
+                    # response, so a plain synchronous send is fine here
+                    # (no request to stall).
+                    send_order_status_email(
+                        order,
+                        "Payment confirmed",
+                        (
+                            f"Payment for order {order.order_number} has been confirmed. "
+                            "Your order is now being processed."
+                        ),
                     )
 
             except Order.DoesNotExist:
@@ -408,6 +430,13 @@ class QRProofUploadView(APIView):
                         )
                         locked_order.save()
 
+                        # NEW (Sep 2026 — order status history)
+                        OrderStatusHistory.record(
+                            locked_order,
+                            "cancelled",
+                            note=locked_order.cancellation_reason,
+                        )
+
                 return Response(
                     {
                         "error": (
@@ -425,6 +454,23 @@ class QRProofUploadView(APIView):
             # every other QR upload.
             order.status = "pending_payment"
             order.save(update_fields=["status", "updated_at"])
+
+            # NEW (Sep 2026 — order status history)
+            OrderStatusHistory.record(order, "pending_payment", note="Payment proof uploaded")
+
+            # NEW (Sep 2026 — cart-preservation fix): this is the moment
+            # the cart actually gets cleared for a QR order now, instead
+            # of at checkout — see CheckoutView's CLEAR CART section for
+            # why. Only for orders that actually came from the cart (not
+            # Buy Now, and only once — this whole block only runs on the
+            # very first accepted upload, since order.status is only ever
+            # "order_placed" before that).
+            if order.clear_cart_on_qr_proof:
+                cart = Cart.objects.filter(user=request.user).first()
+                if cart:
+                    cart.items.all().delete()
+                    cart.coupon = None
+                    cart.save()
 
 
         if order.status == "cancelled":
@@ -510,6 +556,17 @@ class QRProofUploadView(APIView):
             reference_type="order",
             reference_id=order_number,
         )
+
+        # NEW (Sep 2026 — order status update emails)
+        threading.Thread(
+            target=send_order_status_email,
+            args=(
+                order,
+                "QR Payment Proof Submitted",
+                f"Your payment proof for order #{order_number} has been submitted and is under review.",
+            ),
+            daemon=True,
+        ).start()
 
         # NEW (Notification Triggers Addendum, Item 14): "New QR payment
         # proof submitted" — the store's admin must also be notified,
@@ -741,6 +798,9 @@ class AdminQRPaymentApproveView(APIView):
             order.status = "confirmed"
             order.save()
 
+            # NEW (Sep 2026 — order status history)
+            OrderStatusHistory.record(order, "confirmed", note="QR payment proof approved by admin")
+
             # ============================================================
             # Transition 2: total_stock -= qty, reserved_stock -= qty
             # ============================================================
@@ -765,6 +825,17 @@ class AdminQRPaymentApproveView(APIView):
             reference_type="order",
             reference_id=order_number,
         )
+
+        # NEW (Sep 2026 — order status update emails)
+        threading.Thread(
+            target=send_order_status_email,
+            args=(
+                order,
+                "QR Payment Approved",
+                f"Your QR payment for order #{order_number} has been approved. Your order is now confirmed.",
+            ),
+            daemon=True,
+        ).start()
 
         # FIX (Frontend Bug Report — Audit Logs, Sep 2026): no admin write
         # endpoint besides Adjust Stock was writing to the shared AuditLog
@@ -875,6 +946,9 @@ class AdminQRPaymentRejectView(APIView):
                 order.save()
                 release_reserved_stock_for_order(order)
 
+                # NEW (Sep 2026 — order status history)
+                OrderStatusHistory.record(order, "cancelled", note=order.cancellation_reason)
+
                 # FIX (Dashboard revenue caching — see DASHBOARD_CACHE_KEY
                 # note above): a cancellation can never remove revenue that
                 # was never counted in the first place here (the order was
@@ -889,6 +963,15 @@ class AdminQRPaymentRejectView(APIView):
                 # Stock stays reserved — nothing to release.
                 order.status = "pending_payment"
                 order.save()
+
+                # NEW (Sep 2026 — order status history): recorded even
+                # though the status value itself may be unchanged, since
+                # a rejection is a meaningful event on the timeline.
+                OrderStatusHistory.record(
+                    order,
+                    "pending_payment",
+                    note=f"QR payment proof rejected: {reason}",
+                )
 
         # ============================================================
         # Customer notification includes reason text + what happens next.
@@ -922,6 +1005,13 @@ class AdminQRPaymentRejectView(APIView):
             reference_type="order",
             reference_id=order_number,
         )
+
+        # NEW (Sep 2026 — order status update emails)
+        threading.Thread(
+            target=send_order_status_email,
+            args=(order, "QR Payment Rejected", customer_message),
+            daemon=True,
+        ).start()
 
         log_admin_action(
             store=order.store,

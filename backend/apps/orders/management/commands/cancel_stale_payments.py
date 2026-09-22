@@ -46,7 +46,8 @@ from django.utils import timezone
 from datetime import timedelta
 
 from apps.notifications.utils import create_notification
-from apps.orders.models import Order, Payment
+from apps.orders.models import Order, Payment, OrderStatusHistory
+from apps.orders.status_email import send_order_status_email
 from apps.orders.views import release_reserved_stock_for_order
 
 STRIPE_TIMEOUT = timedelta(minutes=30)
@@ -77,6 +78,9 @@ def _cancel_order_for_timeout(order, reason):
         locked_order.status = "cancelled"
         locked_order.cancellation_reason = reason
         locked_order.save()
+
+        # NEW (Sep 2026 — order status history)
+        OrderStatusHistory.record(locked_order, "cancelled", note=reason)
 
     # Existing cancellation notification — same one customer-initiated
     # and admin-initiated cancellation already send, so the customer
@@ -156,6 +160,11 @@ def cancel_expired_qr_placements(now=None):
             )
             locked_order.save()
 
+            # NEW (Sep 2026 — order status history)
+            OrderStatusHistory.record(
+                locked_order, "cancelled", note=locked_order.cancellation_reason
+            )
+
         create_notification(
             user=order.customer.user,
             store=order.store,
@@ -167,6 +176,17 @@ def cancel_expired_qr_placements(now=None):
             notification_type="order",
             reference_type="order",
             reference_id=order.order_number,
+        )
+
+        # NEW (Sep 2026 — order status update emails): a cron job has no
+        # HTTP request to stall, so a plain synchronous send is fine here.
+        send_order_status_email(
+            order,
+            "Order cancelled",
+            (
+                f"Your order {order.order_number} has been cancelled "
+                "because payment proof was not submitted in time."
+            ),
         )
 
         cancelled_count += 1
@@ -258,6 +278,11 @@ def cancel_expired_rejected_qr_orders(now=None):
             )
             locked_order.save()
 
+            # NEW (Sep 2026 — order status history)
+            OrderStatusHistory.record(
+                locked_order, "cancelled", note=locked_order.cancellation_reason
+            )
+
         create_notification(
             user=order.customer.user,
             store=order.store,
@@ -270,6 +295,17 @@ def cancel_expired_rejected_qr_orders(now=None):
             notification_type="order",
             reference_type="order",
             reference_id=order.order_number,
+        )
+
+        # NEW (Sep 2026 — order status update emails)
+        send_order_status_email(
+            order,
+            "Order cancelled",
+            (
+                f"Your order {order.order_number} has been cancelled because "
+                "no new payment proof was submitted within 24 hours of the "
+                "rejection."
+            ),
         )
 
         cancelled_count += 1

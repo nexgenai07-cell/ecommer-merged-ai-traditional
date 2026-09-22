@@ -1,9 +1,10 @@
 # PATH: apps/orders/serializers.py
 
 import re
+from datetime import timedelta
 
 from rest_framework import serializers
-from .models import Customer, Order, OrderItem, Payment
+from .models import Customer, Order, OrderItem, OrderStatusHistory, Payment
 from .locations import check_city_province
 
 # Pakistani mobile/landline numbers: optional +92 or leading 0, then 9-11
@@ -31,6 +32,16 @@ CITY_MAX_LENGTH = 30
 # frontend just reads can_cancel / can_track) and by OrderTrackView in
 # views.py (so the API itself also refuses, even if a button is shown).
 CUSTOMER_CANCELLABLE_STATUSES = ("order_placed", "pending_payment", "on_hold", "confirmed")
+
+
+# NEW (Sep 2026 — expected delivery time on order page): matches the
+# labels already shown to the customer on the checkout page's shipping
+# method cards, so the order detail page tells the same story after the
+# order is placed. Keyed by Order.shipping_method ("standard" / "express").
+SHIPPING_DELIVERY_ESTIMATES = {
+    "standard": {"min_days": 5, "max_days": 7, "label": "5-7 business days"},
+    "express": {"min_days": 2, "max_days": 3, "label": "2-3 business days"},
+}
 
 
 def order_can_cancel(order):
@@ -293,6 +304,17 @@ class AdminOrderListSerializer(serializers.ModelSerializer):
         }
 
 
+# NEW (Sep 2026 — order status history / timeline): one entry per status
+# change, in order, with an exact date+time — shown on the customer's
+# order detail page. See OrderStatusHistory.record() call sites across
+# views.py / payments/views.py / cancel_stale_payments.py for how these
+# rows get created.
+class OrderStatusHistorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OrderStatusHistory
+        fields = ["status", "note", "changed_at"]
+
+
 # Returns complete order details including customer, items and payment.
 class OrderDetailSerializer(serializers.ModelSerializer):
     customer = serializers.SerializerMethodField()
@@ -311,6 +333,18 @@ class OrderDetailSerializer(serializers.ModelSerializer):
     # "Cancel Order" / "Track Order" buttons.
     can_cancel = serializers.SerializerMethodField()
     can_track = serializers.SerializerMethodField()
+
+    # NEW (Sep 2026 — expected delivery time on order page): computed from
+    # shipping_method + created_at, not stored on the model, so it always
+    # reflects SHIPPING_DELIVERY_ESTIMATES above even for older orders.
+    expected_delivery = serializers.SerializerMethodField()
+    estimated_delivery_from = serializers.SerializerMethodField()
+    estimated_delivery_to = serializers.SerializerMethodField()
+
+    # NEW (Sep 2026 — order status history / timeline): ordered oldest ->
+    # newest (see OrderStatusHistory.Meta.ordering), so the frontend can
+    # render it top-to-bottom as-is.
+    status_history = OrderStatusHistorySerializer(many=True, read_only=True)
 
     class Meta:
         model = Order
@@ -338,10 +372,30 @@ class OrderDetailSerializer(serializers.ModelSerializer):
             "payment",
             "can_cancel",
             "can_track",
+            "expected_delivery",
+            "estimated_delivery_from",
+            "estimated_delivery_to",
+            "status_history",
         ]
 
     def get_can_cancel(self, obj):
         return order_can_cancel(obj)
+
+    def get_expected_delivery(self, obj):
+        estimate = SHIPPING_DELIVERY_ESTIMATES.get(obj.shipping_method)
+        return estimate["label"] if estimate else None
+
+    def get_estimated_delivery_from(self, obj):
+        estimate = SHIPPING_DELIVERY_ESTIMATES.get(obj.shipping_method)
+        if not estimate:
+            return None
+        return (obj.created_at + timedelta(days=estimate["min_days"])).date()
+
+    def get_estimated_delivery_to(self, obj):
+        estimate = SHIPPING_DELIVERY_ESTIMATES.get(obj.shipping_method)
+        if not estimate:
+            return None
+        return (obj.created_at + timedelta(days=estimate["max_days"])).date()
 
     def get_can_track(self, obj):
         return order_can_track(obj)

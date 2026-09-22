@@ -242,6 +242,18 @@ class Order(models.Model):
         default="pending_payment",
     )
 
+    # NEW (Sep 2026 — QR 10-minute upload window / cart-preservation fix):
+    # set at checkout time (True only when this order came from the
+    # customer's actual persisted cart — payment_method == "qr" and NOT a
+    # Buy Now purchase). QRProofUploadView reads this to decide whether
+    # to clear the cart at proof-upload time (the cart is deliberately
+    # left untouched at checkout now for QR orders — see CheckoutView —
+    # so that a timed-out/never-uploaded order doesn't wipe items the
+    # customer never actually paid for). A Buy Now order never touched
+    # the cart in the first place, so this stays False for those and
+    # QRProofUploadView correctly leaves the customer's real cart alone.
+    clear_cart_on_qr_proof = models.BooleanField(default=False)
+
     shipping_address = models.TextField()
 
     # FIX (B18/B19): city + postal_code are now real, separately validated
@@ -295,6 +307,39 @@ class Order(models.Model):
 
 # Stores every product purchased in an order.
 # Each row represents one product inside an order.
+# NEW (Sep 2026 — order status history / timeline): one row per order
+# status change, in the order it happened, with an exact date+time. Shown
+# on the customer's order detail page as a timeline ("Order Placed — Sep
+# 20, 4:39 PM", "Confirmed — Sep 21, 10:02 AM", ...). Every place in the
+# codebase that sets order.status calls OrderStatusHistory.record(order,
+# status, note) right after — see the "NEW (Sep 2026 — order status
+# history)" comments across orders/views.py, payments/views.py and
+# cancel_stale_payments.py for every call site.
+class OrderStatusHistory(models.Model):
+    order = models.ForeignKey(
+        Order,
+        on_delete=models.CASCADE,
+        related_name="status_history",
+    )
+    status = models.CharField(max_length=20, choices=Order.STATUS_CHOICES)
+    # Short human-readable context for this specific entry — e.g. a
+    # cancellation/rejection reason, or "Auto-cancelled: proof not
+    # uploaded in time". Optional; purely for display, never parsed.
+    note = models.CharField(max_length=255, blank=True, default="")
+    changed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "order_status_history"
+        ordering = ["changed_at"]
+
+    def __str__(self):
+        return f"{self.order.order_number}: {self.status} @ {self.changed_at}"
+
+    @classmethod
+    def record(cls, order, status, note=""):
+        return cls.objects.create(order=order, status=status, note=note)
+
+
 class OrderItem(models.Model):
     order = models.ForeignKey(
         Order,

@@ -34,7 +34,8 @@ from apps.notifications.utils import (
     send_refund_confirmation_email,
 )
 
-from .models import Address, CheckoutOTP, Customer, Order, OrderItem, Payment
+from .status_email import send_order_status_email
+from .models import Address, CheckoutOTP, Customer, Order, OrderItem, OrderStatusHistory, Payment
 from .serializers import (
     OrderListSerializer,
     AdminOrderListSerializer,
@@ -938,6 +939,11 @@ class CheckoutView(APIView):
                 shipping_method=shipping_method,
                 shipping_cost=shipping_cost,
                 status="order_placed" if payment_method == "qr" else "pending_payment",
+                # NEW (Sep 2026 — cart-preservation fix): only True for a
+                # QR order that actually came from the persisted cart —
+                # QRProofUploadView clears the cart at proof-upload time
+                # instead of here (see CLEAR CART section below).
+                clear_cart_on_qr_proof=(payment_method == "qr" and not is_buy_now and bool(cart)),
                 shipping_address=shipping_address,
                 city=city,
                 postal_code=postal_code,
@@ -950,6 +956,11 @@ class CheckoutView(APIView):
             # intentionally NOT marked as "consumed" here anymore, so
             # this same verified row keeps authorizing every future
             # order this customer places, with no re-verification.
+
+            # NEW (Sep 2026 — order status history): first entry in this
+            # order's timeline, timestamped to the exact moment checkout
+            # succeeded.
+            OrderStatusHistory.record(order, order.status, note="Order placed")
 
             # ============================================================
             # CREATE ORDER ITEMS
@@ -1015,9 +1026,20 @@ class CheckoutView(APIView):
             # read from the persisted cart, so there is nothing on it to
             # clear here, and the customer's actual cart is left exactly
             # as it was before they clicked Buy Now.
+            #
+            # NEW (Sep 2026 — QR 10-minute upload window): also skipped
+            # for QR orders. The cart used to be cleared right here, at
+            # checkout time, for every payment method — which meant a QR
+            # order that later timed out (order_placed window ran out, no
+            # proof ever uploaded) had already lost its cart items for
+            # nothing, even though nothing was ever actually paid for.
+            # For QR, clearing now happens in QRProofUploadView instead,
+            # at the moment proof is actually accepted — see
+            # apps/payments/views.py. Stripe is unchanged: cart is still
+            # cleared right here, immediately at checkout.
             # ============================================================
 
-            if not is_buy_now and cart:
+            if not is_buy_now and cart and payment_method != "qr":
                 cart.items.all().delete()
                 cart.coupon = None
                 cart.save()
@@ -1263,7 +1285,7 @@ class OrderDetailView(generics.RetrieveAPIView):
     queryset = (
         Order.objects
         .select_related("customer", "store", "payment")
-        .prefetch_related("items")
+        .prefetch_related("items", "status_history")
     )
 
     def get_queryset(self):
@@ -1329,6 +1351,9 @@ class OrderCancelView(APIView):
             order.status = "cancelled"
             order.save()
 
+            # NEW (Sep 2026 — order status history)
+            OrderStatusHistory.record(order, "cancelled", note="Cancelled by customer")
+
             # FIX (B29): refunded_at timestamp gives a real, checkable
             # confirmation that the refund was processed, instead of just
             # a silent status flip.
@@ -1357,6 +1382,15 @@ class OrderCancelView(APIView):
             reference_type="order",
             reference_id=order.order_number,
         )
+
+        # NEW (Sep 2026 — order status update emails): fired in a
+        # background thread, same reasoning as send_order_confirmation_email
+        # at checkout — an SMTP hang must never stall this response.
+        threading.Thread(
+            target=send_order_status_email,
+            args=(order, "Order cancelled", f"Your order {order.order_number} has been cancelled."),
+            daemon=True,
+        ).start()
 
         # NEW (Notification Triggers Addendum, Item 16): "Order cancelled
         # by customer" — every admin of the store must also be notified,
@@ -1646,6 +1680,19 @@ class AdminOrderStatusUpdateView(APIView):
 
         order.save()
 
+        # NEW (Sep 2026 — order status history): note carries the
+        # cancellation reason when the admin cancelled the order, so the
+        # customer's timeline shows why, not just "Cancelled".
+        OrderStatusHistory.record(
+            order,
+            new_status,
+            note=(
+                (order.cancellation_reason or "Updated by admin")
+                if new_status == "cancelled"
+                else "Updated by admin"
+            ),
+        )
+
         # FIX (Dashboard revenue caching — see DASHBOARD_CACHE_KEY note
         # above): new_status can be "confirmed" (or move further along
         # Order.REVENUE_STATUSES) or "cancelled" — both change what the
@@ -1700,6 +1747,13 @@ class AdminOrderStatusUpdateView(APIView):
             reference_type="order",
             reference_id=order.order_number,
         )
+
+        # NEW (Sep 2026 — order status update emails)
+        threading.Thread(
+            target=send_order_status_email,
+            args=(order, status_titles[new_status], status_messages[new_status]),
+            daemon=True,
+        ).start()
 
         if new_status == "cancelled" and was_paid_before_cancel:
             send_refund_confirmation_email(order)
@@ -1853,5 +1907,5 @@ class AdminOrderDetailView(generics.RetrieveAPIView):
     queryset = (
         Order.objects
         .select_related("customer", "store", "payment")
-        .prefetch_related("items")
+        .prefetch_related("items", "status_history")
     )
