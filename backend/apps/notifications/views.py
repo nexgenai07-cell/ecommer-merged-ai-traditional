@@ -33,9 +33,21 @@ class NotificationViewSet(
     # Returns every notification visible to the logged-in user.
     # This intentionally does not apply type/is_read filters because list()
     # uses it to calculate the total unread count correctly.
+    #
+    # FIX (Sep 2026 — new customers were seeing old notifications): the
+    # user__isnull=True branch matches broadcast notifications, which are
+    # visible to every customer of the store (see SendNotificationView).
+    # It previously matched ALL broadcast notifications regardless of when
+    # they were created, so a brand-new customer immediately saw every
+    # promotion/system broadcast ever sent before they even registered.
+    # Notifications targeted at this specific user (user=self.request.user)
+    # don't have this problem — they can only exist for an already-
+    # registered user — so only the broadcast branch needs the extra
+    # created_at >= registration-date filter.
     def get_base_queryset(self):
         return Notification.objects.filter(
-            Q(user=self.request.user) | Q(user__isnull=True)
+            Q(user=self.request.user)
+            | Q(user__isnull=True, created_at__gte=self.request.user.created_at)
         ).order_by("-created_at")
 
     # Applies optional notification-list filters:
