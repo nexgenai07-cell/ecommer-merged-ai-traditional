@@ -333,6 +333,13 @@ class UserProfileSerializer(serializers.ModelSerializer):
             'profile_picture',
             'role',
             'email_verified',
+            # NEW (Sep 2026 — checkout phone re-verification): lets the
+            # frontend (e.g. the checkout page, by polling GET /me/) know
+            # whether the CURRENT `phone` value above is verified — flips
+            # to True together with email_verified at registration, and
+            # again on its own after VerifyPhoneView confirms a changed
+            # number.
+            'phone_verified',
             'two_factor_enabled',
             'addresses',
             'created_at',
@@ -348,6 +355,9 @@ class UserProfileSerializer(serializers.ModelSerializer):
             'email',
             'role',
             'email_verified',
+            # phone_verified is only ever set by VerifyEmailView /
+            # VerifyPhoneView, never by a direct profile PUT/PATCH.
+            'phone_verified',
             'two_factor_enabled',
             'addresses',
             'created_at',

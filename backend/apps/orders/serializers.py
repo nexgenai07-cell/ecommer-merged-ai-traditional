@@ -30,7 +30,7 @@ CITY_MAX_LENGTH = 30
 # Used by OrderListSerializer / OrderDetailSerializer below (so the
 # frontend just reads can_cancel / can_track) and by OrderTrackView in
 # views.py (so the API itself also refuses, even if a button is shown).
-CUSTOMER_CANCELLABLE_STATUSES = ("pending_payment", "on_hold", "confirmed")
+CUSTOMER_CANCELLABLE_STATUSES = ("order_placed", "pending_payment", "on_hold", "confirmed")
 
 
 def order_can_cancel(order):
@@ -146,6 +146,14 @@ class PaymentSerializer(serializers.ModelSerializer):
             # here now under a clearer name so it reads on every order
             # detail view.
             "qr_rejection_count",
+            # NEW (Sep 2026 — QR 10-minute upload window): lets the
+            # frontend re-derive/resume the countdown and "need more
+            # time?" button state from a normal GET /orders/<order_number>/
+            # call too, not just the immediate checkout response. Both are
+            # null for Stripe orders and for QR orders past the
+            # order_placed stage.
+            "qr_upload_deadline",
+            "qr_extension_used",
         ]
 
     def get_screenshot_url(self, obj):
@@ -637,6 +645,21 @@ class CheckoutPrefillSerializer(serializers.Serializer):
         allow_blank=True,
         allow_null=True,
     )
+    # NEW (Sep 2026 — checkout email/phone verification prefill): the
+    # account's verified email — always shown read-only/non-editable on
+    # the checkout page (changing email still only happens via the
+    # profile page's OTP-verified flow, never here).
+    email = serializers.CharField(
+        allow_blank=True,
+        allow_null=True,
+    )
+    # NEW: tells the frontend whether `phone` above is currently a
+    # VERIFIED number. If the customer edits it to something else at
+    # checkout, the frontend should call POST
+    # /api/v1/auth/send-phone-verification/ and block placing the order
+    # until that new number is verified (CheckoutView enforces this
+    # server-side too — see views.py).
+    phone_verified = serializers.BooleanField()
 
 
 # Validates the customer's saved-address update request.

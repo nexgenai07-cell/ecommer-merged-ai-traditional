@@ -1,7 +1,9 @@
 # PATH: apps/orders/views.py
 
 import logging
+import re
 import threading
+from datetime import timedelta
 
 import stripe
 from decimal import Decimal
@@ -730,6 +732,41 @@ class CheckoutView(APIView):
             )
 
         # ============================================================
+        # NEW (Sep 2026 — checkout phone re-verification): if the
+        # customer typed a phone number MANUALLY at checkout that is
+        # different from the verified number already on their account,
+        # block the order and tell the frontend to call
+        # POST /api/v1/auth/send-phone-verification/ first. Once that new
+        # number is verified (VerifyPhoneView), it becomes
+        # request.user.phone itself, so this check then passes normally —
+        # no separate "verified" flag to track here.
+        #
+        # This only applies to the manually-typed `phone` field — a phone
+        # number that came from a saved Address Book entry (address_id, or
+        # the default address) is left untouched, since an address can
+        # legitimately belong to someone else (e.g. a different recipient)
+        # and was never meant to match the account's own verified number.
+        # ============================================================
+        if selected_address is None:
+            typed_phone = (data.get("phone") or "").strip()
+            if typed_phone:
+                typed_digits = re.sub(r'\D', '', typed_phone)
+                account_digits = re.sub(r'\D', '', request.user.phone or '')
+                if typed_digits != account_digits:
+                    return Response(
+                        {
+                            "error": (
+                                "This phone number is different from your "
+                                "verified number. Please verify it before "
+                                "placing the order."
+                            ),
+                            "phone_verification_required": True,
+                            "phone": typed_phone,
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+        # ============================================================
         # NEW (Sep 2026 — Checkout OTP verification): block order
         # creation until the customer has requested AND verified the
         # code emailed to their account address (see otp_views.py).
@@ -885,6 +922,13 @@ class CheckoutView(APIView):
             # CREATE ORDER
             # ============================================================
 
+            # NEW (Sep 2026 — QR 10-minute upload window): payment_method
+            # is needed here now (moved up from just above CREATE PAYMENT
+            # below) so a QR order can start life as "order_placed"
+            # instead of "pending_payment". Stripe orders are untouched
+            # and still start at "pending_payment" as before.
+            payment_method = data["payment_method"]
+
             order = Order.objects.create(
                 store_id=checkout_store_id,
                 customer=customer,
@@ -893,7 +937,7 @@ class CheckoutView(APIView):
                 discount_amount=discount_amount,
                 shipping_method=shipping_method,
                 shipping_cost=shipping_cost,
-                status="pending_payment",
+                status="order_placed" if payment_method == "qr" else "pending_payment",
                 shipping_address=shipping_address,
                 city=city,
                 postal_code=postal_code,
@@ -938,14 +982,31 @@ class CheckoutView(APIView):
             # CREATE PAYMENT
             # ============================================================
 
-            payment_method = data["payment_method"]
-
-            Payment.objects.create(
-                order=order,
-                status="pending",
-                amount=total_amount,
-                payment_method=payment_method,
-            )
+            # NEW (Sep 2026 — QR 10-minute upload window): a QR order's
+            # payment row starts with status="" (empty) — nothing to
+            # review yet, no proof uploaded — and a 10-minute
+            # qr_upload_deadline. QRProofUploadView (apps/payments/views.py)
+            # is what flips the order to "pending_payment" and the
+            # payment to "under_review" once proof actually comes in, and
+            # cancel_stale_qr_placements (management command) auto-cancels
+            # it if the deadline (or its one-time +5 min extension) passes
+            # first. Stripe orders are unchanged: status="pending" with no
+            # deadline, exactly as before.
+            if payment_method == "qr":
+                payment = Payment.objects.create(
+                    order=order,
+                    status="",
+                    amount=total_amount,
+                    payment_method=payment_method,
+                    qr_upload_deadline=timezone.now() + timedelta(minutes=10),
+                )
+            else:
+                payment = Payment.objects.create(
+                    order=order,
+                    status="pending",
+                    amount=total_amount,
+                    payment_method=payment_method,
+                )
 
             # ============================================================
             # CLEAR CART
@@ -1073,6 +1134,14 @@ class CheckoutView(APIView):
                 "",
             )
             response_data["payment_reference"] = order.order_number
+            # NEW (Sep 2026 — QR 10-minute upload window): lets the
+            # frontend show the countdown / "need more time?" button
+            # without a separate call right after checkout.
+            response_data["qr_upload_deadline"] = (
+                payment.qr_upload_deadline.isoformat()
+                if payment.qr_upload_deadline
+                else None
+            )
 
         return Response(
             response_data,
@@ -1087,11 +1156,19 @@ class CheckoutPrefillView(APIView):
     def get(self, request):
         customer = Customer.objects.filter(user=request.user).first()
 
+        # NEW (Sep 2026 — checkout email/phone verification prefill):
+        # email is always the account's own verified email (non-editable
+        # on the checkout page, same as before). phone_verified tells the
+        # frontend whether the phone value below is currently a verified
+        # number, so it knows whether to lock the field or prompt for
+        # re-verification if the customer edits it.
         data = {
             "shipping_address": customer.address if customer else "",
             "city": customer.city if customer else "",
             "postal_code": customer.postal_code if customer else "",
             "phone": (customer.phone if customer else "") or request.user.phone or "",
+            "email": request.user.email or "",
+            "phone_verified": request.user.phone_verified,
         }
         return Response(CheckoutPrefillSerializer(data).data)
 

@@ -144,6 +144,14 @@ class Order(models.Model):
     # FIX (B30): "out_for_delivery" added — was completely missing before,
     # so admins had no way to mark an order as on its way.
     STATUS_CHOICES = [
+        # NEW (Sep 2026 — QR 10-minute upload window): the very first
+        # state of a QR-payment order, from the moment checkout succeeds
+        # until the customer either uploads their payment proof or the
+        # window expires. Payment.status stays "" (empty) the whole time
+        # this is the order's status — see Payment.status below and
+        # apps/payments/views.py:QRProofUploadView. Stripe orders skip
+        # this entirely and still start at "pending_payment" as before.
+        ("order_placed", "Order Placed"),
         ("pending_payment", "Pending Payment"),
         # NEW (Supervisor scenario 4, Sep 2026): distinct from
         # pending_payment — set when a customer re-uploads QR proof
@@ -355,6 +363,14 @@ class Payment(models.Model):
         max_length=20,
         choices=STATUS_CHOICES,
         default="pending",
+        # NEW (Sep 2026 — QR 10-minute upload window): a QR order's
+        # payment row is created with status="" (empty) while the order
+        # itself is "order_placed" — nothing to review yet since no proof
+        # was uploaded. It only becomes "pending" once... actually it
+        # goes straight from "" to "under_review" the moment proof is
+        # uploaded (see QRProofUploadView), same single step as before.
+        # Stripe payments are untouched and still default to "pending".
+        blank=True,
     )
 
     amount = models.DecimalField(
@@ -450,6 +466,27 @@ class Payment(models.Model):
     qr_rejection_count = models.PositiveIntegerField(
         default=0,
         help_text="Number of times this order's QR proof has been rejected",
+    )
+
+    # NEW (Sep 2026 — QR 10-minute upload window): set at checkout time
+    # (created_at + 10 minutes) for QR orders only. QRProofUploadView
+    # refuses an upload past this deadline, and a new scheduled job
+    # (cancel_stale_qr_placements, see the management command) auto-
+    # cancels any order still "order_placed" once this passes.
+    qr_upload_deadline = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Deadline to upload QR proof before auto-cancel (order_placed stage only)",
+    )
+
+    # NEW (Sep 2026 — QR 10-minute upload window): the customer gets ONE
+    # "need more time?" extension (+5 minutes) after the initial 10-minute
+    # window passes — see ExtendQRUploadTimeView. Sticks at True even
+    # after that extended deadline also passes, so a second extension
+    # request is refused.
+    qr_extension_used = models.BooleanField(
+        default=False,
+        help_text="Whether the one-time +5 minute upload extension has already been used",
     )
 
     created_at = models.DateTimeField(auto_now_add=True)

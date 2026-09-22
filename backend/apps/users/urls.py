@@ -30,6 +30,9 @@ from .twofactor_views import (
 from .email_verification_views import (
     SendVerificationEmailView,
     VerifyEmailView,
+    # NEW (Sep 2026 — checkout phone re-verification)
+    SendPhoneVerificationView,
+    VerifyPhoneView,
 )
 
 # NEW (Sep 2026 — Profile: editable email with OTP verification)
@@ -204,6 +207,24 @@ urlpatterns = [
     ),
 
     # ==========================================================
+    # NEW: Phone Re-Verification — used when a customer changes their
+    # phone number away from the one verified at registration (e.g. from
+    # the checkout page). Same link-based pattern as email verification.
+    # ==========================================================
+
+    path(
+        "send-phone-verification/",
+        SendPhoneVerificationView.as_view(),
+        name="send_phone_verification",
+    ),
+
+    path(
+        "verify-phone/",
+        VerifyPhoneView.as_view(),
+        name="verify_phone",
+    ),
+
+    # ==========================================================
     # NEW: Email Change (OTP-verified) — profile page "edit email"
     # ==========================================================
 
@@ -218,4 +239,4 @@ urlpatterns = [
         ConfirmEmailChangeView.as_view(),
         name="me_email_confirm",
     ),
-]
+]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     

@@ -63,6 +63,17 @@ class User(AbstractBaseUser, PermissionsMixin):
     # Kept separate from is_active so an unverified account can still log in
     # (we just show a "please verify" banner) rather than being locked out.
     email_verified  = models.BooleanField(default=False)
+
+    # NEW (Sep 2026 — combined email+phone verification): flips to True at
+    # the same moment email_verified does, when the user clicks the
+    # registration verification link (see VerifyEmailView) — one link now
+    # verifies both the email AND whatever phone number was on the account
+    # at signup. If the customer later changes their phone at checkout to a
+    # number different from this verified one, this flips back to False for
+    # that new number until they verify it too (see PhoneVerification /
+    # SendPhoneVerificationView / VerifyPhoneView below).
+    phone_verified  = models.BooleanField(default=False)
+
     is_active       = models.BooleanField(default=True)
     is_staff        = models.BooleanField(default=False)
     # Soft-delete flag. Matches migration 0004_user_is_delete, which added
@@ -175,6 +186,44 @@ class EmailVerification(models.Model):
     def create_for_user(cls, user, validity_hours=24):
         return cls.objects.create(
             user=user,
+            token=secrets.token_urlsafe(32),
+            expires_at=timezone.now() + timedelta(hours=validity_hours),
+        )
+
+
+class PhoneVerification(models.Model):
+    """
+    NEW (Sep 2026 — checkout phone re-verification): one row per
+    phone-verification LINK sent (mirrors EmailVerification exactly —
+    token, single-use, 24h expiry). Used only when a customer wants to use
+    a phone number DIFFERENT from the one already verified on their
+    account (e.g. edited at checkout) — the original registration phone is
+    verified together with the email itself (see VerifyEmailView), so this
+    model is never involved at signup time.
+
+    No SMS gateway is wired up yet, so — same as every other OTP/link flow
+    in this project — the link is emailed to the account's email address,
+    not texted to the phone. Clicking it sets User.phone to this row's
+    `phone` and User.phone_verified to True.
+    """
+    user        = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='phone_verifications')
+    phone       = models.CharField(max_length=20)
+    token       = models.CharField(max_length=64, unique=True)
+    is_used     = models.BooleanField(default=False)
+    expires_at  = models.DateTimeField()
+    created_at  = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'phone_verifications'
+
+    def is_valid(self):
+        return not self.is_used and timezone.now() < self.expires_at
+
+    @classmethod
+    def create_for_user(cls, user, phone, validity_hours=24):
+        return cls.objects.create(
+            user=user,
+            phone=phone,
             token=secrets.token_urlsafe(32),
             expires_at=timezone.now() + timedelta(hours=validity_hours),
         )

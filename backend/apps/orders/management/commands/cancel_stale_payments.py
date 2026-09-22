@@ -107,6 +107,73 @@ def cancel_expired_stripe_orders(now=None):
     return cancelled_count
 
 
+# NEW (Sep 2026 — QR 10-minute upload window): auto-cancels QR orders that
+# never got their payment proof uploaded within the window shown to the
+# customer (10 minutes, or 15 if they used their one-time "need more
+# time?" extension — see ExtendQRUploadTimeView in apps/payments/views.py).
+# Distinct from cancel_expired_qr_orders below: this one matches
+# order.status == "order_placed" (BEFORE any proof was ever uploaded),
+# using each payment row's own qr_upload_deadline instead of a single
+# fixed cutoff, since that deadline can differ per order (extended or
+# not). Once proof is uploaded, QRProofUploadView itself moves the order
+# to "pending_payment" and this function no longer matches it — job
+# cancel_expired_qr_orders below take over the 24-hour "proof never
+# uploaded" case, but that only makes sense post-"order_placed", so in
+# practice this window is what actually protects a QR order that never
+# gets its first proof upload at all.
+def cancel_expired_qr_placements(now=None):
+    """10/15-minute QR upload window timeout (before any proof exists)."""
+    now = now or timezone.now()
+
+    stale_orders = Order.objects.filter(
+        status="order_placed",
+        payment__payment_method="qr",
+        payment__qr_upload_deadline__lte=now,
+    ).select_related("customer", "customer__user", "store", "payment")
+
+    cancelled_count = 0
+    for order in stale_orders:
+        with transaction.atomic():
+            locked_order = Order.objects.select_for_update().get(pk=order.pk)
+            locked_payment = Payment.objects.select_for_update().get(
+                order=locked_order
+            )
+
+            if (
+                locked_order.status != "order_placed"
+                or not locked_payment.qr_upload_deadline
+                or locked_payment.qr_upload_deadline > now
+            ):
+                # Proof arrived, or the deadline moved (extension request
+                # racing this job), since the queryset was built.
+                continue
+
+            release_reserved_stock_for_order(locked_order)
+            locked_order.status = "cancelled"
+            locked_order.cancellation_reason = (
+                "QR payment proof was not submitted within the allowed "
+                "time window."
+            )
+            locked_order.save()
+
+        create_notification(
+            user=order.customer.user,
+            store=order.store,
+            title="Order cancelled",
+            message=(
+                f"Your order {order.order_number} has been cancelled "
+                "because payment proof was not submitted in time."
+            ),
+            notification_type="order",
+            reference_type="order",
+            reference_id=order.order_number,
+        )
+
+        cancelled_count += 1
+
+    return cancelled_count
+
+
 def cancel_expired_qr_orders(now=None):
     """
     Part 3.7: 24-hour QR auto-cancel — only when NO proof was ever
@@ -215,24 +282,33 @@ class Command(BaseCommand):
         "Auto-cancels stale pending_payment orders: Stripe orders after "
         "30 minutes with no successful webhook, QR orders after 24 hours "
         "with no proof uploaded, QR orders whose rejected proof was not "
-        "re-uploaded within 24 hours. Releases their reserved stock and "
-        "notifies the customer. Intended to run on a schedule (e.g. every "
-        "5 minutes via cron) — see the module docstring for how to wire "
-        "that up on this deployment."
+        "re-uploaded within 24 hours, and QR orders still in "
+        "'order_placed' whose 10 (or 15, if extended) minute upload "
+        "window ran out with no proof ever uploaded. Releases their "
+        "reserved stock and notifies the customer. Intended to run on a "
+        "schedule (e.g. every minute or every 5 minutes via cron) — see "
+        "the module docstring for how to wire that up on this "
+        "deployment. NOTE: given the new 10-minute QR window, this "
+        "command should now run at least every 1-2 minutes, not every 5, "
+        "or a customer could wait several extra minutes past their "
+        "actual deadline before the order is cancelled."
     )
 
     def handle(self, *args, **options):
         now = timezone.now()
 
+        placement_cancelled = cancel_expired_qr_placements(now=now)
         stripe_cancelled = cancel_expired_stripe_orders(now=now)
         qr_cancelled = cancel_expired_qr_orders(now=now)
         rejected_cancelled = cancel_expired_rejected_qr_orders(now=now)
 
         self.stdout.write(
             self.style.SUCCESS(
-                f"cancel_stale_payments: {stripe_cancelled} Stripe order(s) "
-                f"cancelled (30-min timeout), {qr_cancelled} QR order(s) "
-                f"cancelled (24-hr timeout), {rejected_cancelled} QR order(s) "
-                f"cancelled (rejected proof not re-uploaded in 24 hrs)."
+                f"cancel_stale_payments: {placement_cancelled} QR order(s) "
+                f"cancelled (10/15-min upload window), {stripe_cancelled} "
+                f"Stripe order(s) cancelled (30-min timeout), "
+                f"{qr_cancelled} QR order(s) cancelled (24-hr timeout), "
+                f"{rejected_cancelled} QR order(s) cancelled (rejected "
+                f"proof not re-uploaded in 24 hrs)."
             )
         )

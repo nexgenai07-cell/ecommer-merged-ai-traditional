@@ -6,6 +6,8 @@ from .views import (
     CreatePaymentIntentView,
     StripeWebhookView,
     QRProofUploadView,
+    # NEW (Sep 2026 — QR 10-minute upload window)
+    ExtendQRUploadTimeView,
     AdminQRPaymentPendingView,
     AdminQRPaymentApproveView,
     AdminQRPaymentRejectView,
@@ -40,6 +42,14 @@ urlpatterns = [
         "qr/proof/",
         QRProofUploadView.as_view(),
         name="qr-proof-upload",
+    ),
+    # NEW (Sep 2026 — QR 10-minute upload window): customer's "Need more
+    # time?" action — one-time +5 minute extension before the order
+    # auto-cancels (see cancel_stale_payments.cancel_expired_qr_placements).
+    path(
+        "qr/extend-time/",
+        ExtendQRUploadTimeView.as_view(),
+        name="qr-extend-upload-time",
     ),
 ]
 

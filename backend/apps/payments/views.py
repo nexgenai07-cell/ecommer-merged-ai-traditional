@@ -2,6 +2,7 @@
 
 import stripe
 from decimal import Decimal, ROUND_HALF_UP
+from datetime import timedelta
 import hashlib
 import os
 
@@ -381,6 +382,51 @@ class QRProofUploadView(APIView):
             order.status != "cancelled" and payment.status == "rejected"
         )
 
+        # ============================================================
+        # NEW (Sep 2026 — QR 10-minute upload window): an order sits in
+        # "order_placed" (payment.status == "") from checkout until proof
+        # is uploaded or the window (10 min, +5 min if the customer used
+        # their one-time extension) runs out. cancel_stale_payments
+        # normally auto-cancels it once that deadline passes, but this is
+        # a safety net in case the upload request lands in the tiny
+        # window before that scheduled job has run.
+        # ============================================================
+        if order.status == "order_placed":
+            deadline = payment.qr_upload_deadline
+
+            if deadline and timezone.now() > deadline:
+                with transaction.atomic():
+                    locked_order = Order.objects.select_for_update().get(pk=order.pk)
+                    locked_payment = Payment.objects.select_for_update().get(pk=payment.pk)
+
+                    if locked_order.status == "order_placed":
+                        release_reserved_stock_for_order(locked_order)
+                        locked_order.status = "cancelled"
+                        locked_order.cancellation_reason = (
+                            "QR payment proof was not submitted within "
+                            "the allowed time window."
+                        )
+                        locked_order.save()
+
+                return Response(
+                    {
+                        "error": (
+                            "The time window to upload payment proof for "
+                            "this order has expired and the order has "
+                            "been cancelled."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Still within the window: move the order into the normal
+            # review pipeline. payment.status goes straight from "" to
+            # "under_review" a few lines below, same single step as
+            # every other QR upload.
+            order.status = "pending_payment"
+            order.save(update_fields=["status", "updated_at"])
+
+
         if order.status == "cancelled":
             if (
                 payment.status == "rejected"
@@ -501,6 +547,79 @@ class QRProofUploadView(APIView):
             # when this upload is a retry after an earlier rejection.
             "reopened_after_rejection": is_retry_after_rejection,
         }, status=status.HTTP_200_OK)
+
+
+# NEW (Sep 2026 — QR 10-minute upload window): the customer's "Need more
+# time?" action — gives ONE +5 minute extension to upload their QR proof
+# before cancel_stale_payments' scheduled job auto-cancels the order.
+class ExtendQRUploadTimeView(APIView):
+    """
+    POST /api/v1/payments/qr/extend-time/
+    Request body: { "order_number": "..." }
+
+    Only usable once per order, and only while the order is still
+    "order_placed" (i.e. no proof uploaded yet). Extends
+    payment.qr_upload_deadline to 5 minutes from NOW (not from the
+    original deadline) and marks the extension as used.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        order_number = request.data.get("order_number")
+
+        if not order_number:
+            return Response(
+                {"error": "order_number is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            order = Order.objects.get(
+                order_number=order_number,
+                customer__user=request.user,
+            )
+        except Order.DoesNotExist:
+            return Response(
+                {"error": "Order not found"},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        payment = getattr(order, "payment", None)
+        if payment is None or payment.payment_method != "qr":
+            return Response(
+                {"error": "This order is not a QR payment order."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if order.status != "order_placed":
+            return Response(
+                {
+                    "error": (
+                        "This order is no longer waiting for payment "
+                        "proof — an extension is not needed (or no "
+                        "longer possible)."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if payment.qr_extension_used:
+            return Response(
+                {"error": "You have already used your one-time extension for this order."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        payment.qr_upload_deadline = timezone.now() + timedelta(minutes=5)
+        payment.qr_extension_used = True
+        payment.save(update_fields=["qr_upload_deadline", "qr_extension_used", "updated_at"])
+
+        return Response(
+            {
+                "message": "You have been given 5 more minutes to upload your payment proof.",
+                "qr_upload_deadline": payment.qr_upload_deadline.isoformat(),
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class AdminQRPaymentPendingView(APIView):
