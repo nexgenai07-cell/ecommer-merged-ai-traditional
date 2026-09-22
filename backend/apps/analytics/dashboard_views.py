@@ -16,6 +16,7 @@ from django.db.models.functions import (
     TruncMonth,
     TruncYear,
     Coalesce,
+    Replace,
 )
 from django.utils import timezone
 
@@ -853,6 +854,30 @@ class AnalyticsExportView(APIView):
       - WhatsApp exports: message text / customer names are made safe
         against spreadsheet formula injection (see csv_safe_text()).
 
+    AUDIT (22 Sep 2026 - export filter gaps): the 7 remaining gap types
+    listed in the "CSV Export — Missing/Unsupported Filters" request are
+    now fixed — each one accepts exactly the params listed there and
+    filters identically to the equivalent on-screen list endpoint:
+      - orders: status, search, product, category, ordering (matches
+        GET /api/v1/admin/orders/filter/ — AdminOrderFilterView)
+      - returns: status, search, ordering (matches GET /api/v1/returns/
+        — ReturnListView)
+      - complaints: status, priority, search (matches GET
+        /api/v1/complaints/ — CreateComplaintView's admin listing)
+      - discounts: status, discount_type, search, ordering (matches GET
+        /api/v1/discounts/ — DiscountViewSet; sent as discount_type so
+        it can't collide with this endpoint's own ?type= dispatch param)
+      - inventory: status, category_id, search (matches the Inventory
+        Alerts filters on GET /api/v1/products/search/)
+      - customers: search, ordering (matches GET
+        /api/v1/admin/customers/ — AdminCustomerListView, incl. the
+        digit-normalised phone search)
+      - social_posts: status, platform, search (matches GET
+        /api/v1/social/posts/ — SocialPostViewSet)
+    The 7 types already listed as "Already correct" in that request
+    (sales, revenue, products, categories, audit_logs,
+    whatsapp_numbers, whatsapp_conversation) are untouched.
+
     NOTE on column choices: the v7 doc didn't specify exact CSV columns
     per type (only that each type must export "a real CSV, not an
     error, not an empty file"), so the columns below are my best-effort
@@ -919,7 +944,57 @@ class AnalyticsExportView(APIView):
     # ---- per-type CSV handlers ----------------------------------------
 
     def _export_orders(self, writer, start_date, end_date):
+        # UPDATED (22 Sep 2026 — export filter gaps): status, search,
+        # product, category and ordering now match GET
+        # /api/v1/admin/orders/filter/ (Admin — Filter Orders / API 62 /
+        # AdminOrderFilterView) exactly, so exporting from the Order
+        # Management page always matches what's on screen. Previously
+        # only start_date/end_date reached this export — the other 5
+        # active filters on that page were silently ignored.
         qs = filter_orders_by_date(Order.objects.all(), start_date, end_date)
+
+        params = self.request.query_params
+
+        status_param = params.get('status')
+        if status_param:
+            # Same "pending" -> "pending_payment" alias as
+            # AdminOrderFilterView.
+            if status_param == 'pending':
+                status_param = 'pending_payment'
+            qs = qs.filter(status=status_param)
+
+        search = params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(order_number__icontains=search) |
+                Q(customer__name__icontains=search)
+            )
+
+        product = params.get('product')
+        if product:
+            qs = qs.filter(
+                Q(items__product__name__icontains=product) |
+                Q(items__product_name__icontains=product)
+            )
+
+        category = params.get('category')
+        if category:
+            qs = qs.filter(items__product__category__name__icontains=category)
+
+        # Joining through items for product/category can duplicate an
+        # order row (once per matching item) — de-duplicate, same as
+        # AdminOrderFilterView.
+        if product or category:
+            qs = qs.distinct()
+
+        ordering_map = {
+            'created_at': 'created_at',
+            '-created_at': '-created_at',
+            'total_amount': 'total_amount',
+            '-total_amount': '-total_amount',
+        }
+        qs = qs.order_by(ordering_map.get(params.get('ordering'), '-created_at'))
+
         writer.writerow(['Order Number', 'Customer', 'Total Amount', 'Status', 'Payment Status', 'Created At'])
         for order in qs.select_related('customer', 'payment'):
             payment_status = order.payment.status if hasattr(order, 'payment') and order.payment else 'N/A'
@@ -963,11 +1038,51 @@ class AnalyticsExportView(APIView):
             ])
 
     def _export_discounts(self, writer, start_date, end_date):
+        # UPDATED (22 Sep 2026 — export filter gaps): status, discount_type,
+        # search and ordering now match GET /api/v1/discounts/
+        # (DiscountViewSet) exactly — same derived active/inactive/expired
+        # status logic, same code search, same ordering whitelist. The
+        # frontend's "Type" filter is accepted here as ?discount_type= (the
+        # underlying model/list-endpoint field is called "type") so it
+        # can't collide with this export's own ?type=discounts dispatch
+        # param.
         qs = Discount.objects.filter(is_delete=False)
         if start_date:
             qs = qs.filter(created_at__date__gte=start_date)
         if end_date:
             qs = qs.filter(created_at__date__lte=end_date)
+
+        params = self.request.query_params
+
+        search = params.get('search')
+        if search:
+            qs = qs.filter(code__icontains=search)
+
+        discount_type = params.get('discount_type')
+        if discount_type in ('percent', 'fixed'):
+            qs = qs.filter(type=discount_type)
+
+        status_param = params.get('status')
+        now = timezone.now()
+        if status_param == 'active':
+            qs = qs.filter(is_active=True, end_date__gte=now)
+        elif status_param == 'inactive':
+            qs = qs.filter(is_active=False)
+        elif status_param == 'expired':
+            qs = qs.filter(is_active=True, end_date__lt=now)
+
+        ordering_map = {
+            'created_at': 'created_at',
+            '-created_at': '-created_at',
+            'code': 'code',
+            '-code': '-code',
+            'value': 'value',
+            '-value': '-value',
+            'end_date': 'end_date',
+            '-end_date': '-end_date',
+        }
+        qs = qs.order_by(ordering_map.get(params.get('ordering'), '-created_at'))
+
         writer.writerow(['Code', 'Type', 'Value', 'Min Order Amount', 'Start Date', 'End Date', 'Is Active', 'Created At'])
         for d in qs:
             writer.writerow([
@@ -985,7 +1100,57 @@ class AnalyticsExportView(APIView):
         # silently exporting stale/wrong stock numbers. Uses
         # available_stock (total_stock - reserved_stock), same as every
         # other stock-reporting endpoint in the app.
+        #
+        # UPDATED (22 Sep 2026 — export filter gaps): status, category_id
+        # and search now match GET /api/v1/products/search/'s Inventory
+        # Alerts filters exactly (out_of_stock / low_stock / healthy
+        # status logic based on available_stock vs low_stock_threshold,
+        # same category_id comma/repeated handling, same name/
+        # description/sku/category-name search) — see _export_products
+        # below for the identical status-filter logic.
         qs = Product.objects.filter(is_delete=False).select_related('category')
+
+        params = self.request.query_params
+
+        category_id_values = params.getlist('category_id')
+        category_ids = []
+        for raw in category_id_values:
+            category_ids.extend([v.strip() for v in raw.split(',') if v.strip()])
+        if category_ids:
+            # FIX (22 Sep 2026 — export filter gaps, hardening): a
+            # non-numeric category_id used to be handed straight to
+            # category_id__in=[...] — Django/the DB driver raises a raw
+            # ValueError trying to cast it to an int, which surfaces as
+            # an unhandled 500, not a clean error. Same guard as
+            # _export_products below / /products/search/ (API 29).
+            if not all(v.isdigit() for v in category_ids):
+                raise ValidationError({'error': 'category_id must contain only valid ids.'})
+            qs = qs.filter(category_id__in=category_ids)
+
+        search = params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(name__icontains=search) |
+                Q(description__icontains=search) |
+                Q(sku__icontains=search) |
+                Q(category__name__icontains=search)
+            )
+
+        status_values = params.getlist('status')
+        statuses = []
+        for raw in status_values:
+            statuses.extend([v.strip() for v in raw.split(',') if v.strip()])
+        if statuses:
+            qs = qs.annotate(_available_stock=F('total_stock') - F('reserved_stock'))
+            status_filter = Q()
+            if 'out_of_stock' in statuses:
+                status_filter |= Q(_available_stock__lte=0)
+            if 'low_stock' in statuses:
+                status_filter |= Q(_available_stock__gt=0, _available_stock__lte=F('low_stock_threshold'))
+            if 'healthy' in statuses or 'in_stock' in statuses:
+                status_filter |= Q(_available_stock__gt=F('low_stock_threshold'))
+            qs = qs.filter(status_filter)
+
         writer.writerow(['SKU', 'Name', 'Category', 'Stock', 'Low Stock Threshold', 'Is Active'])
         for p in qs:
             writer.writerow([
@@ -1250,11 +1415,45 @@ class AnalyticsExportView(APIView):
             writer.writerow([log.direction, csv_safe_text(log.message), log.is_admin, log.created_at])
 
     def _export_returns(self, writer, start_date, end_date):
+        # UPDATED (22 Sep 2026 — export filter gaps): status, search and
+        # ordering now match GET /api/v1/returns/ (ReturnListView)
+        # exactly — same "requested" -> "pending" alias, same search
+        # fields (order number, reason, customer name, RET-<id>
+        # reference), same ordering whitelist.
         qs = Return.objects.select_related('order', 'customer')
         if start_date:
             qs = qs.filter(created_at__date__gte=start_date)
         if end_date:
             qs = qs.filter(created_at__date__lte=end_date)
+
+        params = self.request.query_params
+
+        status_param = params.get('status')
+        if status_param == 'requested':
+            status_param = 'pending'
+        if status_param in ('pending', 'approved', 'rejected'):
+            qs = qs.filter(status=status_param)
+
+        search = (params.get('search') or '').strip()
+        if search:
+            search_filter = (
+                Q(order__order_number__icontains=search) |
+                Q(reason__icontains=search) |
+                Q(customer__name__icontains=search)
+            )
+            ref_match = re.match(r'^ret-?(\d+)$', search, re.IGNORECASE)
+            if ref_match:
+                search_filter |= Q(id=int(ref_match.group(1)))
+            qs = qs.filter(search_filter)
+
+        ordering_map = {
+            'created_at': 'created_at',
+            '-created_at': '-created_at',
+            'customer_name': 'customer__name',
+            '-customer_name': '-customer__name',
+        }
+        qs = qs.order_by(ordering_map.get(params.get('ordering'), '-created_at'))
+
         writer.writerow(['Order Number', 'Customer', 'Reason', 'Status', 'Created At', 'Resolved At'])
         for r in qs:
             writer.writerow([
@@ -1263,11 +1462,36 @@ class AnalyticsExportView(APIView):
             ])
 
     def _export_complaints(self, writer, start_date, end_date):
+        # UPDATED (22 Sep 2026 — export filter gaps): status, priority and
+        # search now match GET /api/v1/complaints/ (CreateComplaintView's
+        # admin listing) exactly — same accepted status/priority values,
+        # same search fields (message text, CMP-<id> reference). The page
+        # itself has no date filter yet, so start_date/end_date are left
+        # as-is below (harmless if the page never sends them).
         qs = Complaint.objects.select_related('customer', 'order')
         if start_date:
             qs = qs.filter(created_at__date__gte=start_date)
         if end_date:
             qs = qs.filter(created_at__date__lte=end_date)
+
+        params = self.request.query_params
+
+        status_param = params.get('status')
+        if status_param in ('open', 'in_progress', 'resolved', 'closed'):
+            qs = qs.filter(status=status_param)
+
+        priority_param = params.get('priority')
+        if priority_param in ('normal', 'urgent'):
+            qs = qs.filter(priority=priority_param)
+
+        search = (params.get('search') or '').strip()
+        if search:
+            search_filter = Q(message__icontains=search)
+            ref_match = re.match(r'^cmp-?(\d+)$', search, re.IGNORECASE)
+            if ref_match:
+                search_filter |= Q(id=int(ref_match.group(1)))
+            qs = qs.filter(search_filter)
+
         writer.writerow(['ID', 'Customer', 'Order Number', 'Type', 'Status', 'Priority', 'Created At'])
         for c in qs:
             writer.writerow([
@@ -1276,11 +1500,32 @@ class AnalyticsExportView(APIView):
             ])
 
     def _export_social_posts(self, writer, start_date, end_date):
+        # UPDATED (22 Sep 2026 — export filter gaps): status, platform and
+        # search now match GET /api/v1/social/posts/ (SocialPostViewSet)
+        # exactly — same caption/hashtags search. Status and platform are
+        # straightforward equality filters against the model's own
+        # STATUS_CHOICES / PLATFORM_CHOICES, the same fields the Social
+        # Posts page's own tabs already write to.
         qs = SocialPost.objects.all()
         if start_date:
             qs = qs.filter(created_at__date__gte=start_date)
         if end_date:
             qs = qs.filter(created_at__date__lte=end_date)
+
+        params = self.request.query_params
+
+        status_param = params.get('status')
+        if status_param:
+            qs = qs.filter(status=status_param)
+
+        platform = params.get('platform')
+        if platform:
+            qs = qs.filter(platform=platform)
+
+        search = params.get('search')
+        if search:
+            qs = qs.filter(Q(caption__icontains=search) | Q(hashtags__icontains=search))
+
         writer.writerow(['ID', 'Platform', 'Caption', 'Hashtags', 'Status', 'Created At'])
         for p in qs:
             writer.writerow([
@@ -1291,6 +1536,13 @@ class AnalyticsExportView(APIView):
         # Same "exclude cancelled + pending_payment" total_orders /
         # total_spent logic as AdminCustomerListView (A2), for
         # consistency between the admin customers list and this export.
+        #
+        # UPDATED (22 Sep 2026 — export filter gaps): search and ordering
+        # now match GET /api/v1/admin/customers/ (AdminCustomerListView)
+        # exactly, including the digit-normalised phone search and the
+        # total_orders/total_spent sort options (which reuse the same
+        # annotations already computed below, so the CSV order matches
+        # the screen order exactly).
         qs = Customer.objects.all()
         if start_date:
             qs = qs.filter(created_at__date__gte=start_date)
@@ -1307,6 +1559,47 @@ class AnalyticsExportView(APIView):
                 Value(0), output_field=DecimalField(),
             ),
         )
+
+        params = self.request.query_params
+
+        search = params.get('search')
+        if search:
+            search_filter = Q(name__icontains=search) | Q(email__icontains=search) | Q(phone__icontains=search)
+
+            # Same phone-digit normalisation as AdminCustomerListView, so
+            # a plain-digit WhatsApp-style search still matches a phone
+            # stored with punctuation.
+            search_digits = re.sub(r'[\s\-()+]', '', search)
+            if len(re.sub(r'\D', '', search_digits)) >= 6:
+                qs = qs.annotate(
+                    _phone_digits=Replace(
+                        Replace(
+                            Replace(
+                                Replace(
+                                    Replace('phone', Value('+'), Value('')),
+                                    Value(' '), Value(''),
+                                ),
+                                Value('-'), Value(''),
+                            ),
+                            Value('('), Value(''),
+                        ),
+                        Value(')'), Value(''),
+                    )
+                )
+                search_filter |= Q(_phone_digits__icontains=search_digits)
+
+            qs = qs.filter(search_filter)
+
+        ordering_map = {
+            'created_at': 'created_at',
+            '-created_at': '-created_at',
+            'total_orders': '_total_orders',
+            '-total_orders': '-_total_orders',
+            'total_spent': '_total_spent',
+            '-total_spent': '-_total_spent',
+        }
+        qs = qs.order_by(ordering_map.get(params.get('ordering'), '-created_at'))
+
         writer.writerow(['Name', 'Phone', 'Email', 'Total Orders', 'Total Spent', 'Created At'])
         for c in qs:
             writer.writerow([
