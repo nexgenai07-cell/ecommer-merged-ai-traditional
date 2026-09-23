@@ -1284,7 +1284,7 @@ class OrderDetailView(generics.RetrieveAPIView):
 # Restricts customers to their own orders while allowing admins to view all.
     queryset = (
         Order.objects
-        .select_related("customer", "store", "payment")
+        .select_related("customer", "customer__user", "store", "payment")
         .prefetch_related("items", "status_history")
     )
 
@@ -1499,7 +1499,7 @@ class AdminOrderListView(generics.ListAPIView):
         # so serializing payment_status for every row doesn't fire one
         # extra query per order.
         return (
-            Order.objects.select_related("customer", "payment")
+            Order.objects.select_related("customer", "customer__user", "payment")
             .all()
             .order_by("-created_at")
         )
@@ -1868,7 +1868,7 @@ class AdminOrderFilterView(generics.ListAPIView):
             Order.objects
             # NEW (Sep 2026 — payment_status column): added "payment" here
             # too, same reason as AdminOrderListView above.
-            .select_related("customer", "payment")
+            .select_related("customer", "customer__user", "payment")
             .all()
             .order_by("-created_at")
         )
@@ -1950,6 +1950,6 @@ class AdminOrderDetailView(generics.RetrieveAPIView):
 
     queryset = (
         Order.objects
-        .select_related("customer", "store", "payment")
+        .select_related("customer", "customer__user", "store", "payment")
         .prefetch_related("items", "status_history")
     )

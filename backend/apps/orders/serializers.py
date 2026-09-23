@@ -293,6 +293,33 @@ class OrderListSerializer(serializers.ModelSerializer):
     def get_item_count(self, obj):
         # IMPORTANT: this is the real total, NOT len(items).
         return obj.items.count()
+
+
+# NEW (Sep 2026 — Orders phone number bug): shared by AdminOrderListSerializer
+# and OrderDetailSerializer below, so both show the same phone for the same
+# order instead of drifting out of sync again.
+#
+# 3-level fallback, in order of accuracy for THIS specific order:
+#   1. order.contact_phone — set fresh at checkout (address book entry,
+#      manually-typed number, or default address). The real per-order
+#      number, but phone is optional at checkout so this can be blank.
+#   2. order.customer.phone — the Customer profile's phone. Also can be
+#      blank: it's only a one-time snapshot taken when the Customer row
+#      was first created (registration signal or first order — see
+#      apps/users/signals.py) and never re-synced afterward.
+#   3. order.customer.user.phone — the account's live, always-current
+#      phone (if this customer has an account at all; guest checkouts
+#      have customer.user = None). Last resort, but better than nothing.
+def _resolve_order_phone(order):
+    if order.contact_phone:
+        return order.contact_phone
+    if order.customer.phone:
+        return order.customer.phone
+    if order.customer.user:
+        return order.customer.user.phone
+    return None
+
+
 # Returns order summary with customer information for admin dashboard.
 class AdminOrderListSerializer(serializers.ModelSerializer):
     """
@@ -331,17 +358,13 @@ class AdminOrderListSerializer(serializers.ModelSerializer):
         return {
             "id": obj.customer.id,
             "name": obj.customer.name,
-            # NEW (Sep 2026 — Orders table phone bug): this used to be
-            # obj.customer.phone — the Customer profile's phone, a
-            # one-time snapshot that doesn't track what was actually
-            # typed at checkout for THIS order. Order.contact_phone is
-            # set fresh on every checkout (from the chosen address book
-            # entry, a manually-typed number, or the default address —
-            # see CheckoutView) so it's the real per-order number, which
-            # can legitimately differ from the account's registered
-            # number. Falls back to the profile phone only if
-            # contact_phone is blank (phone is optional at checkout).
-            "phone": obj.contact_phone or obj.customer.phone,
+            # NEW (Sep 2026 — Orders table phone bug, part 2): now uses
+            # the shared 3-level fallback (see _resolve_order_phone
+            # above) — contact_phone alone left some orders with no
+            # phone at all when it was blank AND the Customer profile's
+            # phone was also blank (e.g. an account whose Customer row
+            # was auto-created with no phone at registration).
+            "phone": _resolve_order_phone(obj),
         }
 
     # NEW (Sep 2026 — Orders table missing Payment Status column)
@@ -452,7 +475,12 @@ class OrderDetailSerializer(serializers.ModelSerializer):
             "id": obj.customer.id,
             "name": obj.customer.name,
             "email": obj.customer.email,
-            "phone": obj.customer.phone,
+            # NEW (Sep 2026 — Order Details "Customer Info" missing
+            # phone bug): this card never had a phone at all before —
+            # only name + email. Uses the same shared fallback as the
+            # Orders list (see _resolve_order_phone above) so both pages
+            # always show the identical number for the same order.
+            "phone": _resolve_order_phone(obj),
         }
 
 
