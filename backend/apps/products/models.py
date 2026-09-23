@@ -30,6 +30,22 @@ class Product(models.Model):
         blank=True,
     )
 
+    # NEW (Sep 2026 — admin profit tracking): what the store paid to
+    # acquire this product. Admin-only — never serialized in the
+    # customer-facing list/detail response, only in the admin views.
+    # Used to calculate profit = price - purchase_price.
+    purchase_price = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text=(
+            "Admin-only cost price — what the store paid to acquire this "
+            "product. Used to calculate profit (price - purchase_price). "
+            "Never shown to customers."
+        ),
+    )
+
     # ============================================================
     # CHANGED: Single 'stock' field replaced with three fields
     # as per PDF Part 2 Item 5 (Reserved Stock)

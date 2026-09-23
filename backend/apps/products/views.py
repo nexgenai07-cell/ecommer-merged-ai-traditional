@@ -449,10 +449,14 @@ class ProductViewSet(viewsets.ModelViewSet):
         # FIX (Bug 2): pagination ab standard list() jaisi hi hai.
         page = self.paginate_queryset(qs)
         if page is not None:
-            serializer = ProductListSerializer(page, many=True)
+            serializer = ProductListSerializer(
+                page, many=True, context=self.get_serializer_context()
+            )
             return self.get_paginated_response(serializer.data)
 
-        serializer = ProductListSerializer(qs, many=True)
+        serializer = ProductListSerializer(
+            qs, many=True, context=self.get_serializer_context()
+        )
         return Response(serializer.data)
 
     @action(detail=False, methods=['get'], url_path='suggestions')
@@ -497,7 +501,9 @@ class ProductViewSet(viewsets.ModelViewSet):
             )
         ).order_by('_relevance', 'name')[:6]
 
-        serializer = ProductListSerializer(qs, many=True)
+        serializer = ProductListSerializer(
+            qs, many=True, context=self.get_serializer_context()
+        )
         return Response(serializer.data)
 
     @action(detail=False, methods=['get'], url_path='low-stock',

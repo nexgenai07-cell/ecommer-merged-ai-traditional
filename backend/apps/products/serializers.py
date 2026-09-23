@@ -63,6 +63,13 @@ class ProductListSerializer(serializers.ModelSerializer):
     # ============================================================
     available_stock = serializers.SerializerMethodField()
 
+    # NEW (Sep 2026 — profit tracking): both admin-only. Resolve to None
+    # for a customer request so cost/profit never leaks to the storefront
+    # — this serializer is shared between the public product list and the
+    # admin panel's product list.
+    purchase_price = serializers.SerializerMethodField()
+    profit = serializers.SerializerMethodField()
+
     class Meta:
         model = Product
         fields = [
@@ -70,6 +77,9 @@ class ProductListSerializer(serializers.ModelSerializer):
             "name",
             "price",
             "original_price",
+            # NEW (Sep 2026 — profit tracking): admin-only, null for customers
+            "purchase_price",
+            "profit",
             # ============================================================
             # NEW: Replace single 'stock' with three fields
             # ============================================================
@@ -108,6 +118,29 @@ class ProductListSerializer(serializers.ModelSerializer):
             return None
 
         return img.image.url.replace("http://", "https://")
+
+    # NEW (Sep 2026 — profit tracking): True only for an authenticated
+    # admin making the request.
+    def _is_admin(self):
+        request = self.context.get("request")
+        return bool(
+            request
+            and request.user
+            and request.user.is_authenticated
+            and getattr(request.user, "role", None) == "admin"
+        )
+
+    # NEW (Sep 2026 — profit tracking): store's cost price, admin-only.
+    def get_purchase_price(self, obj):
+        if not self._is_admin():
+            return None
+        return obj.purchase_price
+
+    # NEW (Sep 2026 — profit tracking): price - purchase_price, admin-only.
+    def get_profit(self, obj):
+        if not self._is_admin() or obj.purchase_price is None:
+            return None
+        return obj.price - obj.purchase_price
 
     # ============================================================
     # NEW: available_stock = total_stock - reserved_stock
@@ -155,6 +188,13 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     review_count = serializers.SerializerMethodField()
     total_sold = serializers.SerializerMethodField()
 
+    # NEW (Sep 2026 — profit tracking): both admin-only, null for a
+    # customer request — same shared-serializer situation as
+    # ProductListSerializer (used by both the public detail page and the
+    # admin panel's product edit page).
+    purchase_price = serializers.SerializerMethodField()
+    profit = serializers.SerializerMethodField()
+
     class Meta:
         model = Product
         fields = [
@@ -163,6 +203,9 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             "description",
             "price",
             "original_price",
+            # NEW (Sep 2026 — profit tracking): admin-only, null for customers
+            "purchase_price",
+            "profit",
             # ============================================================
             # NEW: Replace single 'stock' with three fields
             # ============================================================
@@ -199,6 +242,29 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     # ============================================================
     def get_available_stock(self, obj):
         return obj.total_stock - obj.reserved_stock
+
+    # NEW (Sep 2026 — profit tracking): True only for an authenticated
+    # admin making the request.
+    def _is_admin(self):
+        request = self.context.get("request")
+        return bool(
+            request
+            and request.user
+            and request.user.is_authenticated
+            and getattr(request.user, "role", None) == "admin"
+        )
+
+    # NEW (Sep 2026 — profit tracking): store's cost price, admin-only.
+    def get_purchase_price(self, obj):
+        if not self._is_admin():
+            return None
+        return obj.purchase_price
+
+    # NEW (Sep 2026 — profit tracking): price - purchase_price, admin-only.
+    def get_profit(self, obj):
+        if not self._is_admin() or obj.purchase_price is None:
+            return None
+        return obj.price - obj.purchase_price
 
     # NEW: average of every active, non-deleted review's rating.
     # Rounded to 1 decimal place (e.g. 4.8), 0.0 when there are no
@@ -277,6 +343,8 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
             "description",
             "price",
             "original_price",
+            # NEW (Sep 2026 — profit tracking): admin-only cost price
+            "purchase_price",
             # ============================================================
             # NEW: total_stock and reserved_stock
             # ============================================================
@@ -433,6 +501,21 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
                         "a negative discount."
                     )
                 }
+            )
+
+        # NEW (Sep 2026 — profit tracking): purchase_price is the store's
+        # cost price, only used to calculate profit (price -
+        # purchase_price) for the admin. Just needs to be non-negative —
+        # unlike original_price/price above, price is allowed to be lower
+        # than purchase_price (admin may knowingly sell at a loss, e.g.
+        # clearance stock), so that isn't blocked here.
+        purchase_price = data.get(
+            "purchase_price",
+            getattr(self.instance, "purchase_price", None),
+        )
+        if purchase_price is not None and purchase_price < 0:
+            raise serializers.ValidationError(
+                {"purchase_price": "Purchase price cannot be negative."}
             )
 
         # ============================================================

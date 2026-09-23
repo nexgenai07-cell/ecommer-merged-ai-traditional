@@ -1409,6 +1409,25 @@ class OrderCancelView(APIView):
         )
 
         if was_paid:
+            # NEW (Sep 2026 — refund notification): the "Order cancelled"
+            # notification above never mentions the refund at all, even
+            # though total_refunded / payment.amount /refunded_at were
+            # already fully exposed on the dashboard and order detail
+            # page — there was just no notification telling the customer
+            # a refund happened or how much. Adds a dedicated one here,
+            # in addition to the existing cancellation notification.
+            create_notification(
+                user=request.user,
+                store=order.store,
+                title="Refund processed",
+                message=(
+                    f"Rs. {order.payment.amount} has been refunded for "
+                    f"your cancelled order {order.order_number}."
+                ),
+                notification_type="order",
+                reference_type="order",
+                reference_id=order.order_number,
+            )
             send_refund_confirmation_email(order)
 
         return Response(OrderDetailSerializer(order).data)
@@ -1476,7 +1495,14 @@ class AdminOrderListView(generics.ListAPIView):
 
 # Retrieves every order in the system.
     def get_queryset(self):
-        return Order.objects.all().order_by("-created_at")
+        # NEW (Sep 2026 — payment_status column): select_related("payment")
+        # so serializing payment_status for every row doesn't fire one
+        # extra query per order.
+        return (
+            Order.objects.select_related("customer", "payment")
+            .all()
+            .order_by("-created_at")
+        )
 
 # Allows admins to update order status.
 class AdminOrderStatusUpdateView(APIView):
@@ -1756,6 +1782,22 @@ class AdminOrderStatusUpdateView(APIView):
         ).start()
 
         if new_status == "cancelled" and was_paid_before_cancel:
+            # NEW (Sep 2026 — refund notification): same fix as the
+            # customer-initiated cancel path — a dedicated notification
+            # naming the refunded amount, in addition to the existing
+            # "Order cancelled" one above which never mentioned it.
+            create_notification(
+                user=order.customer.user,
+                store=order.store,
+                title="Refund processed",
+                message=(
+                    f"Rs. {order.payment.amount} has been refunded for "
+                    f"your cancelled order {order.order_number}."
+                ),
+                notification_type="order",
+                reference_type="order",
+                reference_id=order.order_number,
+            )
             send_refund_confirmation_email(order)
 
         # FIX (Frontend Bug Report — Audit Logs, Sep 2026): no admin write
@@ -1824,7 +1866,9 @@ class AdminOrderFilterView(generics.ListAPIView):
     def get_queryset(self):
         qs = (
             Order.objects
-            .select_related("customer")
+            # NEW (Sep 2026 — payment_status column): added "payment" here
+            # too, same reason as AdminOrderListView above.
+            .select_related("customer", "payment")
             .all()
             .order_by("-created_at")
         )

@@ -995,12 +995,17 @@ class AnalyticsExportView(APIView):
         }
         qs = qs.order_by(ordering_map.get(params.get('ordering'), '-created_at'))
 
-        writer.writerow(['Order Number', 'Customer', 'Total Amount', 'Status', 'Payment Status', 'Created At'])
+        writer.writerow(['Order Number', 'Customer', 'Total Amount', 'Status', 'Payment Status', 'Cancellation Reason', 'Created At'])
         for order in qs.select_related('customer', 'payment'):
             payment_status = order.payment.status if hasattr(order, 'payment') and order.payment else 'N/A'
+            # NEW (Sep 2026 — cancelled orders export): cancellation_reason
+            # already exists on the Order model (set when an admin cancels
+            # an order — see AdminOrderStatusUpdateView). Blank for any
+            # order that was never cancelled, same as a normal empty cell.
             writer.writerow([
                 order.order_number, order.customer.name, order.total_amount,
-                order.status, payment_status, order.created_at,
+                order.status, payment_status, order.cancellation_reason or '',
+                order.created_at,
             ])
 
     def _export_sales(self, writer, start_date, end_date, status_param=None):

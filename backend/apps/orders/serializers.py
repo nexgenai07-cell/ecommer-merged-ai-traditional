@@ -139,6 +139,15 @@ class PaymentSerializer(serializers.ModelSerializer):
             "status",
             "amount",
             "paid_at",
+            # NEW (Sep 2026 — refund visibility bug): amount and status
+            # were already exposed above (so a "refunded" payment already
+            # showed its status and the refunded amount), but refunded_at
+            # itself — the one field that actually confirms a refund
+            # happened and when — was set on the model at cancellation
+            # time (see CustomerOrderCancelView / AdminOrderStatusUpdateView
+            # in views.py) but never reached this serializer, so the order
+            # detail page had no way to show it.
+            "refunded_at",
             # ============================================================
             # NEW: Payment method fields
             # ============================================================
@@ -157,6 +166,17 @@ class PaymentSerializer(serializers.ModelSerializer):
             # here now under a clearer name so it reads on every order
             # detail view.
             "qr_rejection_count",
+            # NEW (Sep 2026 — rejection reason not shown bug): the admin
+            # already types a reason on every QR-proof rejection (see
+            # AdminQRPaymentRejectView) and it was saved correctly on
+            # Payment.qr_reject_reason, but — like qr_rejection_count
+            # before the fix above — it was never exposed on this
+            # serializer, so it reached neither the admin's nor the
+            # customer's order detail page. Both use this same
+            # OrderDetailSerializer -> PaymentSerializer, so exposing it
+            # here fixes both at once. Null for a payment that was never
+            # rejected.
+            "qr_reject_reason",
             # NEW (Sep 2026 — QR 10-minute upload window): lets the
             # frontend re-derive/resume the countdown and "need more
             # time?" button state from a normal GET /orders/<order_number>/
@@ -281,6 +301,16 @@ class AdminOrderListSerializer(serializers.ModelSerializer):
 
     customer = serializers.SerializerMethodField()
 
+    # NEW (Sep 2026 — Orders table missing Payment Status column): the
+    # table only ever showed the order status (placed/pending/cancelled/
+    # delivered etc.), never the separate payment status
+    # (pending/under_review/paid/rejected/refunded), even though the CSV
+    # export already includes it. Payment is a OneToOne on Order
+    # (related_name="payment"), so it's read straight off that — None
+    # for the rare case a payment row doesn't exist yet (e.g. an order
+    # created outside the normal checkout flow).
+    payment_status = serializers.SerializerMethodField()
+
     class Meta:
         model = Order
         fields = [
@@ -292,6 +322,7 @@ class AdminOrderListSerializer(serializers.ModelSerializer):
             "shipping_method",
             "shipping_cost",
             "status",
+            "payment_status",
             "created_at",
         ]
 
@@ -302,6 +333,11 @@ class AdminOrderListSerializer(serializers.ModelSerializer):
             "name": obj.customer.name,
             "phone": obj.customer.phone,
         }
+
+    # NEW (Sep 2026 — Orders table missing Payment Status column)
+    def get_payment_status(self, obj):
+        payment = getattr(obj, "payment", None)
+        return payment.status if payment else None
 
 
 # NEW (Sep 2026 — order status history / timeline): one entry per status

@@ -40,10 +40,18 @@ class AuditLogSerializer(serializers.ModelSerializer):
     # shows the admin's email instead of just their numeric id, easier to read
     user_email = serializers.CharField(source='user.email', read_only=True, default='system')
 
+    # NEW (Sep 2026 — Audit Logs table bug): the table only had the
+    # numeric user id to show ("USER: 88"), with no way to know which
+    # admin that was. User.name already exists (used elsewhere, e.g.
+    # AuditLogUserListView's {id, name, email}) so it's exposed here too
+    # — 'System' default matches user_email's fallback for the same
+    # user=None case (e.g. an automated/system-triggered action).
+    user_name = serializers.CharField(source='user.name', read_only=True, default='System')
+
     class Meta:
         model = AuditLog
         fields = [
-            'id', 'user', 'user_email', 'action', 'entity', 'entity_id',
+            'id', 'user', 'user_name', 'user_email', 'action', 'entity', 'entity_id',
             'old_data', 'new_data', 'ip_address', 'source', 'created_at',
         ]
         read_only_fields = fields  # nothing on AuditLog should be editable through the API
