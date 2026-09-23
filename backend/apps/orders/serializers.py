@@ -331,7 +331,17 @@ class AdminOrderListSerializer(serializers.ModelSerializer):
         return {
             "id": obj.customer.id,
             "name": obj.customer.name,
-            "phone": obj.customer.phone,
+            # NEW (Sep 2026 — Orders table phone bug): this used to be
+            # obj.customer.phone — the Customer profile's phone, a
+            # one-time snapshot that doesn't track what was actually
+            # typed at checkout for THIS order. Order.contact_phone is
+            # set fresh on every checkout (from the chosen address book
+            # entry, a manually-typed number, or the default address —
+            # see CheckoutView) so it's the real per-order number, which
+            # can legitimately differ from the account's registered
+            # number. Falls back to the profile phone only if
+            # contact_phone is blank (phone is optional at checkout).
+            "phone": obj.contact_phone or obj.customer.phone,
         }
 
     # NEW (Sep 2026 — Orders table missing Payment Status column)

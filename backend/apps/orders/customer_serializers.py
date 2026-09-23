@@ -15,6 +15,22 @@ class CustomerAdminSerializer(serializers.ModelSerializer):
     total_orders = serializers.SerializerMethodField()
     total_spent = serializers.SerializerMethodField()
 
+    # NEW (Sep 2026 — Admin Customers page missing phone bug): phone used
+    # to read straight off Customer.phone — a one-time snapshot copied
+    # from User.phone the moment the Customer row was first created
+    # (either by the new-user signal at registration, or
+    # get_or_create_customer() on the customer's first order — see
+    # apps/users/signals.py). If the account's phone was empty at that
+    # exact moment (e.g. Google sign-up, which never collects a phone,
+    # or the phone was only added afterward via profile edit), this
+    # column stayed permanently blank even once the account's real phone
+    # was set — nothing re-syncs Customer.phone after creation.
+    # obj.user.phone is the live, always-current value for any customer
+    # who has an account, so it's preferred here; obj.phone remains the
+    # fallback for a guest-checkout customer (user=None — see
+    # Customer.user's null=True/blank=True comment in models.py).
+    phone = serializers.SerializerMethodField()
+
     class Meta:
         model = Customer
         fields = [
@@ -29,6 +45,12 @@ class CustomerAdminSerializer(serializers.ModelSerializer):
             "total_spent",
             "created_at",
         ]
+
+    # NEW (Sep 2026 — Admin Customers page missing phone bug)
+    def get_phone(self, obj):
+        if obj.user and obj.user.phone:
+            return obj.user.phone
+        return obj.phone
 
     # Returns total number of orders that actually count as "placed" —
     # i.e. the customer has paid for them.
