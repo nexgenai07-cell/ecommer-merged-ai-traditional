@@ -5,7 +5,7 @@ from rest_framework import viewsets, permissions, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
-from django.db.models import Q, F
+from django.db.models import Q, F, Case, When, Value, IntegerField
 
 from .services import adjust_stock as adjust_stock_service
 from .models import Product, ProductImage, ProductHistory
@@ -31,6 +31,7 @@ class ProductViewSet(viewsets.ModelViewSet):
     DELETE /api/v1/products/{id}/        -> soft delete (admin only)
 
     GET    /api/v1/products/search/      -> filtered search (anyone)
+    GET    /api/v1/products/suggestions/ -> navbar type-ahead dropdown (anyone)
     GET    /api/v1/products/low-stock/   -> below threshold (admin only)
 
     POST   /api/v1/products/{id}/images/                       -> add image (admin only)
@@ -62,7 +63,7 @@ class ProductViewSet(viewsets.ModelViewSet):
             'images'
         )
 
-        if self.action in ['list', 'retrieve', 'search']:
+        if self.action in ['list', 'retrieve', 'search', 'suggestions']:
             if not (
                 self.request.user.is_authenticated
                 and self.request.user.role == 'admin'
@@ -72,7 +73,7 @@ class ProductViewSet(viewsets.ModelViewSet):
         return qs
 
     def get_serializer_class(self):
-        if self.action == 'list' or self.action == 'search':
+        if self.action in ('list', 'search', 'suggestions'):
             return ProductListSerializer
         if self.action in ['create', 'update', 'partial_update']:
             return ProductCreateUpdateSerializer
@@ -81,7 +82,7 @@ class ProductViewSet(viewsets.ModelViewSet):
         return ProductDetailSerializer
 
     def get_permissions(self):
-        if self.action in ['list', 'retrieve', 'search']:
+        if self.action in ['list', 'retrieve', 'search', 'suggestions']:
             return [permissions.AllowAny()]
         return [permissions.IsAuthenticated(), IsAdmin()]
 
@@ -450,6 +451,51 @@ class ProductViewSet(viewsets.ModelViewSet):
         if page is not None:
             serializer = ProductListSerializer(page, many=True)
             return self.get_paginated_response(serializer.data)
+
+        serializer = ProductListSerializer(qs, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'], url_path='suggestions')
+    def suggestions(self, request):
+        """
+        GET /api/v1/products/suggestions/?q=auto
+
+        NEW (Sep 2026 — navbar search-suggestions bug fix):
+        The navbar's type-ahead dropdown was showing products with no
+        relation to what the customer typed (e.g. "auto" returning a
+        microwave, "machine" returning shoes and a suit). Root cause:
+        there was no backend endpoint built for a dropdown at all —
+        /search/ exists but returns the full paginated catalog matching
+        `q`, not a short ranked list meant for a live dropdown. This is
+        a dedicated, lightweight endpoint for that dropdown:
+          - only returns products that actually match `q` (name, SKU,
+            or category name) — nothing unrelated is ever returned
+          - ranked by relevance: name starts with `q` first, then name
+            contains `q`, then SKU/category matches
+          - capped at 6 results, no pagination — a dropdown doesn't need
+            {count, next, previous}, just a short list
+          - empty/missing `q` returns an empty list instead of dumping
+            the whole catalog into the dropdown
+        """
+        q = request.query_params.get('q', '').strip()
+        if not q:
+            return Response([])
+
+        qs = self.get_queryset().filter(
+            Q(name__icontains=q) |
+            Q(sku__icontains=q) |
+            Q(category__name__icontains=q)
+        ).distinct()
+
+        qs = qs.annotate(
+            _relevance=Case(
+                When(name__istartswith=q, then=Value(0)),
+                When(name__icontains=q, then=Value(1)),
+                When(sku__icontains=q, then=Value(2)),
+                default=Value(3),
+                output_field=IntegerField(),
+            )
+        ).order_by('_relevance', 'name')[:6]
 
         serializer = ProductListSerializer(qs, many=True)
         return Response(serializer.data)
