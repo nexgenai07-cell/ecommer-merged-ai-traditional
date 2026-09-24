@@ -255,7 +255,90 @@ class ProductViewSet(viewsets.ModelViewSet):
                 )
 
             return Response(serializer.data)
-        
+
+    def _parse_price_range(self, request):
+        """
+        Reads and validates ?min_price= / ?max_price= from the request.
+
+        Returns (min_price_value, max_price_value, error_response):
+          - on success  -> (Decimal-or-None, Decimal-or-None, None)
+          - on failure  -> (None, None, Response(400)) — the caller just
+                           has to `return` that response as-is.
+
+        NEW (Sep 2026): pulled out of search() into this helper so the
+        exact same validation + short user-friendly messages are shared by
+        /products/search/ and /products/low-stock/ (which now also
+        accepts min_price / max_price).
+        """
+        # FIX (Price range filter bug report, Sep 2026): min_price /
+        # max_price were passed straight into the queryset with no
+        # validation at all — negative values (e.g. min_price=-500) were
+        # silently accepted, and a "reversed" range (min_price greater
+        # than max_price, e.g. min_price=10000&max_price=5000) was also
+        # silently accepted and just returned zero results instead of
+        # telling the caller their range was invalid. Both are now
+        # rejected with a clear 400 error before touching the queryset.
+        #
+        # FIX (User-friendly error messages, Sep 2026): the reversed-range
+        # message used to be a long technical string ("...The range must
+        # go from the smaller value to the larger value, e.g.
+        # min_price=5000&max_price=10000.") that the admin panel showed
+        # as-is in its toast. All three messages below are now short,
+        # plain-language sentences meant to be shown directly to the user.
+        # The response shape ({"error": "..."}) and 400 status are
+        # unchanged, so nothing on the frontend needs to change. Also
+        # rejects NaN / Infinity, which Decimal() accepts but which would
+        # otherwise crash the comparisons below with a 500.
+        min_price = request.query_params.get('min_price')
+        max_price = request.query_params.get('max_price')
+
+        min_price_value = None
+        if min_price is not None and min_price != '':
+            try:
+                min_price_value = Decimal(min_price)
+                if not min_price_value.is_finite():
+                    raise InvalidOperation
+            except (InvalidOperation, ValueError):
+                return None, None, Response(
+                    {"error": "Please enter a valid minimum price."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if min_price_value < 0:
+                return None, None, Response(
+                    {"error": "Minimum price cannot be negative."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        max_price_value = None
+        if max_price is not None and max_price != '':
+            try:
+                max_price_value = Decimal(max_price)
+                if not max_price_value.is_finite():
+                    raise InvalidOperation
+            except (InvalidOperation, ValueError):
+                return None, None, Response(
+                    {"error": "Please enter a valid maximum price."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if max_price_value < 0:
+                return None, None, Response(
+                    {"error": "Maximum price cannot be negative."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        if (
+            min_price_value is not None
+            and max_price_value is not None
+            and min_price_value > max_price_value
+        ):
+            return None, None, Response(
+                {"error": "Minimum price cannot be greater than maximum price."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return min_price_value, max_price_value, None
+
+
     @action(detail=False, methods=['get'], url_path='search')
     def search(self, request):
         """
@@ -311,62 +394,12 @@ class ProductViewSet(viewsets.ModelViewSet):
         if category_ids:
             qs = qs.filter(category_id__in=category_ids).distinct()
 
-        min_price = request.query_params.get('min_price')
-        max_price = request.query_params.get('max_price')
-
-        # FIX (Price range filter bug report, Sep 2026): min_price /
-        # max_price were passed straight into the queryset with no
-        # validation at all — negative values (e.g. min_price=-500) were
-        # silently accepted, and a "reversed" range (min_price greater
-        # than max_price, e.g. min_price=10000&max_price=5000) was also
-        # silently accepted and just returned zero results instead of
-        # telling the caller their range was invalid. Both are now
-        # rejected with a clear 400 error before touching the queryset.
-        min_price_value = None
-        if min_price is not None and min_price != '':
-            try:
-                min_price_value = Decimal(min_price)
-            except (InvalidOperation, ValueError):
-                return Response(
-                    {"error": "min_price must be a valid number."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            if min_price_value < 0:
-                return Response(
-                    {"error": "min_price cannot be negative."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-        max_price_value = None
-        if max_price is not None and max_price != '':
-            try:
-                max_price_value = Decimal(max_price)
-            except (InvalidOperation, ValueError):
-                return Response(
-                    {"error": "max_price must be a valid number."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            if max_price_value < 0:
-                return Response(
-                    {"error": "max_price cannot be negative."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-        if (
-            min_price_value is not None
-            and max_price_value is not None
-            and min_price_value > max_price_value
-        ):
-            return Response(
-                {
-                    "error": (
-                        "min_price cannot be greater than max_price. "
-                        "The range must go from the smaller value to the "
-                        "larger value, e.g. min_price=5000&max_price=10000."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        # Price range validation lives in _parse_price_range() so that
+        # /search/ and /low-stock/ share exactly the same rules and
+        # error messages. See the FIX notes inside that method.
+        min_price_value, max_price_value, price_error = self._parse_price_range(request)
+        if price_error is not None:
+            return price_error
 
         if min_price_value is not None:
             qs = qs.filter(price__gte=min_price_value)
@@ -520,6 +553,14 @@ class ProductViewSet(viewsets.ModelViewSet):
         Ab isके liye alag, chota LowStockProductSerializer use ho raha hai
         jo sirf doc-required fields return karta hai.
 
+        FIX (Frontend bug report, Sep 2026): the "chota" serializer above
+        had no price / category / image / sku / is_active, so the admin
+        Products table showed Rs. 0, blank category, no image and "No" on
+        website whenever Status = Low Stock was selected. It now returns
+        every field ProductListSerializer does (the original 4 doc fields
+        are all still there), and this endpoint also accepts
+        min_price / max_price / ordering like /products/search/ does.
+
         FIX (Frontend audit, Sep 2026): this endpoint used to return the
         FULL unpaginated list with no search/category params, so
         selecting "Low Stock" together with a text search or a category
@@ -531,10 +572,14 @@ class ProductViewSet(viewsets.ModelViewSet):
         Python since available_stock/low_stock_threshold isn't a single
         DB column to filter/order by directly).
         """
+        # FIX (Frontend bug report, Sep 2026): select_related/prefetch_related
+        # added because the serializer below now returns category and
+        # primary_image too — without them every row would trigger its own
+        # extra DB queries.
         qs = Product.objects.filter(
             is_active=True,
             is_delete=False,
-        )
+        ).select_related('category').prefetch_related('images')
 
         q = request.query_params.get('q')
         if q:
@@ -551,6 +596,34 @@ class ProductViewSet(viewsets.ModelViewSet):
             category_ids.extend([v.strip() for v in raw.split(',') if v.strip()])
         if category_ids:
             qs = qs.filter(category_id__in=category_ids)
+
+        # FIX (Frontend bug report, Sep 2026): price range and sorting
+        # were completely ignored here, so picking Status = "Low Stock"
+        # together with a Price range / Sort on the admin Products page
+        # returned EVERY low-stock product, unfiltered and unsorted.
+        # Same validation/messages as /products/search/.
+        min_price_value, max_price_value, price_error = self._parse_price_range(request)
+        if price_error is not None:
+            return price_error
+
+        if min_price_value is not None:
+            qs = qs.filter(price__gte=min_price_value)
+
+        if max_price_value is not None:
+            qs = qs.filter(price__lte=max_price_value)
+
+        # Same whitelist as /products/search/. 'id' is added as a
+        # tie-breaker so products with an equal price/name don't jump
+        # between pages. The Python list comprehension below keeps the
+        # queryset order, so the sort survives the low-stock comparison.
+        allowed_ordering_fields = {
+            'created_at', '-created_at',
+            'price', '-price',
+            'name', '-name',
+        }
+        ordering = request.query_params.get('ordering')
+        if ordering in allowed_ordering_fields:
+            qs = qs.order_by(ordering, 'id')
 
         # FIX (Cross-check, Sep 2026 — PDF Part 2 Item 5): was comparing
         # p.stock (the deprecated field, frozen since nothing updates it
@@ -572,10 +645,14 @@ class ProductViewSet(viewsets.ModelViewSet):
         # caller explicitly asks for a page.
         if "page" in request.query_params:
             page = self.paginate_queryset(low_stock_products)
-            serializer = LowStockProductSerializer(page, many=True)
+            serializer = LowStockProductSerializer(
+                page, many=True, context=self.get_serializer_context()
+            )
             return self.get_paginated_response(serializer.data)
 
-        serializer = LowStockProductSerializer(low_stock_products, many=True)
+        serializer = LowStockProductSerializer(
+            low_stock_products, many=True, context=self.get_serializer_context()
+        )
         return Response(serializer.data)
 
     @action(detail=True, methods=['post'], url_path='images',

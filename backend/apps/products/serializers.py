@@ -152,22 +152,26 @@ class ProductListSerializer(serializers.ModelSerializer):
 # ============================================================
 # UPDATED: LowStockProductSerializer with new stock fields
 # ============================================================
-class LowStockProductSerializer(serializers.ModelSerializer):
-    available_stock = serializers.SerializerMethodField()
+class LowStockProductSerializer(ProductListSerializer):
+    """
+    FIX (Frontend bug report, Sep 2026): this used to be a tiny standalone
+    serializer with only id/name/stock fields/threshold. The admin Products
+    page uses /products/low-stock/ when Status = "Low Stock" is selected and
+    renders the rows exactly like the normal product list, so the missing
+    price / category / primary_image / sku / is_active made every row show
+    Rs. 0, no category, no image and "No" under On Website.
 
-    class Meta:
-        model = Product
-        fields = [
-            "id",
-            "name",
-            "total_stock",
-            "reserved_stock",
-            "available_stock",
+    It now inherits everything from ProductListSerializer (price, category,
+    primary_image, sku, is_active, purchase_price, profit, in_stock, ...) and
+    keeps low_stock_threshold on top. The original fields — id, name,
+    total_stock, reserved_stock, available_stock, low_stock_threshold — are
+    all still present, so the dashboard low-stock widget keeps working.
+    """
+
+    class Meta(ProductListSerializer.Meta):
+        fields = list(ProductListSerializer.Meta.fields) + [
             "low_stock_threshold",
         ]
-
-    def get_available_stock(self, obj):
-        return obj.total_stock - obj.reserved_stock
 
 
 # ============================================================
