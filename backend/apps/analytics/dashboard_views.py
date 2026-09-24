@@ -1471,9 +1471,18 @@ class AnalyticsExportView(APIView):
                 Q(reason__icontains=search) |
                 Q(customer__name__icontains=search)
             )
-            ref_match = re.match(r'^ret-?(\d+)$', search, re.IGNORECASE)
-            if ref_match:
-                search_filter |= Q(id=int(ref_match.group(1)))
+            # FIX (Sep 2026 — ID search bug report): same ID spellings as
+            # the Returns table ("#RET-20", "RET 20", "#20", "20") — see
+            # reference_id_from_search() in apps/orders/return_views.py.
+            # Imported here to avoid a module-load-time dependency.
+            from apps.orders.return_views import reference_id_from_search
+            ref = reference_id_from_search(search, 'ret')
+            if ref:
+                ref_id, explicit = ref
+                if explicit:
+                    search_filter = Q(id=ref_id)
+                else:
+                    search_filter |= Q(id=ref_id)
             qs = qs.filter(search_filter)
 
         ordering_map = {
@@ -1517,9 +1526,16 @@ class AnalyticsExportView(APIView):
         search = (params.get('search') or '').strip()
         if search:
             search_filter = Q(message__icontains=search)
-            ref_match = re.match(r'^cmp-?(\d+)$', search, re.IGNORECASE)
-            if ref_match:
-                search_filter |= Q(id=int(ref_match.group(1)))
+            # FIX (Sep 2026 — ID search bug report): same ID spellings as
+            # the Complaints table ("#CMP-51", "CMP 51", "#51", "51").
+            from apps.orders.return_views import reference_id_from_search
+            ref = reference_id_from_search(search, 'cmp')
+            if ref:
+                ref_id, explicit = ref
+                if explicit:
+                    search_filter = Q(id=ref_id)
+                else:
+                    search_filter |= Q(id=ref_id)
             qs = qs.filter(search_filter)
 
         writer.writerow(['ID', 'Customer', 'Order Number', 'Type', 'Status', 'Priority', 'Created At'])

@@ -20,6 +20,7 @@ from apps.returns.complaint_serializers import (
 from apps.notifications.utils import create_notification, notify_store_admins
 from apps.returns.consumers import broadcast_complaint_message
 from .models import Order, Customer
+from .return_views import reference_id_from_search
 from apps.users.permissions import IsAdmin
 from apps.ai.audit import log_manual_admin_action as log_admin_action
 from core.pagination import StandardResultsPagination
@@ -70,9 +71,18 @@ class CreateComplaintView(generics.ListCreateAPIView):
         if search:
             search_filter = Q(message__icontains=search)
 
-            ref_match = re.match(r"^cmp-?(\d+)$", search, re.IGNORECASE)
-            if ref_match:
-                search_filter |= Q(id=int(ref_match.group(1)))
+            # FIX (Sep 2026 — ID search bug report): "#CMP-51", "CMP 51",
+            # "#51" etc. now work too, not just "CMP-51" — see
+            # reference_id_from_search() in return_views.py. A
+            # prefixed/"#" ID matches only that complaint; a bare number
+            # also matches the message text.
+            ref = reference_id_from_search(search, "cmp")
+            if ref:
+                ref_id, explicit = ref
+                if explicit:
+                    search_filter = Q(id=ref_id)
+                else:
+                    search_filter |= Q(id=ref_id)
 
             qs = qs.filter(search_filter)
 

@@ -22,6 +22,53 @@ from core.pagination import StandardResultsPagination
 from core.date_range import filter_by_date_range
 
 
+# NEW (Sep 2026 — Returns/Complaints ID search bug report): the admin table
+# shows a return's ID as "#RET-20" and a complaint's as "#CMP-51" (the
+# frontend builds that label from the numeric id), but search only
+# recognised the exact spelling "RET-20" / "CMP-51". Copying what's on
+# screen ("#RET-20"), or typing "RET 20", "ret_20", "#20" or just "20" found
+# nothing. Shared by the returns list, the complaints list and both CSV
+# exports (apps/analytics/dashboard_views.py) so they all understand the
+# same spellings.
+_REFERENCE_RE = re.compile(
+    r"^#?\s*(?:(?P<prefix>[a-z]+)\s*[-_ ]?\s*)?(?P<number>\d{1,9})$",
+    re.IGNORECASE,
+)
+
+
+def reference_id_from_search(search, prefix):
+    """
+    Reads a record ID out of a search box value.
+
+    Accepted spellings for prefix="ret" (any case): "#RET-20", "RET-20",
+    "ret20", "RET 20", "ret_20", "#20", "20".
+
+    Returns None when the text isn't an ID (or carries a DIFFERENT prefix,
+    e.g. "CMP-5" while searching returns) — the caller then just does its
+    normal text search.
+    Otherwise returns (id, explicit):
+      explicit=True  -> the text has a "#" or the prefix ("#RET-20",
+                        "RET-20", "#20"): it can only mean that ID, so the
+                        caller should match ONLY that record.
+      explicit=False -> a bare number ("20"): could equally be part of an
+                        order number or a name, so the caller should match
+                        the ID OR the normal text fields.
+    The number is capped at 9 digits so a huge value can never overflow
+    the database's integer column.
+    """
+    text = (search or "").strip()
+    match = _REFERENCE_RE.match(text)
+    if not match:
+        return None
+
+    given_prefix = match.group("prefix")
+    if given_prefix and given_prefix.lower() != prefix.lower():
+        return None
+
+    explicit = bool(given_prefix) or text.startswith("#")
+    return int(match.group("number")), explicit
+
+
 class CreateReturnView(APIView):
     """
     POST /api/v1/orders/{order_number}/return/
@@ -148,9 +195,17 @@ class ReturnListView(generics.ListAPIView):
                 | Q(customer__name__icontains=search)
             )
 
-            ref_match = re.match(r"^ret-?(\d+)$", search, re.IGNORECASE)
-            if ref_match:
-                search_filter |= Q(id=int(ref_match.group(1)))
+            # FIX (Sep 2026 — ID search bug report): "#RET-20", "RET 20",
+            # "#20" etc. now work too, not just "RET-20" — see
+            # reference_id_from_search(). A prefixed/"#" ID matches only
+            # that return; a bare number also matches the text fields.
+            ref = reference_id_from_search(search, "ret")
+            if ref:
+                ref_id, explicit = ref
+                if explicit:
+                    search_filter = Q(id=ref_id)
+                else:
+                    search_filter |= Q(id=ref_id)
 
             qs = qs.filter(search_filter)
 
