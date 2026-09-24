@@ -18,6 +18,7 @@ stripe.api_key = settings.STRIPE_SECRET_KEY
 logger = logging.getLogger(__name__)
 
 from django.db.models import Q, F, ExpressionWrapper, IntegerField
+from django.db.models.functions import Lower
 from django.db import transaction, IntegrityError
 from django.utils import timezone
 
@@ -1486,9 +1487,59 @@ class OrderTrackView(APIView):
 # ADMIN VIEWS
 # ============================================================
 
+# NEW (Sep 2026 — Orders sort bug report): ONE whitelist of every value the
+# admin Orders page's "Sort" dropdown can send as ?ordering=, shared by the
+# two admin order list endpoints below AND by the Orders CSV export
+# (apps/analytics/dashboard_views.py -> _export_orders), so the table and the
+# downloaded file can never sort differently. Before this, only
+# AdminOrderFilterView had a whitelist (created_at / total_amount only),
+# AdminOrderListView had none at all, and "order_number" / "customer_name"
+# were not supported anywhere — any unrecognised value was silently ignored,
+# which is why picking a sort option changed nothing.
+#
+#   ?ordering=created_at | -created_at      -> Oldest / Newest first
+#   ?ordering=total_amount | -total_amount  -> Amount low->high / high->low
+#   ?ordering=customer_name | -customer_name-> Customer name A-Z / Z-A
+#                                             (case-insensitive)
+#   ?ordering=order_number | -order_number  -> Order number A-Z / Z-A
+#
+# Every entry ends with a tie-breaker (created_at / id) so rows with an equal
+# amount or the same customer never reshuffle between requests or repeat/skip
+# across pages. Anything not listed here is ignored (default -created_at).
+ADMIN_ORDER_ORDERING_MAP = {
+    "created_at": ("created_at", "id"),
+    "-created_at": ("-created_at", "-id"),
+    "total_amount": ("total_amount", "-created_at", "id"),
+    "-total_amount": ("-total_amount", "-created_at", "id"),
+    "order_number": ("order_number",),
+    "-order_number": ("-order_number",),
+    "customer_name": (Lower("customer__name"), "-created_at", "id"),
+    "-customer_name": (Lower("customer__name").desc(), "-created_at", "id"),
+}
+
+
+def apply_admin_order_ordering(qs, ordering):
+    """
+    Applies ?ordering= to an Order queryset using ADMIN_ORDER_ORDERING_MAP.
+    A missing / unrecognised value leaves the queryset's existing ordering
+    (-created_at) untouched.
+    """
+    fields = ADMIN_ORDER_ORDERING_MAP.get(ordering)
+    if fields is None:
+        return qs
+    return qs.order_by(*fields)
+
+
 # Returns all orders for administrators.
 class AdminOrderListView(generics.ListAPIView):
-    """GET /api/v1/admin/orders/"""
+    """
+    GET /api/v1/admin/orders/
+
+    NEW (Sep 2026 — Orders sort bug report): now also accepts ?ordering=
+    (see ADMIN_ORDER_ORDERING_MAP above) — this endpoint ignored it
+    completely before, so any Sort option picked on the Orders page did
+    nothing when the page was served from here.
+    """
     serializer_class = AdminOrderListSerializer
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
     pagination_class = StandardResultsPagination
@@ -1498,10 +1549,13 @@ class AdminOrderListView(generics.ListAPIView):
         # NEW (Sep 2026 — payment_status column): select_related("payment")
         # so serializing payment_status for every row doesn't fire one
         # extra query per order.
-        return (
+        qs = (
             Order.objects.select_related("customer", "customer__user", "payment")
             .all()
             .order_by("-created_at")
+        )
+        return apply_admin_order_ordering(
+            qs, self.request.query_params.get("ordering")
         )
 
 # Allows admins to update order status.
@@ -1846,7 +1900,10 @@ class AdminOrderFilterView(generics.ListAPIView):
                  Drawer's orders tab so that one customer's full order
                  history can be sorted by Newest/Oldest/Amount server
                  -side instead of only re-sorting the loaded page.
-                 Defaults to -created_at when missing/invalid.)
+                 Defaults to -created_at when missing/invalid.
+                 UPDATED (Sep 2026): also customer_name / -customer_name
+                 and order_number / -order_number — see
+                 ADMIN_ORDER_ORDERING_MAP.)
     - page
     """
 
@@ -1855,12 +1912,9 @@ class AdminOrderFilterView(generics.ListAPIView):
     pagination_class = StandardResultsPagination
 
     # Fixed whitelist so no arbitrary/unsafe column name can be passed in.
-    ORDERING_MAP = {
-        "created_at": "created_at",
-        "-created_at": "-created_at",
-        "total_amount": "total_amount",
-        "-total_amount": "-total_amount",
-    }
+    # UPDATED (Sep 2026): now the shared module-level map (adds
+    # customer_name / order_number) so the CSV export sorts identically.
+    ORDERING_MAP = ADMIN_ORDER_ORDERING_MAP
 
 # Filters orders using status, customer, dates and search keywords.
     def get_queryset(self):
@@ -1936,9 +1990,7 @@ class AdminOrderFilterView(generics.ListAPIView):
 
         # Ordering (NEW) — only overrides the default -created_at when a
         # whitelisted value is actually passed in.
-        ordering = params.get("ordering")
-        if ordering in self.ORDERING_MAP:
-            qs = qs.order_by(self.ORDERING_MAP[ordering])
+        qs = apply_admin_order_ordering(qs, params.get("ordering"))
 
         return qs
 

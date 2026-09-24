@@ -987,13 +987,19 @@ class AnalyticsExportView(APIView):
         if product or category:
             qs = qs.distinct()
 
-        ordering_map = {
-            'created_at': 'created_at',
-            '-created_at': '-created_at',
-            'total_amount': 'total_amount',
-            '-total_amount': '-total_amount',
-        }
-        qs = qs.order_by(ordering_map.get(params.get('ordering'), '-created_at'))
+        # FIX (Sep 2026 — Orders sort bug report): sorting now uses the
+        # SAME shared whitelist as the admin Orders table
+        # (ADMIN_ORDER_ORDERING_MAP in apps/orders/views.py), so the CSV
+        # comes out in the exact order shown on screen — including the new
+        # customer_name / -customer_name and order_number / -order_number
+        # options. Only 4 values were supported here before, and any other
+        # sort the page offered was silently ignored. Imported inside the
+        # method to avoid a module-load-time dependency between the
+        # analytics and orders views.
+        from apps.orders.views import apply_admin_order_ordering
+
+        qs = qs.order_by('-created_at')
+        qs = apply_admin_order_ordering(qs, params.get('ordering'))
 
         writer.writerow(['Order Number', 'Customer', 'Total Amount', 'Status', 'Payment Status', 'Cancellation Reason', 'Created At'])
         for order in qs.select_related('customer', 'payment'):
