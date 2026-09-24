@@ -4,7 +4,7 @@ import re
 
 from rest_framework import generics, permissions
 from django.db.models import Q, Count, Sum, Value, DecimalField
-from django.db.models.functions import Coalesce, Replace
+from django.db.models.functions import Coalesce, Replace, Lower
 from .models import Customer, Order
 from .customer_serializers import CustomerAdminSerializer
 from apps.users.permissions import IsAdmin
@@ -42,6 +42,17 @@ class AdminCustomerListView(generics.ListAPIView):
     delivered) — matching CustomerAdminSerializer exactly, so the
     numbers shown on this list and the numbers used to sort it can
     never drift apart.
+
+    FIX (24 Sep 2026 — Customers Name sort bug): 'name' / '-name' were
+    missing from ALLOWED_ORDERING entirely, so selecting "Name: A-Z" or
+    "Name: Z-A" on the admin Customers page sent ?ordering=name /
+    ?ordering=-name, which get_queryset() didn't recognise — it silently
+    fell back to the else branch (-created_at), so the two Name options
+    had no visible effect. Added below using Lower('name') so sorting is
+    case-insensitive (e.g. "amir" sorts next to "Amir", not after every
+    uppercase name) — same approach as the matching fix in
+    AnalyticsExportView._export_customers (apps/analytics/dashboard_views.py)
+    so the on-screen list and the CSV export always agree.
     """
     serializer_class = CustomerAdminSerializer
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
@@ -54,6 +65,8 @@ class AdminCustomerListView(generics.ListAPIView):
         '-total_orders': '-_total_orders',
         'total_spent': '_total_spent',
         '-total_spent': '-_total_spent',
+        'name': Lower('name'),
+        '-name': Lower('name').desc(),
     }
 
 # Fetches all customers and applies search + order-status filters if provided.
