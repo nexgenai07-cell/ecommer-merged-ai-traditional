@@ -240,3 +240,55 @@ def send_email_change_notice(old_email, new_email):
     except Exception:
         logger.exception("send_email_change_notice: failed to notify %s", old_email)
         return False
+
+
+def send_phone_change_code(user, new_phone, code):
+    """
+    NEW (Sep 2026 — Profile: editable phone with OTP verification,
+    code-entry flow).
+
+    Unlike send_email_change_code (which emails the code to the NEW
+    address being verified), this is sent to the account's EXISTING,
+    already-verified email — because there is no SMS gateway to text the
+    new phone number, and this step is really about confirming the
+    person changing the number is the real account owner, not about
+    confirming they own that new number. Same 6-digit / 10-minute
+    pattern as every other OTP flow in this file.
+    """
+    subject = "Confirm your new phone number"
+    message = (
+        f"Your phone number change verification code is: {code}\n\n"
+        f"You requested to change your phone number to {new_phone}. "
+        "Enter this code in the app to confirm the change. "
+        "This code is valid for 10 minutes. If you did not request this, "
+        "please ignore this email and your phone number will stay "
+        "unchanged."
+    )
+    html_message = f"""
+        <html>
+            <body>
+                <h2>Confirm your new phone number</h2>
+                <p>You requested to change your phone number to
+                <strong>{new_phone}</strong>.</p>
+                <p>Use this code to confirm the change:</p>
+                <h1 style="letter-spacing: 4px;">{code}</h1>
+                <p>This code is valid for 10 minutes.</p>
+                <p>If you did not request this, you can safely ignore this
+                email — your phone number will not change.</p>
+            </body>
+        </html>
+    """
+
+    try:
+        email_msg = EmailMultiAlternatives(
+            subject=subject,
+            body=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[user.email],
+        )
+        email_msg.attach_alternative(html_message, "text/html")
+        email_msg.send(fail_silently=False)
+        return True
+    except Exception:
+        logger.exception("send_phone_change_code: failed to send code to %s", user.email)
+        return False

@@ -41,6 +41,12 @@ from .email_change_views import (
     ConfirmEmailChangeView,
 )
 
+# NEW (Sep 2026 — Profile: editable phone with OTP code-entry verification)
+from .phone_change_views import (
+    RequestPhoneChangeView,
+    ConfirmPhoneChangeView,
+)
+
 urlpatterns = [
 
     # ==========================================================
@@ -239,4 +245,23 @@ urlpatterns = [
         ConfirmEmailChangeView.as_view(),
         name="me_email_confirm",
     ),
-]                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+
+    # ==========================================================
+    # NEW: Phone Change (OTP code-entry verified) — profile page
+    # "edit phone number". Distinct from send-phone-verification/ &
+    # verify-phone/ above, which are the LINK-based checkout re-verify
+    # flow; this is the CODE-based flow used from the Profile page.
+    # ==========================================================
+
+    path(
+        "me/phone/change/",
+        RequestPhoneChangeView.as_view(),
+        name="me_phone_change",
+    ),
+
+    path(
+        "me/phone/confirm/",
+        ConfirmPhoneChangeView.as_view(),
+        name="me_phone_confirm",
+    ),
+]

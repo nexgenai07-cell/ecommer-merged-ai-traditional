@@ -353,10 +353,20 @@ class UserProfileSerializer(serializers.ModelSerializer):
             # endpoint can never silently move the account to an
             # unverified address.
             'email',
+            # NEW (Sep 2026 — Profile: phone with OTP code-entry
+            # verification): phone is now read-only here too, for the
+            # same reason email is — changing it goes through the
+            # dedicated verify-then-save flow instead
+            # (POST /me/phone/change/ + /me/phone/confirm/, see
+            # phone_change_views.py), so a plain PUT/PATCH to this
+            # endpoint can no longer save a new phone number directly,
+            # and phone_verified can never go stale/mismatched again.
+            'phone',
             'role',
             'email_verified',
             # phone_verified is only ever set by VerifyEmailView /
-            # VerifyPhoneView, never by a direct profile PUT/PATCH.
+            # VerifyPhoneView / ConfirmPhoneChangeView, never by a
+            # direct profile PUT/PATCH.
             'phone_verified',
             'two_factor_enabled',
             'addresses',

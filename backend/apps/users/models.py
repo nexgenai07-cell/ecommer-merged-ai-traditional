@@ -259,3 +259,34 @@ class EmailChangeRequest(models.Model):
 
     def is_valid(self):
         return timezone.now() < self.otp_expires_at
+
+
+# NEW (Sep 2026 — Profile: editable phone with OTP verification, code-entry
+# flow): mirrors EmailChangeRequest exactly, but the 6-digit code is emailed
+# to the account's ALREADY-registered email address (not texted to the new
+# phone — no SMS gateway exists in this project, same reasoning as
+# PhoneVerification above), since the whole point is proving the person
+# sitting in the app right now is the real account owner, not proving they
+# control the new phone number itself.
+#
+# One row per user (OneToOneField) — requesting a new change overwrites any
+# still-pending one, so only the most recently requested code is ever valid.
+class PhoneChangeRequest(models.Model):
+    user           = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='phone_change_request',
+    )
+    new_phone      = models.CharField(max_length=20)
+    otp_code       = models.CharField(max_length=6)
+    otp_expires_at = models.DateTimeField()
+    created_at     = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'phone_change_requests'
+
+    def __str__(self):
+        return f'{self.user.email} -> {self.new_phone}'
+
+    def is_valid(self):
+        return timezone.now() < self.otp_expires_at
