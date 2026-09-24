@@ -1493,9 +1493,16 @@ class AnalyticsExportView(APIView):
         }
         qs = qs.order_by(ordering_map.get(params.get('ordering'), '-created_at'))
 
-        writer.writerow(['Order Number', 'Customer', 'Reason', 'Status', 'Created At', 'Resolved At'])
+        # FIX (Sep 2026 — export ID bug report): the CSV had no Return ID at
+        # all, so a row couldn't be matched back to the "#RET-20" shown in
+        # the admin Returns table. Added as the first column, written in
+        # exactly the format the table displays (the frontend builds that
+        # label from the numeric id). It can also be pasted straight into
+        # the Returns search box.
+        writer.writerow(['Return ID', 'Order Number', 'Customer', 'Reason', 'Status', 'Created At', 'Resolved At'])
         for r in qs:
             writer.writerow([
+                f'#RET-{r.id}',
                 r.order.order_number, r.customer.name if r.customer else '',
                 r.reason, r.status, r.created_at, r.resolved_at or '',
             ])
@@ -1541,7 +1548,10 @@ class AnalyticsExportView(APIView):
         writer.writerow(['ID', 'Customer', 'Order Number', 'Type', 'Status', 'Priority', 'Created At'])
         for c in qs:
             writer.writerow([
-                c.id, c.customer.name, c.order.order_number if c.order else '',
+                # FIX (Sep 2026 — export ID bug report): was the bare
+                # number (51); now "#CMP-51", exactly as the admin
+                # Complaints table shows it.
+                f'#CMP-{c.id}', c.customer.name, c.order.order_number if c.order else '',
                 c.type, c.status, c.priority, c.created_at,
             ])
 
