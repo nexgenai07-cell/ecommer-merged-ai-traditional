@@ -1203,18 +1203,25 @@ class AnalyticsExportView(APIView):
         # Same validation + messages as /products/search/: bad number,
         # negative, or a reversed range -> 400 (used to be a 500 / an
         # empty file).
+        #
+        # UPDATED (Sep 2026 - user-friendly price errors): messages are
+        # now the same short, plain-language sentences /products/search/
+        # returns (see ProductViewSet._parse_price_range), instead of the
+        # old technical "min_price cannot be greater than max_price. The
+        # range must go from..." string.
         def _parse_price(key):
             raw = params.get(key)
             if raw is None or raw == '':
                 return None
+            label = 'minimum' if key == 'min_price' else 'maximum'
             try:
                 value = Decimal(raw)
             except (InvalidOperation, ValueError):
-                raise ValidationError({'error': f'{key} must be a valid number.'})
+                raise ValidationError({'error': f'Please enter a valid {label} price.'})
             if not value.is_finite():
-                raise ValidationError({'error': f'{key} must be a valid number.'})
+                raise ValidationError({'error': f'Please enter a valid {label} price.'})
             if value < 0:
-                raise ValidationError({'error': f'{key} cannot be negative.'})
+                raise ValidationError({'error': f'{label.capitalize()} price cannot be negative.'})
             return value
 
         min_price = _parse_price('min_price')
@@ -1222,11 +1229,7 @@ class AnalyticsExportView(APIView):
 
         if min_price is not None and max_price is not None and min_price > max_price:
             raise ValidationError({
-                'error': (
-                    'min_price cannot be greater than max_price. '
-                    'The range must go from the smaller value to the '
-                    'larger value, e.g. min_price=5000&max_price=10000.'
-                )
+                'error': 'Minimum price cannot be greater than maximum price.'
             })
 
         if min_price is not None:
@@ -1307,8 +1310,24 @@ class AnalyticsExportView(APIView):
             'product_count': '_product_count',
             '-product_count': '-_product_count',
         }
-        qs = qs.annotate(_product_count=Count('products', distinct=True))
-        qs = qs.order_by(ordering_map.get(params.get('ordering'), 'name'))
+        # FIX (Categories export mismatch report, Sep 2026): "Product
+        # Count" in this CSV counted EVERY product row (including
+        # inactive and soft-deleted ones), while the admin Categories
+        # table (CategorySerializer.get_product_count) only counts
+        # is_active=True products - so the same category showed e.g.
+        # "4 items" on screen but 7 in the exported file, and "Most
+        # Products" sorted differently in the two places. Counts exactly
+        # what the table counts now, and uses the same "name"/"id"
+        # tie-breakers as CategoryViewSet.get_queryset() so equal counts
+        # come out in the same order as on screen.
+        qs = qs.annotate(
+            _product_count=Count(
+                'products',
+                filter=Q(products__is_active=True),
+                distinct=True,
+            )
+        )
+        qs = qs.order_by(ordering_map.get(params.get('ordering'), 'name'), 'name', 'id')
 
         writer.writerow(['Name', 'Is Active', 'Product Count', 'Created At'])
         for c in qs:
