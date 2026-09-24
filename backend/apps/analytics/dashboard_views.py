@@ -17,6 +17,7 @@ from django.db.models.functions import (
     TruncYear,
     Coalesce,
     Replace,
+    Lower,
 )
 from django.utils import timezone
 
@@ -1653,6 +1654,16 @@ class AnalyticsExportView(APIView):
             '-total_orders': '-_total_orders',
             'total_spent': '_total_spent',
             '-total_spent': '-_total_spent',
+            # FIX (24 Sep 2026 — Customers Name sort bug): 'name'/'-name'
+            # were missing from this map, so selecting "Name: A-Z" or
+            # "Name: Z-A" on the Customers page silently fell back to
+            # '-created_at' when exporting (Customer.objects.all() has no
+            # default ordering either, but 'ordering' was never passed
+            # through to order_by for these two values). Kept case-
+            # insensitive with Lower() so 'apple' and 'Banana' sort
+            # correctly relative to each other, matching AdminCustomerListView.
+            'name': Lower('name'),
+            '-name': Lower('name').desc(),
         }
         qs = qs.order_by(ordering_map.get(params.get('ordering'), '-created_at'))
 
