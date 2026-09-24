@@ -4,7 +4,7 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
-from django.db.models import Count
+from django.db.models import Count, Q
 
 from .models import Category
 from .serializers import CategorySerializer
@@ -86,12 +86,34 @@ class CategoryViewSet(viewsets.ModelViewSet):
         # Count" column/sort needs it, so it's annotated here the same
         # way total_orders/total_spent are annotated for the admin
         # customer list, purely so the DB can filter/sort by it too.
+        #
+        # FIX (Categories sort bug report, Sep 2026): "Most Products" /
+        # "Fewest Products" sorted by a DIFFERENT number than the one the
+        # table shows. The "Products Count" column comes from
+        # CategorySerializer.get_product_count(), which only counts
+        # is_active=True products, but this annotation counted EVERY
+        # product row (including inactive and soft-deleted ones). A
+        # category with e.g. 2 active + 4 deleted products showed "2 items"
+        # but was sorted as if it had 6. The annotation now counts exactly
+        # what the serializer shows.
         queryset = queryset.annotate(
-            _product_count=Count("products", distinct=True)
+            _product_count=Count(
+                "products",
+                filter=Q(products__is_active=True),
+                distinct=True,
+            )
         )
 
+        # FIX (Categories sort bug report, Sep 2026): "name" and "id" are
+        # added as tie-breakers. Many categories share the same product
+        # count (e.g. several with 5 items), and without a tie-breaker the
+        # database is free to return equal rows in any order — so the
+        # list could reshuffle between requests and rows could repeat or
+        # go missing across pages.
         ordering = params.get("ordering")
-        queryset = queryset.order_by(self.ORDERING_MAP.get(ordering, "name"))
+        queryset = queryset.order_by(
+            self.ORDERING_MAP.get(ordering, "name"), "name", "id"
+        )
 
         return queryset
 
