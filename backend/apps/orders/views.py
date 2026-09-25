@@ -1365,6 +1365,20 @@ class OrderCancelView(APIView):
                 order.payment.refunded_at = timezone.now()
                 order.payment.save()
 
+                # NEW (Sep 2026 — refund step missing from Order Timeline):
+                # payment.status flips to "refunded" and a "Refund
+                # processed" notification already goes out below, but
+                # nothing was pushing a matching entry into
+                # status_history — so the Order Timeline only ever showed
+                # CONFIRMED and CANCELLED, never the refund itself, even
+                # though it happened. Recorded here, right next to the
+                # payment update, so the timeline reflects it too.
+                OrderStatusHistory.record(
+                    order,
+                    "refunded",
+                    note=f"Rs. {order.payment.amount} refunded",
+                )
+
         # FIX (B28): customer-initiated cancellation previously created no
         # notification at all, unlike the admin-initiated path — so the
         # customer had nothing confirming the cancellation actually
@@ -1836,6 +1850,19 @@ class AdminOrderStatusUpdateView(APIView):
         ).start()
 
         if new_status == "cancelled" and was_paid_before_cancel:
+            # NEW (Sep 2026 — refund step missing from Order Timeline):
+            # same gap as the customer-initiated cancel path — payment
+            # was already flipped to "refunded" above and the "Refund
+            # processed" notification below already existed, but no
+            # status_history entry was ever pushed for the refund itself,
+            # so the admin-cancelled path's Order Timeline was missing it
+            # too. Recorded here, alongside the refund notification.
+            OrderStatusHistory.record(
+                order,
+                "refunded",
+                note=f"Rs. {order.payment.amount} refunded",
+            )
+
             # NEW (Sep 2026 — refund notification): same fix as the
             # customer-initiated cancel path — a dedicated notification
             # naming the refunded amount, in addition to the existing

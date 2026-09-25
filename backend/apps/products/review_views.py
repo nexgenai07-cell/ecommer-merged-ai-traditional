@@ -114,6 +114,37 @@ class ProductReviewListCreateView(APIView):
             order__status="delivered",
         ).exists()
 
+        # NEW (Sep 2026 — review eligibility bug): a review used to be
+        # accepted from ANY logged-in user regardless of whether they had
+        # ever bought this exact product — is_verified_purchase was only
+        # ever a cosmetic "Verified Purchase" badge on the response, it
+        # was never actually enforced as a requirement to post a review
+        # in the first place. Now a non-admin customer must have at
+        # least one DELIVERED order containing this specific product
+        # (the same check already used for is_verified above) before
+        # they're allowed to review it at all — buying a different
+        # product, or this same product but not yet delivered, no
+        # longer qualifies. Admins are exempt from this check: they were
+        # already able to post a review that shows up anonymously
+        # (never expected to have bought the product themselves), and
+        # that existing behaviour is unchanged here.
+        is_admin = (
+            request.user.is_authenticated and request.user.role == "admin"
+        )
+
+        if not is_admin and not is_verified:
+            return Response(
+                {
+                    "error": (
+                        "You can only review products you have "
+                        "purchased and received. This product needs to "
+                        "be delivered to your account before you can "
+                        "leave a review."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         review = Review.objects.create(
             product=product,
             user=request.user,

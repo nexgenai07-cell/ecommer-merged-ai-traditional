@@ -16,7 +16,7 @@ from apps.returns.serializers import (
 )
 from apps.notifications.utils import create_notification, notify_store_admins
 from apps.ai.audit import log_manual_admin_action as log_admin_action
-from .models import Order
+from .models import Order, OrderStatusHistory
 from apps.users.permissions import IsAdmin
 from core.pagination import StandardResultsPagination
 from core.date_range import filter_by_date_range
@@ -299,6 +299,22 @@ class AdminReturnStatusUpdateView(APIView):
         }
 
         title, message = notification_text[return_request.status]
+
+        # NEW (Sep 2026 — return step missing from Order Timeline): same
+        # gap as the refund step (see OrderCancelView / 
+        # AdminOrderStatusUpdateView) — an approved return changed
+        # Return.status and fired a notification, but nothing ever
+        # pushed a matching entry into the order's status_history, so
+        # the Order Timeline never showed that the order was returned.
+        # Recorded here, with the exact date/time it was approved, just
+        # like every other timeline entry. A rejected return isn't a
+        # change to the order itself, so it isn't logged here.
+        if return_request.status == "approved":
+            OrderStatusHistory.record(
+                return_request.order,
+                "returned",
+                note=f"Return approved: {return_request.reason}",
+            )
 
         create_notification(
             user=return_request.customer.user,

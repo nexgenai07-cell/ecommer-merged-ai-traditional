@@ -45,6 +45,15 @@ stripe.api_key = settings.STRIPE_SECRET_KEY
 # rejection permanently cancels the order and re-upload is refused.
 MAX_QR_REJECTION_ATTEMPTS = 3
 
+# NEW (Sep 2026 — QR rejection notice missing the re-upload deadline):
+# same 1-hour window as QR_REJECTED_TIMEOUT in
+# apps/orders/management/commands/cancel_stale_payments.py — that command
+# is what actually auto-cancels the order once this window passes.
+# Kept as a separate local constant (rather than importing the
+# management command module here) purely for display text below; if the
+# real timeout ever changes, update both.
+QR_REUPLOAD_WINDOW_HOURS = 1
+
 
 # FIX (Sep 2026 — Dashboard revenue not updating after payment approval):
 # DashboardView (apps/analytics/dashboard_views.py) caches its response
@@ -993,7 +1002,17 @@ class AdminQRPaymentRejectView(APIView):
                 f"Your QR payment for order #{order_number} has been "
                 f"rejected. Reason: {reason}. Please re-upload a valid "
                 f"payment proof — you have {attempts_left} attempt(s) "
-                "left before this order is cancelled."
+                "left before this order is cancelled. "
+                # NEW (Sep 2026 — QR rejection notice missing the
+                # re-upload deadline): the customer previously wasn't
+                # told the actual time limit, only that "attempts" were
+                # left — but cancel_stale_payments.py auto-cancels the
+                # order 1 hour after this rejection regardless of
+                # attempts remaining, so the notice now says so
+                # explicitly.
+                f"You have {QR_REUPLOAD_WINDOW_HOURS} hour to re-upload "
+                "your payment proof, or this order will be "
+                "automatically cancelled."
             )
 
         create_notification(
