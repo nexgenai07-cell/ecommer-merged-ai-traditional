@@ -358,6 +358,15 @@ class ProductViewSet(viewsets.ModelViewSet):
           4. FIX (A1): 'q' ab sirf name/description nahi, sku bhi match
              karta h — ?q=ELE-BUL-A1C9 ab us product ko dhoond leta h
              chahe wo string name mei kahin na ho.
+          4b. UPDATED (Sep 2026 — search scope change, backend request): SKU
+             ab 'q' mein match nahi hota — frontend ka navbar placeholder
+             ab sirf "Search by product name or category" kehta hai, is
+             liye backend bhi sirf name/category tak scope kar diya gaya
+             hai (SKU pehle hi hata diya gaya tha; is round mein
+             `description` bhi hata di gayi hai, kyunki frontend ka
+             scope sirf do cheezon — product name aur category — tak
+             hi limit karna tha, taake koi bhi teesra field match na ho
+             jo placeholder se match na kare).
           5. FIX (A1): 'in_stock=false' pehle silently ignore ho raha tha
              (sirf 'true' check hota tha), is liye out-of-stock filter
              kabhi lagta hi nahi tha aur count hamesha poore catalog ka
@@ -378,10 +387,15 @@ class ProductViewSet(viewsets.ModelViewSet):
             # category name (e.g. "Shoes") into the navbar search got
             # zero results because q only matched name/description/sku,
             # even though the category itself exists.
+            #
+            # UPDATED (Sep 2026 — search scope change, backend request):
+            # `description` removed from this filter (SKU was already
+            # not matched here) — matching is now limited to exactly
+            # product name + category, same two fields the navbar's
+            # "Search by product name or category" placeholder promises,
+            # and the same scope the /suggestions/ dropdown already uses.
             qs = qs.filter(
                 Q(name__icontains=q) |
-                Q(description__icontains=q) |
-                Q(sku__icontains=q) |
                 Q(category__name__icontains=q)
             )
 
@@ -505,14 +519,18 @@ class ProductViewSet(viewsets.ModelViewSet):
         /search/ exists but returns the full paginated catalog matching
         `q`, not a short ranked list meant for a live dropdown. This is
         a dedicated, lightweight endpoint for that dropdown:
-          - only returns products that actually match `q` (name, SKU,
-            or category name) — nothing unrelated is ever returned
+          - only returns products that actually match `q` (name or
+            category name) — nothing unrelated is ever returned
           - ranked by relevance: name starts with `q` first, then name
-            contains `q`, then SKU/category matches
+            contains `q`, then category matches
           - capped at 6 results, no pagination — a dropdown doesn't need
             {count, next, previous}, just a short list
           - empty/missing `q` returns an empty list instead of dumping
             the whole catalog into the dropdown
+
+        UPDATED (Sep 2026 — search scope change, backend request): SKU
+        removed from matching and from the relevance ranking, to match
+        the navbar's "Search by product name or category" placeholder.
         """
         q = request.query_params.get('q', '').strip()
         if not q:
@@ -520,7 +538,6 @@ class ProductViewSet(viewsets.ModelViewSet):
 
         qs = self.get_queryset().filter(
             Q(name__icontains=q) |
-            Q(sku__icontains=q) |
             Q(category__name__icontains=q)
         ).distinct()
 
@@ -528,7 +545,6 @@ class ProductViewSet(viewsets.ModelViewSet):
             _relevance=Case(
                 When(name__istartswith=q, then=Value(0)),
                 When(name__icontains=q, then=Value(1)),
-                When(sku__icontains=q, then=Value(2)),
                 default=Value(3),
                 output_field=IntegerField(),
             )

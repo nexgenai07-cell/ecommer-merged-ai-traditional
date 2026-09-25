@@ -31,6 +31,17 @@ from apps.ai.admin_tools.analytics_tools import detect_date_range_hint
 # Models retry/fallback handling function (Agar primary model fail ho to next model try karta hai)
 from apps.ai.gemini_utils import call_with_model_fallback 
 
+# FIX — CRITICAL BUG: pehle ye dono sirf make_nvidia_attempt() ke andar
+# LOCALLY import hote thay. make_groq_attempt() unhe bina import kiye
+# hi use kar raha tha — is liye jab bhi saare NVIDIA models fail ho kar
+# Groq fallback tak pohanchte, ye NameError se turant crash ho jata
+# (NVIDIA list bhi stale thi — dono milakar HAR admin message pe generic
+# "kuch masla ho gaya hai" error deते thay, chahe message kuch bhi ho).
+# Ab module-level import hai — dono attempt() functions (NVIDIA aur
+# Groq) isay bina crash ke use kar sakte hain.
+from apps.ai.admin_response_metadata import extract_admin_metadata
+from apps.ai.suggestions import get_admin_followup_suggestions
+
 # Is specific file ke liye diagnostic logger initialize kar rahe hain
 logger = logging.getLogger("ai.admin_agent") 
 
@@ -47,14 +58,12 @@ def _detect_admin_language_hint(text: str) -> str:
     - Agar input mein Urdu/Arabic characters hain -> AI Urdu Script mein reply karega.
     - Agar input English/Roman Urdu mein hai -> AI Latin/Roman script mein reply karega.
     """
-    # Check kar rahe hain ke text exist karta hai aur usme Urdu characters hain ya nahi
     if text and _URDU_SCRIPT_PATTERN.search(text):
         return (
             "The admin's CURRENT message is written in Urdu (Arabic) script. "
             "Reply in Urdu script only."
         )
     
-    # Agar Urdu characters nahi milte to Latin/Roman script ka instruction return karte hain
     return (
         "The admin's CURRENT message is written in Latin/Roman script (English "
         "letters), NOT Urdu (Arabic) script and NOT Hindi (Devanagari) script — "
@@ -358,10 +367,8 @@ def _build_executor(llm, session_key, user):
     EXECUTIVE PIPELINE BUILDER:
     LLM Model, Admin Tools aur Prompt Template ko combine kar ke LangChain Agent Executor banata hai.
     """
-    # User aur session context ke mutabiq available tools fetch karte hain
     tools = get_admin_agent_tools(session_key, user)
 
-    # Prompt Template create karte hain jisme SYSTEM_PROMPT, history, user input aur scratchpad (tool logs) shaamil hain
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
         MessagesPlaceholder("chat_history", optional=True),
@@ -369,15 +376,13 @@ def _build_executor(llm, session_key, user):
         MessagesPlaceholder("agent_scratchpad"),
     ])
 
-    # LLM, Tools aur Prompt ko mila kar tool-calling agent banate hain
     agent = create_tool_calling_agent(llm, tools, prompt)
 
-    # AgentExecutor object return karte hain jo actual execution control karta hai
     return AgentExecutor(
         agent=agent,
         tools=tools,
-        verbose=settings.DEBUG,  # Debugging mode mein verbose logs prints honge
-        return_intermediate_steps=True,  # Intermediate tool steps save karega
+        verbose=settings.DEBUG,
+        return_intermediate_steps=True,
     )
 
 
@@ -386,44 +391,50 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
     MAIN ENTRY POINT FUNCTION:
     Admin Dashboard ka chat consumer sabse pehle is function ko call karta hai.
     """
-    # Chat history ensure karte hain ke list format mein ho
     chat_history = chat_history or []
     
-    # Hints ko format kar ke local variables mein ready kar rahe hain
     date_range_hint = _format_date_range_hint(detect_date_range_hint(user_input))
     pending_action_hint_text = _format_pending_action_hint(pending_action_hint)
     active_product_hint_text = _format_active_product_hint(active_product_hint)
     language_hint = _detect_admin_language_hint(user_input)
 
     # NVIDIA Models chain (Priority wise: Primary pehle, baki fallbacks hain)
+    #
+    # FIX (2026-09-25) — pehle wali list ("openai/gpt-oss-120b",
+    # "deepseek-ai/deepseek-v4-flash", "deepseek-ai/deepseek-v4-pro",
+    # "nvidia/nemotron-3-super-120b-a12b") NVIDIA ki taraf se decommission
+    # (410 Gone) ya inaccessible (403 Forbidden) ho chuki thi — isi wajah
+    # se EVERY admin message pe saare 5 NVIDIA attempts fail ho kar Groq
+    # fallback tak pohanchte thay (aur Groq fallback mein neeche wala
+    # NameError bug bhi tha — dono milakar har message pe generic error
+    # deta tha, chahe admin kuch bhi likhe). Ye list shopping_agent.py
+    # wali already-verified currently-active NVIDIA model IDs se sync ki
+    # gayi hai. Agar future mein koi model dobara 410/403 de, sirf yahan
+    # se replace kar dena.
     NVIDIA_MODEL_CHAIN = [
-        ("openai/gpt-oss-120b", {}),                # Primary Model
-        ("deepseek-ai/deepseek-v4-flash", {}),      # Fast Fallback 1
-        ("deepseek-ai/deepseek-v4-pro", {}),        # Reasoning Fallback 2
-        ("nvidia/nemotron-3-super-120b-a12b", {}),  # Agentic Fallback 3
-        ("meta/llama-3.3-70b-instruct", {}),        # Stable Fallback 4
+        ("meta/llama-3.3-70b-instruct", {}),                 # Primary Model — currently active, reliable tool-calling
+        ("deepseek-ai/deepseek-v4-flash-0731", {}),          # Fast Fallback 1 — dated slug (base slug EOL ho chuka)
+        ("qwen/qwen3-next-80b-a3b-instruct", {}),            # Reasoning Fallback 2
+        ("nvidia/llama-3.3-nemotron-super-49b-v1", {}),      # Agentic Fallback 3 — NVIDIA's own agentic model, currently active slug
     ]
 
     def make_nvidia_attempt(model_id, extra_kwargs):
         """Helper closure: NVIDIA model calling logic ko wrap karta hai."""
         def attempt():
-            # OpenAI API-compatible format mein NVIDIA model setup karte hain
             llm = ChatOpenAI(
                 model=model_id,
                 api_key=settings.NVIDIA_API_KEY,
                 base_url="https://integrate.api.nvidia.com/v1",
                 temperature=0.2,
-                max_retries=0,  # Automatic internal retries disable hain (hamara custom fallback control karega)
-                timeout=8,      # Maximum 8 seconds wait limit
+                max_retries=0,
+                timeout=8,
                 **extra_kwargs,
             )
             
-            # Agent Executor initialize karte hain
             executor = _build_executor(llm, session_key, user)
 
             logger.warning(f"[admin_agent] TRYING model={model_id}")
 
-            # Agent ko run/invoke kar rahe hain
             result = executor.invoke({
                 "input": user_input,
                 "chat_history": chat_history,
@@ -433,7 +444,6 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
                 "language_hint": language_hint,
             })
 
-            # Check karte hain ke is turn mein AI ne kaun se tools use kiye
             steps = result.get("intermediate_steps", [])
             tool_names = [step[0].tool for step in steps] if steps else []
             logger.warning(
@@ -441,13 +451,9 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
             )
 
             # Execution Result se Extra Metadata aur Suggestions extract karte hain
-            from apps.ai.admin_response_metadata import extract_admin_metadata
-            from apps.ai.suggestions import get_admin_followup_suggestions
-
             metadata = extract_admin_metadata(result.get("intermediate_steps", []))
             suggestions = get_admin_followup_suggestions(metadata.get('pending_action'), steps)
 
-            # Output text, metadata, aur follow-up chips/suggestions return karte hain
             return result["output"], metadata, suggestions
         return attempt
 
@@ -473,20 +479,22 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
             return result["output"], metadata, suggestions
         return attempt
 
-    # Primary NVIDIA model attempt construct karte hain
     primary_model_id, primary_kwargs = NVIDIA_MODEL_CHAIN[0]
     nvidia_attempt = make_nvidia_attempt(primary_model_id, primary_kwargs)
 
-    # Bakaya NVIDIA models ki fallback list banate hain
     fallback_fns = [
         make_nvidia_attempt(model_id, extra_kwargs)
         for model_id, extra_kwargs in NVIDIA_MODEL_CHAIN[1:]
     ]
 
     # Agar GROQ_API_KEY mojood ho to Groq models ko bhi last-resort fallbacks mein add kar dete hain
+    #
+    # FIX (2026-09-25) — "llama-3.3-70b-versatile" aur "llama-3.1-8b-instant"
+    # Groq ne 16 Aug 2026 ko decommission kar diye thay (404 model_not_found)
+    # — yahi bug shopping_agent.py mein bhi tha aur wahan fix ho chuka hai.
+    # Groq ki official replacement recommendation follow ki gayi hai.
     if settings.GROQ_API_KEY:
-        fallback_fns.append(make_groq_attempt("llama-3.3-70b-versatile"))
-        fallback_fns.append(make_groq_attempt("llama-3.1-8b-instant"))
+        fallback_fns.append(make_groq_attempt("openai/gpt-oss-120b"))
+        fallback_fns.append(make_groq_attempt("openai/gpt-oss-20b"))
 
-    # Primary attempt chalate hain. Agar wo fail ho to call_with_model_fallback baari baari fallback_fns try karega
     return call_with_model_fallback(nvidia_attempt, fallback_fns=fallback_fns)
