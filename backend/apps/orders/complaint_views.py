@@ -250,7 +250,7 @@ class ComplaintMessageView(APIView):
                 "sender_name": msg.sender.name,
                 "sender_role": "admin" if msg.sender.role == "admin" else "customer",
                 "message": msg.message,
-                "created_at": msg.created_at,
+                "created_at": complaint_message.created_at.istoformat(),
             }
             for msg in messages
         ]
