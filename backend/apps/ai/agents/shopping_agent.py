@@ -411,21 +411,23 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
     # Order = priority: [0] primary, baaki fallback (upar wala fail ho
     # tabhi neeche wala try hota hai).
     #
-    # UPDATED — admin ki request pe (data-accuracy/tool-calling reliability
-    # behtar karne ki umeed mein) "openai/gpt-oss-120b" ko wapis PRIMARY
-    # bana diya. NOTE: production logs (2026-08-03) mein isay consistently
-    # slow/unreliable paya gaya tha (~21s fail hone mein) — lekin us waqt
-    # ka slow-fallback bug (gemini-key-count-based retry loop) alag se fix
-    # ho chuka hai, is liye ab worst-case sirf ~8s (single timeout) lagega
-    # is model ke fail hone tak, phir turant deepseek-v4-flash pe fallback
-    # ho jayega. Agar response time phir bhi kharab lage, is list ka order
-    # wapis palat dena (deepseek-v4-flash ko index 0 pe le aana).
+    # FIX (2026-09-25) — saare purane model IDs NVIDIA ki taraf se
+    # decommission (410 Gone) ya inaccessible (403 Forbidden) ho chuke
+    # thay ("openai/gpt-oss-120b", "deepseek-ai/deepseek-v4-flash",
+    # "deepseek-ai/deepseek-v4-pro", "meta/llama-3.2-90b-vision-instruct",
+    # "nvidia/nemotron-3-super-120b-a12b" — supervisor logs mein exact
+    # error dekh ke confirm kiya), isi wajah se HAR customer message pe
+    # "Sorry, kuch masla ho gaya hai" wala generic error aa raha tha.
+    # Neeche di gayi list NVIDIA ke current (docs.api.nvidia.com,
+    # updated 2026-09) LLM catalog se li gayi hai. Agar future mein
+    # koi model dobara 410/403 de, sirf yahan se replace kar dena —
+    # baaki poora fallback/retry logic (gemini_utils.py) waisa hi rahega.
     NVIDIA_MODEL_CHAIN = [
-        ("openai/gpt-oss-120b", False, {}),                         # NEW PRIMARY — admin ki request pe try kiya ja raha
-        ("deepseek-ai/deepseek-v4-flash", False, {}),               # fast fallback — pehle primary tha
-        ("meta/llama-3.2-90b-vision-instruct", True, {}),           # vision fallback (image search ke liye)
-        ("deepseek-ai/deepseek-v4-pro", False, {}),                 # strong reasoning, same family
-        ("nvidia/nemotron-3-super-120b-a12b", False, {}),           # NVIDIA's own agentic model — sahi slug (-a12b zaroori tha)
+        ("meta/llama-3.3-70b-instruct", False, {}),                 # NEW PRIMARY — currently active, reliable tool-calling
+        ("deepseek-ai/deepseek-v4-flash-0731", False, {}),          # fast fallback — dated slug (base "deepseek-v4-flash" EOL ho chuka)
+        ("meta/llama-3.2-11b-vision-instruct", True, {}),           # vision fallback (image search ke liye) — smaller/wider-access vision model
+        ("qwen/qwen3-next-80b-a3b-instruct", False, {}),            # strong reasoning fallback
+        ("nvidia/llama-3.3-nemotron-super-49b-v1", False, {}),      # NVIDIA's own agentic model — currently listed/active slug
     ]
 
     def make_nvidia_attempt(model_id, vision_capable, extra_kwargs):
@@ -499,8 +501,13 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
     if settings.GROQ_API_KEY:
         # Last-resort fallback — sirf tab try hota hai jab SAARE NVIDIA models
         # (upar wali chain) fail/quota-exhaust ho chuke hon.
-        fallback_fns.append(make_groq_attempt("llama-3.3-70b-versatile"))
-        fallback_fns.append(make_groq_attempt("llama-3.1-8b-instant"))
+        #
+        # FIX (2026-09-25) — "llama-3.3-70b-versatile" aur "llama-3.1-8b-instant"
+        # Groq ne 16 Aug 2026 ko decommission kar diye (404 model_not_found
+        # supervisor logs mein confirm hua). Groq ki apni official replacement
+        # recommendation follow ki gayi hai: gpt-oss-120b / gpt-oss-20b.
+        fallback_fns.append(make_groq_attempt("openai/gpt-oss-120b"))
+        fallback_fns.append(make_groq_attempt("openai/gpt-oss-20b"))
 
     # FLOW → apps/ai/gemini_utils.py — retry/fallback yahan hota hai (chain mein
     # order se ek-ek model try hota hai), phir wapis (output, metadata) tuple
