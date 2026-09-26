@@ -427,7 +427,7 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
                 base_url="https://integrate.api.nvidia.com/v1",
                 temperature=0.2,
                 max_retries=0,
-                timeout=8,
+                timeout=4,   # CHANGED — 8s se 4s: fast-fail taake fallback chain me total wait time kam ho
                 **extra_kwargs,
             )
             
@@ -460,7 +460,7 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
     def make_groq_attempt(model_name):
         """Helper closure: Emergency Groq model attempt wrapper (Jab NVIDIA ke saare models fail hon)."""
         def attempt():
-            llm = ChatGroq(model=model_name, groq_api_key=settings.GROQ_API_KEY, temperature=0.2, timeout=8)
+            llm = ChatGroq(model=model_name, groq_api_key=settings.GROQ_API_KEY, temperature=0.2, timeout=4)   # CHANGED — 8s se 4s
             executor = _build_executor(llm, session_key, user)
             
             result = executor.invoke({

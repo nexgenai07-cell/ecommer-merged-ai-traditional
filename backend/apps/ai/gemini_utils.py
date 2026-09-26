@@ -141,17 +141,26 @@ def _run_fallbacks(fallback_fns, last_error):
 # Fix: agent LLM chain ke liye ye alag, seedha function use karo — Gemini
 # key count se koi matlab nahi, sirf EK chhota transient-retry, phir
 # seedha fallback chain.
-MODEL_TRANSIENT_RETRY_ATTEMPTS = 1        # LLM chain ke liye — embeddings wale se kam, taake jaldi fallback pe jump ho
-MODEL_TRANSIENT_RETRY_DELAY_SECONDS = 2
+#
+# CHANGED (foran-fallback request) — MODEL_TRANSIENT_RETRY_ATTEMPTS ab 1
+# se 0 kar diya gaya hai. Pehle primary model fail hone par ek baar
+# SAME model ko 2-second sleep ke baad dobara try kiya jata tha, tab
+# jaake fallback chain shuru hoti — is se har request pe extra ~2-6 sec
+# (sleep + dobara model call) add ho rahe thay. Ab 0 attempts ka matlab
+# hai: model ek hi baar try hota hai, fail hote hi (transient ho ya na
+# ho) BINA kisi sleep/retry ke turant agle fallback model pe chala
+# jata hai — "koi model na chale to foran dusre pe fallback" wala
+# exact behavior.
+MODEL_TRANSIENT_RETRY_ATTEMPTS = 0        # CHANGED — 1 se 0: koi bhi retry nahi, foran fallback
+MODEL_TRANSIENT_RETRY_DELAY_SECONDS = 2   # ab is se koi lena dena nahi (attempts=0 hone se ye kabhi trigger hi nahi hoga) — reference ke liye rakha hai
 
 
 def call_with_model_fallback(attempt_fn, fallback_fns=None):
     """
     LLM agent chain (NVIDIA model -> ... -> Groq model) ke liye. Har
-    model ko sirf EK chhoti transient-retry deta hai, phir turant agle
-    fallback model pe chala jata hai — Gemini key-count se bilkul
-    independent (embeddings ke `call_with_fallback` se ye is liye alag
-    hai).
+    model ko sirf EK chance deta hai, phir turant agle fallback model
+    pe chala jata hai — Gemini key-count se bilkul independent
+    (embeddings ke `call_with_fallback` se ye is liye alag hai).
     """
     last_error = None
     for attempt_num in range(MODEL_TRANSIENT_RETRY_ATTEMPTS + 1):
@@ -162,6 +171,6 @@ def call_with_model_fallback(attempt_fn, fallback_fns=None):
             if is_transient_error(e) and attempt_num < MODEL_TRANSIENT_RETRY_ATTEMPTS:
                 time.sleep(MODEL_TRANSIENT_RETRY_DELAY_SECONDS)
                 continue
-            break  # transient ho ya na ho, ek retry ke baad seedha fallback chain
+            break  # transient ho ya na ho, seedha fallback chain
 
     return _run_fallbacks(fallback_fns, last_error)

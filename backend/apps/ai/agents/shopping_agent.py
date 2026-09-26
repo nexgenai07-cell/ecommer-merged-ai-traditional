@@ -438,7 +438,7 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
                 base_url="https://integrate.api.nvidia.com/v1",
                 temperature=0.4,
                 max_retries=0,   # NEW — FIX: pehle 1 tha — client apni taraf se chhupi hui retry karta tha jo `timeout` ke UPAR extra wait jorti thi. Retry ab sirf call_with_model_fallback level pe.
-                timeout=8,   # NEW — FIX: 10s se 8s kiya
+                timeout=4,   # CHANGED — 8s se 4s: fast-fail taake fallback chain me total wait time kam ho
                 **extra_kwargs,
             )
             executor = _build_executor(llm, session_key, user)
@@ -474,7 +474,7 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
 
     def make_groq_attempt(model_name):
         def attempt():
-            llm = ChatGroq(model=model_name, groq_api_key=settings.GROQ_API_KEY, temperature=0.4, timeout=8)   # NEW — FIX: timeout 8s
+            llm = ChatGroq(model=model_name, groq_api_key=settings.GROQ_API_KEY, temperature=0.4, timeout=4)   # CHANGED — 8s se 4s
             executor = _build_executor(llm, session_key, user)
             result = executor.invoke({
                 "input": user_input,
