@@ -396,10 +396,10 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
     # 410/403 de rahi hai logs mein — same replacement jab kiya jaye,
     # yahan bhi kar dena taake dono files sync rahein.
     NVIDIA_MODEL_CHAIN = [
-        ("meta/llama-3.3-70b-instruct", {}),                 # Primary Model — currently active, reliable tool-calling
-        ("deepseek-ai/deepseek-v4-flash-0731", {}),          # Fast Fallback 1 — dated slug (base slug EOL ho chuka)
-        ("qwen/qwen3-next-80b-a3b-instruct", {}),            # Reasoning Fallback 2
-        ("nvidia/llama-3.3-nemotron-super-49b-v1", {}),      # Agentic Fallback 3 — NVIDIA's own agentic model, currently active slug
+        ("openai/gpt-oss-120b", {}),                 # Primary Model — currently active, reliable tool-calling
+        ("openai/gpt-oss-20b", {}),          # Fast Fallback 1 — dated slug (base slug EOL ho chuka)
+        ("google/gemma-3-27b-it", {}),            # Reasoning Fallback 2
+        ("mistralai/mistral-small-3.1-24b-instruct-2503", {}),      # Agentic Fallback 3 — NVIDIA's own agentic model, currently active slug
     ]
 
     def make_nvidia_attempt(model_id, extra_kwargs):

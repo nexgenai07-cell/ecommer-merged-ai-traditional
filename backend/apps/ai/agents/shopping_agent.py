@@ -418,10 +418,10 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
     # jaye — filhal ye chain fail-fast hai (~100-300ms per dead model), asal
     # slowness ka source nahi tha.
     NVIDIA_MODEL_CHAIN = [
-        ("meta/llama-3.3-70b-instruct", False, {}),                 # NEW PRIMARY — currently active, reliable tool-calling
-        ("deepseek-ai/deepseek-v4-flash-0731", False, {}),          # fast fallback — dated slug (base "deepseek-v4-flash" EOL ho chuka)
+        ("openai/gpt-oss-120b", False, {}),                 # NEW PRIMARY — currently active, reliable tool-calling
+        ("openai/gpt-oss-20b", False, {}),          # fast fallback — dated slug (base "deepseek-v4-flash" EOL ho chuka)
         ("meta/llama-3.2-11b-vision-instruct", True, {}),           # vision fallback (image search ke liye) — smaller/wider-access vision model
-        ("qwen/qwen3-next-80b-a3b-instruct", False, {}),            # strong reasoning fallback
+        ("mistralai/mistral-small-3.1-24b-instruct-2503", True, {}),            # strong reasoning fallback
         ("nvidia/llama-3.3-nemotron-super-49b-v1", False, {}),      # NVIDIA's own agentic model — currently listed/active slug
     ]
 

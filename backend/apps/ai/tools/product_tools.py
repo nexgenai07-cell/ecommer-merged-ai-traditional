@@ -6,25 +6,51 @@
 # use karti hai — semantic search ke liye.
 
 import logging   # NEW — DIAGNOSTIC: bar-bar "product available nahi" ki asal wajah pinpoint karne ke liye
+import time       # NEW — FIX: chhota retry-delay ke liye
+import threading  # NEW — FIX: singleton client thread-safe banane ke liye
 import requests
 from django.conf import settings
 from qdrant_client import QdrantClient
+import httpx   # NEW — FIX: connection-level exceptions ko specifically catch karne ke liye
+from qdrant_client.http.exceptions import ResponseHandlingException   # NEW — FIX
 
 from apps.ai.gemini_utils import gemini_keys, call_with_fallback   # FLOW → gemini_utils.py (embedding call ke liye bhi fallback)
-from apps.products.models import Product   # NEW — FIX: staleness-check ab EK single DB query se hoti hai, N alag-alag HTTP calls se nahi (neeche dekhein)
+from apps.products.models import Product   # FIX: staleness-check ab EK single DB query se hoti hai, N alag-alag HTTP calls se nahi
 
 logger = logging.getLogger("ai.tools.product_tools")   # NEW
 
 
+# NEW — CRITICAL FIX (2026-09-26): pehle get_qdrant_client() HAR search
+# call pe ek NAYA QdrantClient() bana raha tha — matlab har search ke
+# liye ek fresh TLS handshake (Qdrant Cloud ke sath naya SSL connection
+# negotiate karna). Yahi behavior logs mein baar baar dikhne wali
+# "[WinError 10054] An existing connection was forcibly closed by the
+# remote host" errors ki asal wajah thi — itni jaldi jaldi bahut saare
+# fresh TLS handshakes banane se connection beech mein hi reset ho raha
+# tha (Windows/network/firewall level par). Ab client sirf EK BAAR banta
+# hai (module-level singleton) aur har request usi existing, warm
+# connection ko reuse karti hai — jo bahut zyada stable aur fast hai.
+_qdrant_client = None
+_qdrant_client_lock = threading.Lock()
+
+
 def get_qdrant_client():
-
-    # FLOW: Qdrant Cloud se connection banata hai — har search/embed call yahi client use karta hai
-
-    """Qdrant client — har tool use karta hai ise"""
-    return QdrantClient(
-        url=settings.QDRANT_URL,
-        api_key=settings.QDRANT_API_KEY,
-    )
+    """
+    FLOW: Qdrant Cloud se connection banata hai — har search/embed call
+    yahi client use karta hai. Ab singleton hai — ek dafa banta hai,
+    phir process ki poori zindagi reuse hota hai (connection pooling se
+    fayda uthane ke liye).
+    """
+    global _qdrant_client
+    if _qdrant_client is None:
+        with _qdrant_client_lock:
+            if _qdrant_client is None:   # double-checked locking
+                _qdrant_client = QdrantClient(
+                    url=settings.QDRANT_URL,
+                    api_key=settings.QDRANT_API_KEY,
+                    timeout=10,   # NEW — explicit timeout, taake ek hangi hui request poore agent ko block na kare
+                )
+    return _qdrant_client
 
 
 def get_query_embedding(text):
@@ -56,6 +82,21 @@ def get_query_embedding(text):
     return call_with_fallback(attempt)      # FLOW → gemini_utils.py (sirf Gemini key rotation, Groq fallback nahi — Groq embeddings nahi deta)
 
 
+# NEW — FIX: connection-level glitches (jaise WinError 10054, TLS reset)
+# aksar ek chhote se network hiccup ki wajah se hote hain aur turant
+# dobara try karne se theek ho jate hain — is liye inhe ek dafa,
+# BAHUT chhoti delay ke sath retry karte hain. Ye baaki errors (jaise
+# collection-not-found, bad-request) ko retry NAHI karta — sirf
+# genuinely transient connection errors ko.
+def _query_points_with_retry(qdrant, **kwargs):
+    try:
+        return qdrant.query_points(**kwargs)
+    except (httpx.ConnectError, httpx.RemoteProtocolError, ResponseHandlingException) as e:
+        logger.warning(f"[search_products_tool] Qdrant connection glitch ({e}) — retrying once after 0.3s")
+        time.sleep(0.3)
+        return qdrant.query_points(**kwargs)
+
+
 def search_products_tool(query: str, max_price: float = None, category: str = None, limit: int = 5) -> dict:
     """
     FLOW: registry.py ke search_products tool se call hota hai.
@@ -84,8 +125,13 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
         # FLOW: yahan ASAL QDRANT SEARCH hoti hai — ye "products" Qdrant
         # collection (index_products management command se pehle se filled)
         # ko search karta hai
+        #
+        # CHANGED — ab direct qdrant.query_points() ke bajaye
+        # _query_points_with_retry() se call hota hai (upar dekhein) —
+        # taake ek chhota connection glitch poori search ko fail na kare.
 
-        search_response = qdrant.query_points(
+        search_response = _query_points_with_retry(
+            qdrant,
             collection_name=settings.QDRANT_COLLECTION,
             query=query_vector,
             limit=limit * 3,  # zyada fetch karo — filters ke baad bhi enough milein
@@ -107,9 +153,9 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
 
         products = []
 
-        # NEW — FIX (v2): Pichli baar har Qdrant candidate ko apni hi API
-        # par ek ALAG HTTP call se verify kiya ja raha tha (limit*3 tak =
-        # 15 sequential network round-trips PER SEARCH) — isse response
+        # FIX (v2): Pichli baar har Qdrant candidate ko apni hi API par
+        # ek ALAG HTTP call se verify kiya ja raha tha (limit*3 tak = 15
+        # sequential network round-trips PER SEARCH) — isse response
         # itna slow ho gaya ke poora search_products call hi timeout/fail
         # hone laga, aur customer ko koi bhi metadata/product cards milna
         # bilkul band ho gaya tha (sirf text reply aata tha). Ab isi
@@ -130,7 +176,7 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
         )
 
         products = []
-        products_without_category_filter = []   # NEW — fallback ke liye
+        products_without_category_filter = []   # fallback ke liye
 
         for result in search_results:
             payload = result.payload
@@ -138,7 +184,7 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
             if pid is None:
                 continue
 
-            # NEW — CRITICAL FIX: Qdrant index kabhi STALE ho jata hai —
+            # CRITICAL FIX: Qdrant index kabhi STALE ho jata hai —
             # product delete/deactivate/update ho chuka hota hai asal
             # database mein, lekin Qdrant re-index nahi hota (jab tak
             # index_products command dobara na chale) — isi wajah se
@@ -172,7 +218,7 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
                 'in_stock':         getattr(live, 'in_stock', stock > 0),
                 'stock':            stock,
                 'description':      getattr(live, 'description', '') or '',
-                # NEW — image abhi bhi Qdrant payload se (DB field ka naam
+                # image abhi bhi Qdrant payload se (DB field ka naam
                 # yahan confirm nahi tha) — kabhi image kabhi thodi purani
                 # ho sakti hai, lekin ye poore product ke stale/ghost hone
                 # (jo asal bug tha) se bohot chhota risk hai.
@@ -183,7 +229,7 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
             if len(products_without_category_filter) < limit:
                 products_without_category_filter.append(product_dict)
 
-            # NEW — FIX: pehle EXACT string match tha (category_name.lower()
+            # FIX: pehle EXACT string match tha (category_name.lower()
             # != category.lower()) — agar LLM ne "Kitchen" bheja lekin DB
             # mein category ka asal naam "Kitchen & Dining" ya "Home &
             # Kitchen" hai, to ye EXACT match fail ho jata aur sab results
@@ -202,7 +248,7 @@ def search_products_tool(query: str, max_price: float = None, category: str = No
             if len(products) >= limit:
                 break
 
-        # NEW — FIX: agar category filter ki wajah se list bilkul KHALI ho
+        # FIX: agar category filter ki wajah se list bilkul KHALI ho
         # gayi ho (jaise LLM ne category="shoes"/"footwear" bheja jo
         # hamari DB mein exist hi nahi karti, is liye koi bhi category
         # match nahi hui), lekin semantic search ne otherwise RELEVANT
