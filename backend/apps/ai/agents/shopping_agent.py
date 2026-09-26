@@ -411,17 +411,12 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
     # Order = priority: [0] primary, baaki fallback (upar wala fail ho
     # tabhi neeche wala try hota hai).
     #
-    # FIX (2026-09-25) — saare purane model IDs NVIDIA ki taraf se
-    # decommission (410 Gone) ya inaccessible (403 Forbidden) ho chuke
-    # thay ("openai/gpt-oss-120b", "deepseek-ai/deepseek-v4-flash",
-    # "deepseek-ai/deepseek-v4-pro", "meta/llama-3.2-90b-vision-instruct",
-    # "nvidia/nemotron-3-super-120b-a12b" — supervisor logs mein exact
-    # error dekh ke confirm kiya), isi wajah se HAR customer message pe
-    # "Sorry, kuch masla ho gaya hai" wala generic error aa raha tha.
-    # Neeche di gayi list NVIDIA ke current (docs.api.nvidia.com,
-    # updated 2026-09) LLM catalog se li gayi hai. Agar future mein
-    # koi model dobara 410/403 de, sirf yahan se replace kar dena —
-    # baaki poora fallback/retry logic (gemini_utils.py) waisa hi rahega.
+    # NOTE (2026-09-26): logs confirm saare 5 NVIDIA models abhi 410 Gone /
+    # 403 Forbidden de rahe hain — inhein Maham replace karengi jab naye
+    # verified model IDs mil jayein. Fallback chain design tab tak intact
+    # rakha gaya hai taake jaise hi models restore hon, kaam turant chal
+    # jaye — filhal ye chain fail-fast hai (~100-300ms per dead model), asal
+    # slowness ka source nahi tha.
     NVIDIA_MODEL_CHAIN = [
         ("meta/llama-3.3-70b-instruct", False, {}),                 # NEW PRIMARY — currently active, reliable tool-calling
         ("deepseek-ai/deepseek-v4-flash-0731", False, {}),          # fast fallback — dated slug (base "deepseek-v4-flash" EOL ho chuka)
@@ -437,8 +432,8 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
                 api_key=settings.NVIDIA_API_KEY,
                 base_url="https://integrate.api.nvidia.com/v1",
                 temperature=0.4,
-                max_retries=0,   # NEW — FIX: pehle 1 tha — client apni taraf se chhupi hui retry karta tha jo `timeout` ke UPAR extra wait jorti thi. Retry ab sirf call_with_model_fallback level pe.
-                timeout=4,   # CHANGED — 8s se 4s: fast-fail taake fallback chain me total wait time kam ho
+                max_retries=0,   # FIX: pehle 1 tha — client apni taraf se chhupi hui retry karta tha jo `timeout` ke UPAR extra wait jorti thi. Retry ab sirf call_with_model_fallback level pe.
+                timeout=4,       # fast-fail taake fallback chain me total wait time kam ho
                 **extra_kwargs,
             )
             executor = _build_executor(llm, session_key, user)
@@ -474,7 +469,21 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
 
     def make_groq_attempt(model_name):
         def attempt():
-            llm = ChatGroq(model=model_name, groq_api_key=settings.GROQ_API_KEY, temperature=0.4, timeout=4)   # CHANGED — 8s se 4s
+            llm = ChatGroq(
+                model=model_name,
+                groq_api_key=settings.GROQ_API_KEY,
+                temperature=0.4,
+                timeout=4,
+                max_retries=0,   # FIX (2026-09-26) — CRITICAL: yahan max_retries set hi nahi tha,
+                                 # is wajah se Groq/OpenAI SDK apni taraf se 429 (Too Many Requests)
+                                 # pe khud hi HIDDEN retry kar raha tha aur server ke Retry-After
+                                 # header ka pura wait follow kar raha tha ("Retrying request in
+                                 # 34.000000 seconds", "18 seconds", "29 seconds" — logs mein
+                                 # confirm hua). Ye retries hamari apni call_with_model_fallback
+                                 # chain se BAHAR, humein dikhe bina ho rahe thay — yahi 2-minute
+                                 # delays ki asal wajah thi. max_retries=0 se Groq bhi turant fail
+                                 # hoga aur control wapis hamari chain ko milega.
+            )
             executor = _build_executor(llm, session_key, user)
             result = executor.invoke({
                 "input": user_input,
@@ -501,11 +510,6 @@ def run_shopping_agent(user_input: str, session_key: str, user=None, chat_histor
     if settings.GROQ_API_KEY:
         # Last-resort fallback — sirf tab try hota hai jab SAARE NVIDIA models
         # (upar wali chain) fail/quota-exhaust ho chuke hon.
-        #
-        # FIX (2026-09-25) — "llama-3.3-70b-versatile" aur "llama-3.1-8b-instant"
-        # Groq ne 16 Aug 2026 ko decommission kar diye (404 model_not_found
-        # supervisor logs mein confirm hua). Groq ki apni official replacement
-        # recommendation follow ki gayi hai: gpt-oss-120b / gpt-oss-20b.
         fallback_fns.append(make_groq_attempt("openai/gpt-oss-120b"))
         fallback_fns.append(make_groq_attempt("openai/gpt-oss-20b"))
 

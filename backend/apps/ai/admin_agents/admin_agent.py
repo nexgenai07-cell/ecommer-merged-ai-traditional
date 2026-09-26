@@ -31,14 +31,6 @@ from apps.ai.admin_tools.analytics_tools import detect_date_range_hint
 # Models retry/fallback handling function (Agar primary model fail ho to next model try karta hai)
 from apps.ai.gemini_utils import call_with_model_fallback 
 
-# FIX — CRITICAL BUG: pehle ye dono sirf make_nvidia_attempt() ke andar
-# LOCALLY import hote thay. make_groq_attempt() unhe bina import kiye
-# hi use kar raha tha — is liye jab bhi saare NVIDIA models fail ho kar
-# Groq fallback tak pohanchte, ye NameError se turant crash ho jata
-# (NVIDIA list bhi stale thi — dono milakar HAR admin message pe generic
-# "kuch masla ho gaya hai" error deते thay, chahe message kuch bhi ho).
-# Ab module-level import hai — dono attempt() functions (NVIDIA aur
-# Groq) isay bina crash ke use kar sakte hain.
 from apps.ai.admin_response_metadata import extract_admin_metadata
 from apps.ai.suggestions import get_admin_followup_suggestions
 
@@ -400,17 +392,9 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
 
     # NVIDIA Models chain (Priority wise: Primary pehle, baki fallbacks hain)
     #
-    # FIX (2026-09-25) — pehle wali list ("openai/gpt-oss-120b",
-    # "deepseek-ai/deepseek-v4-flash", "deepseek-ai/deepseek-v4-pro",
-    # "nvidia/nemotron-3-super-120b-a12b") NVIDIA ki taraf se decommission
-    # (410 Gone) ya inaccessible (403 Forbidden) ho chuki thi — isi wajah
-    # se EVERY admin message pe saare 5 NVIDIA attempts fail ho kar Groq
-    # fallback tak pohanchte thay (aur Groq fallback mein neeche wala
-    # NameError bug bhi tha — dono milakar har message pe generic error
-    # deta tha, chahe admin kuch bhi likhe). Ye list shopping_agent.py
-    # wali already-verified currently-active NVIDIA model IDs se sync ki
-    # gayi hai. Agar future mein koi model dobara 410/403 de, sirf yahan
-    # se replace kar dena.
+    # NOTE (2026-09-26): shopping_agent.py wali NVIDIA list bhi abhi
+    # 410/403 de rahi hai logs mein — same replacement jab kiya jaye,
+    # yahan bhi kar dena taake dono files sync rahein.
     NVIDIA_MODEL_CHAIN = [
         ("meta/llama-3.3-70b-instruct", {}),                 # Primary Model — currently active, reliable tool-calling
         ("deepseek-ai/deepseek-v4-flash-0731", {}),          # Fast Fallback 1 — dated slug (base slug EOL ho chuka)
@@ -427,7 +411,7 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
                 base_url="https://integrate.api.nvidia.com/v1",
                 temperature=0.2,
                 max_retries=0,
-                timeout=4,   # CHANGED — 8s se 4s: fast-fail taake fallback chain me total wait time kam ho
+                timeout=4,
                 **extra_kwargs,
             )
             
@@ -460,7 +444,17 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
     def make_groq_attempt(model_name):
         """Helper closure: Emergency Groq model attempt wrapper (Jab NVIDIA ke saare models fail hon)."""
         def attempt():
-            llm = ChatGroq(model=model_name, groq_api_key=settings.GROQ_API_KEY, temperature=0.2, timeout=4)   # CHANGED — 8s se 4s
+            llm = ChatGroq(
+                model=model_name,
+                groq_api_key=settings.GROQ_API_KEY,
+                temperature=0.2,
+                timeout=4,
+                max_retries=0,   # FIX (2026-09-26) — CRITICAL: shopping_agent.py jaisa hi bug
+                                 # yahan bhi tha — max_retries set na hone se SDK khud 429 pe
+                                 # server ke Retry-After (18-34 sec) ka pura wait kar raha tha,
+                                 # hamari apni fallback chain ke control se bahar. Ab 0 hai —
+                                 # turant fail hoga, foran agla fallback try hoga.
+            )
             executor = _build_executor(llm, session_key, user)
             
             result = executor.invoke({
@@ -487,12 +481,6 @@ def run_admin_agent(user_input: str, session_key: str, user, chat_history=None, 
         for model_id, extra_kwargs in NVIDIA_MODEL_CHAIN[1:]
     ]
 
-    # Agar GROQ_API_KEY mojood ho to Groq models ko bhi last-resort fallbacks mein add kar dete hain
-    #
-    # FIX (2026-09-25) — "llama-3.3-70b-versatile" aur "llama-3.1-8b-instant"
-    # Groq ne 16 Aug 2026 ko decommission kar diye thay (404 model_not_found)
-    # — yahi bug shopping_agent.py mein bhi tha aur wahan fix ho chuka hai.
-    # Groq ki official replacement recommendation follow ki gayi hai.
     if settings.GROQ_API_KEY:
         fallback_fns.append(make_groq_attempt("openai/gpt-oss-120b"))
         fallback_fns.append(make_groq_attempt("openai/gpt-oss-20b"))
