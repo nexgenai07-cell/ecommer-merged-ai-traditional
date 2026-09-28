@@ -10,6 +10,13 @@ class OrdersConfig(AppConfig):
     name = 'apps.orders'
 
     def ready(self):
+        # NEW (Sep 2026 — live order/payment updates): register the signal
+        # receivers FIRST. This must stay above the scheduler checks below,
+        # because those `return` early (ENABLE_SCHEDULER=False, manage.py
+        # commands, reloader parent) and the signals must be registered in
+        # every process — including one where the scheduler is off.
+        from . import signals  # noqa: F401
+
         # NEW (Sep 2026 — auto-cancel scheduling fix): starts the
         # in-process scheduler (apps/orders/scheduler.py) that runs the
         # cancel_stale_payments management command every 60 seconds —

@@ -69,6 +69,14 @@ class ProductListSerializer(serializers.ModelSerializer):
     # admin panel's product list.
     purchase_price = serializers.SerializerMethodField()
     profit = serializers.SerializerMethodField()
+    # NEW (Sep 2026 — markup/margin calculation): admin-only, null for
+    # customers. Both pulled from Product.markup_percent /
+    # Product.profit_margin_percent (apps/products/models.py) so the
+    # % math lives in exactly one place — see that model for the
+    # markup-vs-margin distinction (cost-based vs price-based %).
+    markup_percent = serializers.SerializerMethodField()
+    profit_percent = serializers.SerializerMethodField()
+    profit_margin_percent = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -80,6 +88,9 @@ class ProductListSerializer(serializers.ModelSerializer):
             # NEW (Sep 2026 — profit tracking): admin-only, null for customers
             "purchase_price",
             "profit",
+            "markup_percent",
+            "profit_percent",
+            "profit_margin_percent",
             # ============================================================
             # NEW: Replace single 'stock' with three fields
             # ============================================================
@@ -136,11 +147,34 @@ class ProductListSerializer(serializers.ModelSerializer):
             return None
         return obj.purchase_price
 
-    # NEW (Sep 2026 — profit tracking): price - purchase_price, admin-only.
+    # UPDATED (Sep 2026 — markup/margin calculation): now delegates to
+    # Product.markup_amount instead of repeating "price - purchase_price"
+    # here, so this and ProductDetailSerializer can never drift apart.
     def get_profit(self, obj):
-        if not self._is_admin() or obj.purchase_price is None:
+        if not self._is_admin():
             return None
-        return obj.price - obj.purchase_price
+        return obj.markup_amount
+
+    # NEW (Sep 2026 — markup/margin calculation): % on cost price —
+    # see Product.markup_percent in apps/products/models.py.
+    def get_markup_percent(self, obj):
+        if not self._is_admin():
+            return None
+        return obj.markup_percent
+
+    # NEW (Sep 2026 — profit concepts): Profit % (profit / cost x 100) —
+    # same formula as markup_percent, see Product.profit_percent.
+    def get_profit_percent(self, obj):
+        if not self._is_admin():
+            return None
+        return obj.profit_percent
+
+    # NEW (Sep 2026 — markup/margin calculation): % on selling price —
+    # see Product.profit_margin_percent in apps/products/models.py.
+    def get_profit_margin_percent(self, obj):
+        if not self._is_admin():
+            return None
+        return obj.profit_margin_percent
 
     # ============================================================
     # NEW: available_stock = total_stock - reserved_stock
@@ -198,6 +232,12 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     # admin panel's product edit page).
     purchase_price = serializers.SerializerMethodField()
     profit = serializers.SerializerMethodField()
+    # NEW (Sep 2026 — markup/margin calculation): admin-only, null for
+    # customers. See Product.markup_percent / profit_margin_percent in
+    # apps/products/models.py for the cost-based-vs-price-based-% distinction.
+    markup_percent = serializers.SerializerMethodField()
+    profit_percent = serializers.SerializerMethodField()
+    profit_margin_percent = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
@@ -210,6 +250,9 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             # NEW (Sep 2026 — profit tracking): admin-only, null for customers
             "purchase_price",
             "profit",
+            "markup_percent",
+            "profit_percent",
+            "profit_margin_percent",
             # ============================================================
             # NEW: Replace single 'stock' with three fields
             # ============================================================
@@ -264,11 +307,34 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             return None
         return obj.purchase_price
 
-    # NEW (Sep 2026 — profit tracking): price - purchase_price, admin-only.
+    # UPDATED (Sep 2026 — markup/margin calculation): now delegates to
+    # Product.markup_amount instead of repeating "price - purchase_price"
+    # here, so this and ProductListSerializer can never drift apart.
     def get_profit(self, obj):
-        if not self._is_admin() or obj.purchase_price is None:
+        if not self._is_admin():
             return None
-        return obj.price - obj.purchase_price
+        return obj.markup_amount
+
+    # NEW (Sep 2026 — markup/margin calculation): % on cost price —
+    # see Product.markup_percent in apps/products/models.py.
+    def get_markup_percent(self, obj):
+        if not self._is_admin():
+            return None
+        return obj.markup_percent
+
+    # NEW (Sep 2026 — profit concepts): Profit % (profit / cost x 100) —
+    # same formula as markup_percent, see Product.profit_percent.
+    def get_profit_percent(self, obj):
+        if not self._is_admin():
+            return None
+        return obj.profit_percent
+
+    # NEW (Sep 2026 — markup/margin calculation): % on selling price —
+    # see Product.profit_margin_percent in apps/products/models.py.
+    def get_profit_margin_percent(self, obj):
+        if not self._is_admin():
+            return None
+        return obj.profit_margin_percent
 
     # NEW: average of every active, non-deleted review's rating.
     # Rounded to 1 decimal place (e.g. 4.8), 0.0 when there are no
@@ -312,6 +378,26 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
             "blank": "SKU is required.",
             "null": "SKU is required.",
             "max_length": f"SKU cannot be longer than {SKU_MAX_LENGTH} characters.",
+        },
+    )
+    # NEW (Sep 2026 — purchase_price made compulsory): previously
+    # optional (model field is null=True, blank=True — kept that way at
+    # the DB level as a safety net, same reasoning as `sku` above), so
+    # admin add/edit forms could silently submit no cost price at all.
+    # Explicitly required here, same pattern as `sku`, so create/full
+    # update (PUT) always reject a missing/blank/null purchase_price.
+    # A partial update (PATCH) is unaffected — DRF doesn't enforce
+    # required=True fields during partial=True, so an unrelated PATCH
+    # (e.g. toggling is_active) doesn't force re-sending purchase_price.
+    purchase_price = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        required=True,
+        allow_null=False,
+        error_messages={
+            "required": "Purchase price is required.",
+            "null": "Purchase price is required.",
+            "invalid": "Enter a valid purchase price.",
         },
     )
     category_id = serializers.IntegerField(write_only=True, required=False)

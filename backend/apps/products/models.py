@@ -135,6 +135,50 @@ class Product(models.Model):
         return self.total_stock - self.reserved_stock
 
     # ============================================================
+    # NEW (Sep 2026 — profit/markup calculation): single source of
+    # truth for cost-vs-price math, used by ProductListSerializer /
+    # ProductDetailSerializer (admin-only "profit" field) and by
+    # analytics.ProfitReportView. All three return None when
+    # purchase_price hasn't been set yet, instead of raising or
+    # silently showing 0 (which would look like "no profit" rather
+    # than "cost not entered").
+    #
+    #   markup_amount          = price - purchase_price          (Rs.)
+    #   markup_percent         = markup_amount / purchase_price   (% on cost)
+    #   profit_margin_percent  = markup_amount / price            (% on selling price)
+    # ============================================================
+    @property
+    def markup_amount(self):
+        """Gross profit per unit in Rs. — price minus purchase_price."""
+        if self.purchase_price is None:
+            return None
+        return self.price - self.purchase_price
+
+    @property
+    def markup_percent(self):
+        """Markup % — profit expressed as a % of the COST price."""
+        if self.purchase_price is None or self.purchase_price == 0:
+            return None
+        return (self.markup_amount / self.purchase_price) * 100
+
+    @property
+    def profit_margin_percent(self):
+        """Profit margin % — profit expressed as a % of the SELLING price."""
+        if self.purchase_price is None or self.price == 0:
+            return None
+        return (self.markup_amount / self.price) * 100
+
+    @property
+    def profit_percent(self):
+        """
+        Profit % — gross profit as a % of the COST price. Per the profit
+        concept table this is the same formula as markup_percent
+        (profit / cost x 100), exposed under its own name so every
+        concept in the table has a matching field.
+        """
+        return self.markup_percent
+
+    # ============================================================
     # NEW: Validate that reserved_stock never exceeds total_stock
     # ============================================================
     def clean(self):
@@ -328,6 +372,20 @@ class ProductStats(models.Model):
 class Review(models.Model):
     RATING_CHOICES = [(i, str(i)) for i in range(1, 6)]
 
+    # NEW (Sep 2026 — review moderation queue): every customer-submitted
+    # review now starts 'pending' and is invisible on the product page
+    # until an admin approves it (see review_views.py:
+    # ProductReviewListCreateView.post — status set there — and
+    # AdminReviewListView / AdminReviewModerateView, the new admin
+    # moderation endpoints). An admin's OWN review is auto-approved on
+    # creation (no self-moderation needed). Editing an approved review
+    # sends it back to 'pending' for re-review — see ReviewDetailView.put.
+    STATUS_CHOICES = [
+        ("pending", "Pending"),
+        ("approved", "Approved"),
+        ("rejected", "Rejected"),
+    ]
+
     product = models.ForeignKey(
         Product,
         on_delete=models.CASCADE,
@@ -341,14 +399,42 @@ class Review(models.Model):
     rating = models.PositiveSmallIntegerField(choices=RATING_CHOICES)
     comment = models.TextField(blank=True, default="")
 
+    # NEW (Sep 2026 — reviewer profile picture): fully optional — a
+    # customer can attach a photo of themselves when leaving a review,
+    # or leave it empty and nothing shows. Uses the same CloudinaryField
+    # already used for ProductImage.image above, so it's uploaded/stored
+    # the same way (see ProductReviewListCreateView.post in
+    # review_views.py for the upload handling).
+    profile_picture = CloudinaryField(
+        "image",
+        blank=True,
+        null=True,
+        help_text="Optional — reviewer's profile picture, shown next to their review.",
+    )
+
     # Set automatically by the create endpoint (review_views.py) based on
     # whether this user has a delivered order containing this product —
     # never accepted directly from the request body.
     is_verified_purchase = models.BooleanField(default=False)
 
-    # Lets an admin hide an inappropriate review without deleting it
-    # outright (separate from is_delete, which is the customer's own
-    # "delete my review" action).
+    # NEW (Sep 2026 — review moderation queue): the actual "is this
+    # visible on the site" switch now. Only status='approved' reviews
+    # are ever returned by the public product-reviews GET endpoint.
+    status = models.CharField(
+        max_length=10,
+        choices=STATUS_CHOICES,
+        default="pending",
+        help_text=(
+            "pending = awaiting admin review (default for every "
+            "customer-submitted review); approved = visible on the "
+            "product page; rejected = hidden, admin declined it."
+        ),
+    )
+
+    # DEPRECATED (Sep 2026): superseded by `status` above for deciding
+    # what's publicly visible. Kept on the model (unused by any current
+    # view) rather than removed, to avoid a destructive field-drop
+    # migration for a column that existing code/tools may still read.
     is_active = models.BooleanField(default=True)
     is_delete = models.BooleanField(default=False)
 

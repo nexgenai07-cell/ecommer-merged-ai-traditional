@@ -9,6 +9,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.db.models import (
     Sum, Count, Min, Max, OuterRef, Subquery, IntegerField, Q, Value, DecimalField, F,
+    ExpressionWrapper,
 )
 from django.db.models.functions import (
     TruncDate,
@@ -27,7 +28,7 @@ from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 
 from apps.orders.models import Order, OrderItem, Customer
-from apps.products.models import Product, Discount
+from apps.products.models import Product, Discount, Review
 from apps.social.models import SocialPost
 from apps.returns.models import Return, Complaint
 from apps.categories.models import Category
@@ -178,6 +179,133 @@ def get_trunc_function(period):
     }[period]
 
 
+# ============================================================
+# NEW (Sep 2026 — profit/markup/margin concepts, everywhere):
+# ONE shared implementation of the cost / revenue / markup / profit /
+# margin concepts, used by Dashboard, Sales, Revenue, Profit, Best
+# Sellers and the Sales/Revenue CSV exports — so every screen shows
+# numbers built from the exact same formulas:
+#
+#   Total Revenue (Total Sales) = sum(selling price x quantity)
+#   Total Cost (COGS)           = sum(purchase price x quantity)
+#   Markup per unit             = selling price - purchase price
+#   Total Markup = Gross Profit = Total Revenue - Total Cost
+#   Markup %  = Profit %        = Gross Profit / Total Cost    x 100
+#   Profit Margin %             = Gross Profit / Total Revenue x 100
+#
+# "Revenue" here means PRODUCT sales only (OrderItem price x quantity).
+# It deliberately excludes shipping and is BEFORE any coupon discount,
+# which is what Order.total_amount used to include/subtract — see
+# `discounts_given` / `shipping_collected` in ProfitReportView for
+# those two amounts shown separately.
+#
+# Items whose product was deleted (OrderItem.product is SET_NULL) or has
+# no purchase_price are left out of cost AND profit (their revenue still
+# counts in total_revenue) so profit is never overstated — see
+# `items_missing_cost`.
+# ============================================================
+MONEY_FIELD = DecimalField(max_digits=14, decimal_places=2)
+
+ITEM_REVENUE_EXPR = ExpressionWrapper(
+    F("price") * F("quantity"), output_field=MONEY_FIELD
+)
+ITEM_COST_EXPR = ExpressionWrapper(
+    F("product__purchase_price") * F("quantity"), output_field=MONEY_FIELD
+)
+ITEM_HAS_COST = Q(product__isnull=False, product__purchase_price__isnull=False)
+
+
+def concept_aggregates(include_orders=False):
+    """Aggregate expressions to run on an OrderItem queryset (either
+    .aggregate() for totals, or .values(bucket).annotate() per period)."""
+    aggs = {
+        "total_revenue": Coalesce(
+            Sum(ITEM_REVENUE_EXPR), Value(0), output_field=MONEY_FIELD
+        ),
+        "total_cost": Coalesce(
+            Sum(ITEM_COST_EXPR, filter=ITEM_HAS_COST),
+            Value(0), output_field=MONEY_FIELD,
+        ),
+        # revenue / units of ONLY the items whose cost is known — profit,
+        # margin and per-unit cost are calculated on these so a missing
+        # cost never inflates profit.
+        "costed_revenue": Coalesce(
+            Sum(ITEM_REVENUE_EXPR, filter=ITEM_HAS_COST),
+            Value(0), output_field=MONEY_FIELD,
+        ),
+        "units_sold": Coalesce(Sum("quantity"), 0),
+        "costed_units": Coalesce(Sum("quantity", filter=ITEM_HAS_COST), 0),
+        "items_missing_cost": Count("id", filter=~ITEM_HAS_COST),
+    }
+    if include_orders:
+        # distinct: an order with several items must count once.
+        aggs["total_orders"] = Count("order", distinct=True)
+    return aggs
+
+
+def build_concept_metrics(row):
+    """Turns the raw sums from concept_aggregates() (or the per-order
+    equivalent in annotate_order_concepts) into every concept in the
+    profit table. Percentages are None when their base is 0."""
+    revenue = row.get("total_revenue") or Decimal("0")
+    cost = row.get("total_cost") or Decimal("0")
+    costed_revenue = row.get("costed_revenue") or Decimal("0")
+    units = row.get("units_sold") or 0
+    costed_units = row.get("costed_units") or 0
+
+    gross_profit = costed_revenue - cost
+
+    markup_percent = round(float(gross_profit / cost * 100), 2) if cost else None
+    profit_margin_percent = (
+        round(float(gross_profit / costed_revenue * 100), 2)
+        if costed_revenue else None
+    )
+
+    return {
+        "units_sold": units,
+        "avg_selling_price_per_unit": round(revenue / units, 2) if units else None,
+        "avg_cost_per_unit": round(cost / costed_units, 2) if costed_units else None,
+        "markup_per_unit": round(gross_profit / costed_units, 2) if costed_units else None,
+        "total_revenue": revenue,
+        "total_cost": cost,
+        "total_markup": gross_profit,
+        "gross_profit": gross_profit,
+        "markup_percent": markup_percent,
+        # Per the concept table, Profit % uses the same formula as
+        # Markup % (Gross Profit / Total Cost x 100).
+        "profit_percent": markup_percent,
+        "profit_margin_percent": profit_margin_percent,
+        "items_missing_cost": row.get("items_missing_cost", 0) or 0,
+    }
+
+
+def annotate_order_concepts(qs):
+    """Per-ORDER version of the same sums (scalar subqueries, so there's
+    no join fan-out) — used by the Sales/Revenue CSV exports, which are
+    one row per order."""
+    def _sub(expr, output_field, item_filter=None):
+        items = OrderItem.objects.filter(order=OuterRef("pk"))
+        if item_filter is not None:
+            items = items.filter(item_filter)
+        return Coalesce(
+            Subquery(
+                items.values("order").annotate(t=Sum(expr)).values("t"),
+                output_field=output_field,
+            ),
+            Value(0),
+            output_field=output_field,
+        )
+
+    return qs.annotate(
+        total_revenue=_sub(ITEM_REVENUE_EXPR, MONEY_FIELD),
+        total_cost=_sub(ITEM_COST_EXPR, MONEY_FIELD, ITEM_HAS_COST),
+        costed_revenue=_sub(ITEM_REVENUE_EXPR, MONEY_FIELD, ITEM_HAS_COST),
+        units_sold=_sub("quantity", IntegerField()),
+        costed_units=_sub("quantity", IntegerField(), ITEM_HAS_COST),
+    )
+
+
+
 class DashboardView(APIView):
     """
     GET /api/v1/analytics/dashboard/
@@ -190,7 +318,10 @@ class DashboardView(APIView):
 
 
     def get(self, request):
-        cache_key = 'analytics_dashboard'
+        # UPDATED (Sep 2026 — profit concepts): key bumped to _v2 so a response
+        # cached under the old revenue definition / old shape isn't served
+        # for up to 5 minutes right after this ships.
+        cache_key = 'analytics_dashboard_v2'
         cached = cache.get(cache_key)
         if cached:
             return Response(cached)
@@ -210,7 +341,23 @@ class DashboardView(APIView):
         delivered_orders = Order.objects.filter(status__in=Order.REVENUE_STATUSES)
 
 
-        total_revenue = delivered_orders.aggregate(total=Sum('total_amount'))['total'] or 0
+        # UPDATED (Sep 2026 — profit/markup/margin concepts): revenue is
+        # now product sales (selling price x quantity) from OrderItem, not
+        # Order.total_amount (which included shipping and was net of
+        # coupon discounts) — same definition as Sales/Revenue/Profit
+        # reports and Best Sellers, so every screen agrees. See
+        # concept_aggregates() / build_concept_metrics() near the top.
+        def items_revenue(orders):
+            return OrderItem.objects.filter(order__in=orders).aggregate(
+                t=Coalesce(Sum(ITEM_REVENUE_EXPR), Value(0), output_field=MONEY_FIELD)
+            )['t'] or 0
+
+        concept_totals = build_concept_metrics(
+            OrderItem.objects.filter(order__in=delivered_orders).aggregate(
+                **concept_aggregates()
+            )
+        )
+        total_revenue = concept_totals['total_revenue']
         total_orders = Order.objects.count()
         total_customers = Customer.objects.count()
         total_products = Product.objects.filter(
@@ -219,14 +366,14 @@ class DashboardView(APIView):
         ).count()
 
 
-        this_period_revenue = delivered_orders.filter(
+        this_period_revenue = items_revenue(delivered_orders.filter(
             created_at__date__gte=last_30_days
-        ).aggregate(total=Sum('total_amount'))['total'] or 0
+        ))
 
 
-        prev_period_revenue = delivered_orders.filter(
+        prev_period_revenue = items_revenue(delivered_orders.filter(
             created_at__date__gte=prev_30_days, created_at__date__lt=last_30_days
-        ).aggregate(total=Sum('total_amount'))['total'] or 0
+        ))
 
 
         this_period_orders = Order.objects.filter(created_at__date__gte=last_30_days).count()
@@ -243,7 +390,7 @@ class DashboardView(APIView):
             return f'{sign}{pct:.0f}%'
 
 
-        today_revenue = delivered_orders.filter(created_at__date=today).aggregate(total=Sum('total_amount'))['total'] or 0
+        today_revenue = items_revenue(delivered_orders.filter(created_at__date=today))
         today_orders = Order.objects.filter(created_at__date=today).count()
 
 
@@ -265,6 +412,14 @@ class DashboardView(APIView):
             if p.stock <= p.low_stock_threshold
         )
 
+        # NEW (Sep 2026 — review moderation queue): surfaces how many
+        # customer reviews are sitting in AdminReviewListView's queue
+        # awaiting approve/reject, so the admin dashboard homepage can
+        # show it as a card/badge (same idea as pending_orders above).
+        pending_reviews = Review.objects.filter(
+            status="pending", is_delete=False
+        ).count()
+
         data = {
          'total_revenue': total_revenue,
          'total_orders': total_orders,
@@ -276,6 +431,15 @@ class DashboardView(APIView):
          'low_stock_products': low_stock_products,
          'today_revenue': today_revenue,
          'today_orders': today_orders,
+         'pending_reviews': pending_reviews,
+         # NEW (Sep 2026 — profit/markup/margin concepts): all-time, over
+         # the same sold orders as total_revenue above.
+         'total_cost': concept_totals['total_cost'],
+         'gross_profit': concept_totals['gross_profit'],
+         'total_markup': concept_totals['total_markup'],
+         'markup_percent': concept_totals['markup_percent'],
+         'profit_percent': concept_totals['profit_percent'],
+         'profit_margin_percent': concept_totals['profit_margin_percent'],
 }
 
 
@@ -286,7 +450,20 @@ class DashboardView(APIView):
 
 class SalesReportView(APIView):
     """
-    GET /api/v1/analytics/sales/?start_date=&end_date=&period=daily|weekly|monthly|yearly
+    GET /api/v1/analytics/sales/?start_date=&end_date=&period=daily|weekly|monthly|yearly&status=
+
+    UPDATED (Sep 2026 — profit/markup/margin concepts): built from
+    OrderItem rows (selling price x quantity) instead of
+    Order.total_amount, and every period now also carries the full set
+    of concepts — total_cost (COGS), gross_profit / total_markup,
+    markup_per_unit, markup_percent, profit_percent, profit_margin_percent,
+    avg_selling_price_per_unit, avg_cost_per_unit (see the shared helpers
+    concept_aggregates() / build_concept_metrics() above for the exact
+    formulas). Existing keys (date, total_orders, total_revenue,
+    total_units) are unchanged in name and position; new keys were only
+    ADDED. NOTE: total_revenue is now product sales only (excludes
+    shipping, before coupon discount) — it no longer equals the sum of
+    Order.total_amount.
     """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
@@ -295,44 +472,20 @@ class SalesReportView(APIView):
 
         # FIX (Sep 2026 — Sales/Revenue Report vs Export mismatch): status
         # is now a real, explicit filter (?status=sold|cancelled|refunded|
-        # all|<exact status>, defaults to "sold") instead of being
-        # hardcoded to paid orders only - see filter_orders_by_status().
-        qs = filter_orders_by_date(
+        # all|<exact status>, defaults to "sold") - see filter_orders_by_status().
+        orders_qs = filter_orders_by_date(
             filter_orders_by_status(Order.objects.all(), request.query_params.get("status")),
             start_date,
             end_date,
         )
+        items_qs = OrderItem.objects.filter(order__in=orders_qs)
 
         trunc_fn = get_trunc_function(period)
 
-        # FIX: units-sold ke liye seedha Sum("items__quantity") lagane se
-        # Order-OrderItem join fan-out ho jata — jis order ke 2+ items hon
-        # wo order Count("id")/Sum("total_amount") mein bhi multiple baar
-        # count ho jata (galat total_orders/total_revenue). Isliye pehle
-        # per-order units_sold ek scalar Subquery se nikalte hain (koi
-        # join/fan-out nahi hota), phir bucket ke hisaab se normal
-        # group-by/Sum chalta hai.
-        units_subquery = (
-            OrderItem.objects.filter(order=OuterRef("pk"))
-            .values("order")
-            .annotate(total=Sum("quantity"))
-            .values("total")
-        )
-
-        qs = qs.annotate(
-            units_sold=Coalesce(
-                Subquery(units_subquery, output_field=IntegerField()), 0
-            )
-        )
-
         rows = (
-            qs.annotate(bucket=trunc_fn("created_at"))
+            items_qs.annotate(bucket=trunc_fn("order__created_at"))
             .values("bucket")
-            .annotate(
-                total_orders=Count("id"),
-                total_revenue=Sum("total_amount"),
-                total_units=Sum("units_sold"),
-            )
+            .annotate(**concept_aggregates(include_orders=True))
             .order_by("bucket")
         )
 
@@ -347,55 +500,64 @@ class SalesReportView(APIView):
                 bucket = bucket.strftime("%Y-01-01")
             elif period == "monthly":
                 bucket = bucket.strftime("%Y-%m-01")
-            elif period == "daily":
-                bucket = bucket.strftime("%Y-%m-%d")
             else:
-                # weekly
+                # daily / weekly
                 bucket = bucket.strftime("%Y-%m-%d")
 
+            metrics = build_concept_metrics(row)
             data.append(
                 {
                     "date": bucket,
                     "total_orders": row["total_orders"],
-                    "total_revenue": row["total_revenue"] or 0,
-                    "total_units": row["total_units"] or 0,   # NEW
+                    "total_units": metrics["units_sold"],
+                    **metrics,
                 }
             )
+
+        totals = items_qs.aggregate(**concept_aggregates(include_orders=True))
+        summary = {
+            "total_orders": totals["total_orders"],
+            **build_concept_metrics(totals),
+        }
 
         return Response(
             {
                 "period": period,
+                "summary": summary,
                 "data": data,
             }
         )
-        
+
+
 class RevenueReportView(APIView):
     """
-    GET /api/v1/analytics/revenue/?start_date=&end_date=&period=daily|weekly|monthly|yearly
+    GET /api/v1/analytics/revenue/?start_date=&end_date=&period=daily|weekly|monthly|yearly&status=
+
+    UPDATED (Sep 2026 — profit/markup/margin concepts): same change as
+    SalesReportView — revenue is now the sum of selling price x quantity
+    from OrderItem rows, and every period also carries total_cost,
+    gross_profit / total_markup, markup_percent, profit_percent,
+    profit_margin_percent, etc. Existing keys (period, revenue) are
+    unchanged; new keys were only added.
     """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
     def get(self, request):
         start_date, end_date, period = parse_date_range(request)
 
-        # FIX (Sep 2026 — Sales/Revenue Report vs Export mismatch): status
-        # is now a real, explicit filter (?status=sold|cancelled|refunded|
-        # all|<exact status>, defaults to "sold") instead of being
-        # hardcoded to paid orders only - see filter_orders_by_status().
-        qs = filter_orders_by_date(
+        orders_qs = filter_orders_by_date(
             filter_orders_by_status(Order.objects.all(), request.query_params.get("status")),
             start_date,
             end_date,
         )
+        items_qs = OrderItem.objects.filter(order__in=orders_qs)
 
         trunc_fn = get_trunc_function(period)
 
         rows = (
-            qs.annotate(period_bucket=trunc_fn("created_at"))
+            items_qs.annotate(period_bucket=trunc_fn("order__created_at"))
             .values("period_bucket")
-            .annotate(
-                revenue=Sum("total_amount")
-            )
+            .annotate(**concept_aggregates())
             .order_by("period_bucket")
         )
 
@@ -408,24 +570,117 @@ class RevenueReportView(APIView):
                 period_value = bucket.strftime("%Y")
             elif period == "monthly":
                 period_value = bucket.strftime("%Y-%m")
-            elif period == "daily":
-                period_value = bucket.strftime("%Y-%m-%d")
             else:
-                # weekly
+                # daily / weekly
                 period_value = bucket.strftime("%Y-%m-%d")
 
+            metrics = build_concept_metrics(row)
             data.append(
                 {
                     "period": period_value,
-                    "revenue": row["revenue"] or 0,
+                    "revenue": metrics["total_revenue"],
+                    **metrics,
                 }
             )
 
+        summary = build_concept_metrics(items_qs.aggregate(**concept_aggregates()))
+
         return Response(
             {
+                "summary": summary,
                 "data": data,
             }
         )
+
+
+class ProfitReportView(APIView):
+    """
+    GET /api/v1/analytics/profit/?start_date=&end_date=&period=daily|weekly|monthly|yearly&status=
+
+    Full profit report — every concept in the profit table, for the
+    whole date range (`summary`) and per period (`data`):
+      units_sold, avg_selling_price_per_unit, avg_cost_per_unit,
+      total_revenue, total_cost (COGS), markup_per_unit, total_markup,
+      gross_profit, markup_percent, profit_percent, profit_margin_percent
+    (formulas: see concept_aggregates() / build_concept_metrics()).
+
+    Built from actual OrderItem rows, so an order keeps the selling
+    price it was placed at even if Product.price changes later. Cost is
+    the product's CURRENT purchase_price (OrderItem has no cost
+    snapshot) — if cost changes over time and exact history matters,
+    purchase_price would need copying onto OrderItem at checkout, the
+    way `price` already is. Known limitation, not fixed here.
+
+    Also returns `discounts_given` and `shipping_collected` (summary
+    only) — money that is part of what customers paid (Order.total_amount
+    = items - discount + shipping) but deliberately NOT part of
+    revenue/profit above, shown separately so nothing is hidden.
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+
+    def get(self, request):
+        start_date, end_date, period = parse_date_range(request)
+
+        orders_qs = filter_orders_by_date(
+            filter_orders_by_status(Order.objects.all(), request.query_params.get("status")),
+            start_date,
+            end_date,
+        )
+        items_qs = OrderItem.objects.filter(order__in=orders_qs)
+
+        totals = items_qs.aggregate(**concept_aggregates(include_orders=True))
+        order_money = orders_qs.aggregate(
+            discounts_given=Coalesce(
+                Sum("discount_amount"), Value(0), output_field=MONEY_FIELD
+            ),
+            shipping_collected=Coalesce(
+                Sum("shipping_cost"), Value(0), output_field=MONEY_FIELD
+            ),
+        )
+
+        summary = {
+            "total_orders": totals["total_orders"],
+            **build_concept_metrics(totals),
+            **order_money,
+        }
+
+        trunc_fn = get_trunc_function(period)
+
+        rows = (
+            items_qs.annotate(bucket=trunc_fn("order__created_at"))
+            .values("bucket")
+            .annotate(**concept_aggregates(include_orders=True))
+            .order_by("bucket")
+        )
+
+        data = []
+        for row in rows:
+            bucket = row["bucket"]
+
+            # Same bucket-label format as SalesReportView.
+            if period == "yearly":
+                bucket_label = bucket.strftime("%Y-01-01")
+            elif period == "monthly":
+                bucket_label = bucket.strftime("%Y-%m-01")
+            else:
+                bucket_label = bucket.strftime("%Y-%m-%d")
+
+            metrics = build_concept_metrics(row)
+            data.append({
+                "date": bucket_label,
+                "total_orders": row["total_orders"],
+                # legacy key names kept from the first version of this endpoint
+                "revenue": metrics["total_revenue"],
+                "cost": metrics["total_cost"],
+                **metrics,
+            })
+
+        return Response({
+            "period": period,
+            "summary": summary,
+            "data": data,
+        })
+
 
 class OrdersAnalyticsView(APIView):
     """
@@ -525,11 +780,19 @@ class BestSellersView(generics.GenericAPIView):
                 qs = qs.filter(product__category_id__in=category_ids)
 
 
+        # UPDATED (Sep 2026 — profit/markup/margin concepts): each product
+        # row now also carries total_cost, gross_profit / total_markup,
+        # markup_per_unit, markup_percent, profit_percent,
+        # profit_margin_percent, avg_selling_price_per_unit and
+        # avg_cost_per_unit (see concept_aggregates()). total_revenue is
+        # still the sum of selling price x quantity, so the existing
+        # `ordering=-total_revenue` and all existing keys behave exactly
+        # as before.
         qs = (
             qs.values("product_id", "product_name")
               .annotate(
                   total_sold=Sum("quantity"),
-                  total_revenue=Sum("total_price"),
+                  **concept_aggregates(),
               )
               .order_by(*self.ORDERING_MAP[ordering])
         )
@@ -540,7 +803,7 @@ class BestSellersView(generics.GenericAPIView):
                     "product_id": item["product_id"],
                     "name": item["product_name"],   # API docs expect "name"
                     "total_sold": item["total_sold"],
-                    "total_revenue": item["total_revenue"],
+                    **build_concept_metrics(item),
                 }
                 for item in rows
             ]
@@ -1015,39 +1278,63 @@ class AnalyticsExportView(APIView):
                 order.created_at,
             ])
 
+    # NEW (Sep 2026 — profit/markup/margin concepts): shared writer for
+    # the Sales and Revenue CSVs — one row per order, with the same
+    # concept columns the dashboard reports show (see
+    # annotate_order_concepts / build_concept_metrics). "Order Total Paid"
+    # is what the customer actually paid (items - discount + shipping),
+    # kept so the file still reconciles with payments; the concept
+    # columns are product sales only.
+    def _write_order_concept_rows(self, writer, qs, include_units):
+        def blank(v):
+            return '' if v is None else v
+
+        header = ['Order Number', 'Customer']
+        if include_units:
+            header.append('Units Sold')
+        header += [
+            'Total Revenue (Sales)', 'Total Cost (COGS)',
+            'Gross Profit (Total Markup)', 'Markup %', 'Profit %',
+            'Profit Margin %', 'Order Total Paid', 'Status', 'Created At',
+        ]
+        writer.writerow(header)
+
+        for order in annotate_order_concepts(qs).select_related('customer'):
+            m = build_concept_metrics({
+                'total_revenue': order.total_revenue,
+                'total_cost': order.total_cost,
+                'costed_revenue': order.costed_revenue,
+                'units_sold': order.units_sold,
+                'costed_units': order.costed_units,
+            })
+            row = [order.order_number, order.customer.name]
+            if include_units:
+                row.append(m['units_sold'])
+            row += [
+                m['total_revenue'], m['total_cost'], m['gross_profit'],
+                blank(m['markup_percent']), blank(m['profit_percent']),
+                blank(m['profit_margin_percent']),
+                order.total_amount, order.status, order.created_at,
+            ]
+            writer.writerow(row)
+
     def _export_sales(self, writer, start_date, end_date, status_param=None):
-        # FIX (Sep 2026 — Sales/Revenue Report vs Export mismatch): this
-        # had NO status filter at all before — every order regardless of
-        # status (pending_payment, on_hold, cancelled, everything) was
-        # exported, while the Sales Report dashboard cards only ever
-        # counted paid orders. That mismatch is exactly the bug reported —
-        # dashboard and CSV showing different numbers for the same date
-        # range. Now uses filter_orders_by_status() with the same
-        # ?status= value the dashboard is filtered to (defaults to "sold",
-        # matching SalesReportView's default).
+        # FIX (Sep 2026 — Sales/Revenue Report vs Export mismatch): uses
+        # filter_orders_by_status() with the same ?status= value the
+        # dashboard is filtered to (defaults to "sold").
+        # UPDATED (Sep 2026 — profit concepts): now writes the concept
+        # columns (revenue, COGS, gross profit, markup %, profit %,
+        # margin %) instead of just Total Amount.
         qs = filter_orders_by_status(Order.objects.all(), status_param)
         qs = filter_orders_by_date(qs, start_date, end_date)
-        writer.writerow(['Order Number', 'Customer', 'Items', 'Total Amount', 'Status', 'Created At'])
-        for order in qs.select_related('customer').prefetch_related('items'):
-            writer.writerow([
-                order.order_number, order.customer.name, order.items.count(),
-                order.total_amount, order.status, order.created_at,
-            ])
+        self._write_order_concept_rows(writer, qs, include_units=True)
 
     def _export_revenue(self, writer, start_date, end_date, status_param=None):
-        # FIX (Sep 2026 — Sales/Revenue Report vs Export mismatch): now
-        # uses the same filter_orders_by_status() as RevenueReportView,
-        # driven by the same ?status= value the dashboard is filtered to
-        # (defaults to "sold" — Order.REVENUE_STATUSES — matching the
-        # previous hardcoded behaviour when no filter is selected).
+        # Same status filter as RevenueReportView (defaults to "sold").
+        # UPDATED (Sep 2026 — profit concepts): see _export_sales above.
         qs = filter_orders_by_status(Order.objects.all(), status_param)
         qs = filter_orders_by_date(qs, start_date, end_date)
-        writer.writerow(['Order Number', 'Customer', 'Total Amount', 'Status', 'Created At'])
-        for order in qs.select_related('customer'):
-            writer.writerow([
-                order.order_number, order.customer.name,
-                order.total_amount, order.status, order.created_at,
-            ])
+        self._write_order_concept_rows(writer, qs, include_units=False)
 
     def _export_discounts(self, writer, start_date, end_date):
         # UPDATED (22 Sep 2026 — export filter gaps): status, discount_type,
@@ -1276,15 +1563,33 @@ class AnalyticsExportView(APIView):
         if ordering in ('created_at', '-created_at', 'price', '-price', 'name', '-name'):
             qs = qs.order_by(ordering)
 
-        writer.writerow(['SKU', 'Name', 'Category', 'Price', 'Stock', 'Is Active', 'Created At'])
+        # UPDATED (Sep 2026 — profit/markup/margin concepts): per-unit
+        # Purchase Price (cost), Markup, Markup %, Profit % and Profit
+        # Margin % added after Price — from the Product model properties.
+        # Blank when purchase_price was never set.
+        def blank(v):
+            return '' if v is None else v
+
+        writer.writerow([
+            'SKU', 'Name', 'Category', 'Price', 'Purchase Price',
+            'Markup (per unit)', 'Markup %', 'Profit %', 'Profit Margin %',
+            'Stock', 'Is Active', 'Created At',
+        ])
         for p in qs:
+            mp = p.markup_percent
+            pp = p.profit_percent
+            mg = p.profit_margin_percent
             writer.writerow([
                 # FIX (16 Sep 2026 — Filtering Fix / export review): was
                 # p.stock (deprecated, frozen field) — see Low Stock
                 # Products API 38 and _export_inventory above for the
                 # same fix elsewhere. Uses available_stock instead.
                 p.sku, p.name, p.category.name if p.category else '',
-                p.price, p.available_stock, p.is_active, p.created_at,
+                p.price, blank(p.purchase_price), blank(p.markup_amount),
+                blank(round(mp, 2) if mp is not None else None),
+                blank(round(pp, 2) if pp is not None else None),
+                blank(round(mg, 2) if mg is not None else None),
+                p.available_stock, p.is_active, p.created_at,
             ])
 
     def _export_categories(self, writer, start_date, end_date):

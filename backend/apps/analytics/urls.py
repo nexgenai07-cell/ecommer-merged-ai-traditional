@@ -5,7 +5,7 @@ from .views import TrackBehaviorView, CustomerBehaviorListView
 from .dashboard_views import (
     DashboardView, SalesReportView, RevenueReportView, OrdersAnalyticsView,
     BestSellersView, LowPerformingProductsView, CustomerGrowthView,
-    InventoryAlertsView, AnalyticsExportView,
+    InventoryAlertsView, AnalyticsExportView, ProfitReportView,
 )
 
 # Note: included under 'api/v1/analytics/' in core/urls.py
@@ -18,6 +18,8 @@ urlpatterns = [
     path('dashboard/', DashboardView.as_view(), name='analytics-dashboard'),
     path('sales/', SalesReportView.as_view(), name='analytics-sales'),
     path('revenue/', RevenueReportView.as_view(), name='analytics-revenue'),
+    # NEW (Sep 2026 — profit/markup/margin reporting)
+    path('profit/', ProfitReportView.as_view(), name='analytics-profit'),
     path('orders/', OrdersAnalyticsView.as_view(), name='analytics-orders'),
     path('products/best-sellers/', BestSellersView.as_view(), name='analytics-best-sellers'),
     path('products/low-performing/', LowPerformingProductsView.as_view(), name='analytics-low-performing'),

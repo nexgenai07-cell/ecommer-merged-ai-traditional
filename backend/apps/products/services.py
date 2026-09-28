@@ -5,6 +5,7 @@ from django.db.models import F
 
 from .models import Product, StockMovement
 from apps.notifications.utils import create_notification
+from .signals import broadcast_product   # NEW (Sep 2026): live stock update
 
 
 # NEW (Notification Triggers Addendum, Item 17): "Low stock alert".
@@ -93,6 +94,11 @@ def adjust_stock(
         )
 
         product.refresh_from_db() # Reloads the updated product from the database.
+
+        # NEW (Sep 2026 — live updates): the .update(F(...)) above bypasses
+        # Django signals, so the post_save receiver never fires for it.
+        # Broadcast manually (sent only after this transaction commits).
+        broadcast_product(product)
 
         # ============================================================
         # NEW: Log with total_stock values
