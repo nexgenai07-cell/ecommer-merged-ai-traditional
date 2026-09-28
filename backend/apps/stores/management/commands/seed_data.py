@@ -1,65 +1,38 @@
 """
 PATH: apps/stores/management/commands/seed_data.py
 
-Complete ecommerce seed script.
-Run with: python manage.py seed_data
+Seeds ONLY categories and products (with images).
+Run with:  python manage.py seed_data
+Optional:  python manage.py seed_data --clear
+           (soft-deletes existing products and categories first)
 
-What it creates:
-  - 1 Store (if not exists)
-  - 1 Admin user (if not exists)
-  - 5 Customer users + profiles
-  - 12 Categories (Electronics, Clothing, Shoes, etc.) — each with a real image
-  - 65 Products across all categories (with prices, stock, SKUs) — each with a real image
-  - 4 Active discount codes
-
-Orders/Returns/Complaints seeding was removed (schema mismatch with the
-current Order model — payment_method field doesn't exist on it).
-
-Safe to run multiple times — uses get_or_create everywhere.
+Requires an existing Store and admin user. Creates no users or customers.
+Safe to run multiple times: uses get_or_create.
 """
 
-import os
-import random
 from decimal import Decimal
-from datetime import timedelta
-from django.core.management.base import BaseCommand
-from django.utils import timezone
-from django.utils.text import slugify
-from django.db import transaction
-from requests import options
 
 import cloudinary.uploader
 from cloudinary import CloudinaryImage
+from django.core.management.base import BaseCommand
+from django.db import transaction
+from django.utils.text import slugify
 
-from apps.users.models import User
-from apps.stores.models import Store
 from apps.categories.models import Category
-from apps.products.models import Product, ProductImage, Discount
-from apps.orders.models import Customer
+from apps.products.models import Product, ProductImage
+from apps.stores.models import Store
+from apps.users.models import User
 
-
-# ─── Helpers ────────────────────────────────────────────────────────────────
 
 def p(price):
     return Decimal(str(price))
 
 
-def pick(lst):
-    return random.choice(lst)
-
-
 def upload_stock_photo(seed, folder):
     """
-    Fetches a real (non-dummy) stock photo from Picsum and uploads it to
-    Cloudinary. Returns a CloudinaryImage object (public_id + format +
-    version) — this is the object type CloudinaryField actually knows how
-    to save correctly. Passing just public_id, or a raw dict, produces a
-    broken URL / a DB error, because the field only special-cases
-    CloudinaryResource/CloudinaryImage instances.
-    `overwrite=True` + a stable public_id (from the seed) means re-running
-    this is safe and idempotent — it just refreshes/confirms the same asset.
-    Returns None (and prints a warning) instead of raising, so one failed
-    image never breaks the whole seed run.
+    Uploads a stock photo to Cloudinary and returns a CloudinaryImage.
+    Returns None (and prints a warning) on failure, so one bad image
+    never breaks the whole seed run.
     """
     try:
         source_url = f"https://picsum.photos/seed/{slugify(seed)}/600/600"
@@ -80,393 +53,240 @@ def upload_stock_photo(seed, folder):
         return None
 
 
-# ─── Data ───────────────────────────────────────────────────────────────────
-
+# Each product: (name, price, original_price, stock, sku, description)
 CATEGORIES = [
     {
-        "name": "Electronics",
-        "description": "Smartphones, laptops, tablets, and all digital gadgets",
+        "name": "Jewellery",
+        "description": "Necklaces, earrings, bangles and bridal jewellery sets",
         "products": [
-            {"name": "Samsung Galaxy S24 Ultra", "price": 299999, "original_price": 329999, "stock": 25, "sku": "SAM-S24U-BLK", "description": "6.8-inch Dynamic AMOLED, 200MP camera, 5000mAh battery, S Pen included. The flagship Samsung experience."},
-            {"name": "iPhone 15 Pro Max", "price": 399999, "original_price": 429999, "stock": 18, "sku": "APL-15PM-NTT", "description": "6.7-inch Super Retina XDR, A17 Pro chip, 48MP camera system, titanium design."},
-            {"name": "Xiaomi Redmi Note 13 Pro", "price": 54999, "original_price": 62999, "stock": 60, "sku": "XMI-RN13P-BLU", "description": "6.67-inch AMOLED, 200MP camera, 5100mAh battery, 67W fast charging."},
-            {"name": "Dell XPS 15 Laptop", "price": 389999, "original_price": 419999, "stock": 10, "sku": "DEL-XPS15-2024", "description": "15.6-inch 4K OLED, Intel Core i9, 32GB RAM, 1TB SSD, NVIDIA RTX 4070."},
-            {"name": "HP Pavilion Gaming Laptop", "price": 159999, "original_price": 179999, "stock": 22, "sku": "HP-PAV-G15-AMD", "description": "15.6-inch FHD 144Hz, AMD Ryzen 7, 16GB RAM, 512GB SSD, RTX 3050."},
-            {"name": "Apple iPad Pro 12.9-inch", "price": 249999, "original_price": 269999, "stock": 15, "sku": "APL-IPAD-PRO12", "description": "M2 chip, Liquid Retina XDR display, Face ID, USB-C with Thunderbolt."},
-            {"name": "Sony WH-1000XM5 Headphones", "price": 79999, "original_price": 89999, "stock": 35, "sku": "SNY-WH1000XM5", "description": "Industry-leading noise cancellation, 30-hour battery life, crystal clear hands-free calling."},
-            {"name": "JBL Charge 5 Speaker", "price": 29999, "original_price": 34999, "stock": 45, "sku": "JBL-CHG5-BLK", "description": "Portable Bluetooth speaker, IP67 waterproof, 20 hours playtime, built-in powerbank."},
-            {"name": "Samsung 65-inch 4K Smart TV", "price": 199999, "original_price": 229999, "stock": 8, "sku": "SAM-TV65-4K", "description": "QLED 4K display, Tizen OS, HDR10+, built-in Alexa and Google Assistant."},
-            {"name": "Canon EOS R50 Camera", "price": 149999, "original_price": 164999, "stock": 12, "sku": "CAN-EOSR50-KIT", "description": "24.2MP APS-C sensor, 4K video, dual pixel autofocus, lightweight mirrorless design."},
-        ]
+            ("Kundan Bridal Necklace Set", 45999, 54999, 12, "JWL-KND-BRD01", "Traditional kundan necklace with matching earrings and tikka. Gold-plated, ideal for weddings."),
+            ("Pearl Drop Earrings", 3499, 4500, 60, "JWL-PRL-ERR02", "Freshwater pearl drops on sterling silver hooks. Lightweight and elegant for daily wear."),
+            ("Gold Plated Jhumka Earrings", 2999, 3999, 70, "JWL-JHM-GLD03", "Handcrafted gold plated jhumkas with fine filigree work and pearl beads."),
+            ("Antique Bangles Set of 6", 5499, 6999, 40, "JWL-BNG-ANT04", "Set of six antique-finish bangles with meenakari detailing. Adjustable sizes available."),
+            ("Layered Chain Necklace", 2499, 3299, 55, "JWL-LYR-CHN05", "Double layer gold-tone chain with tiny crystal charms. Anti-tarnish coating."),
+            ("Emerald Green Choker Set", 8999, 11999, 20, "JWL-CHK-EMR06", "Choker necklace with green stones and matching earrings, perfect for mehndi and nikkah events."),
+        ],
     },
     {
-        "name": "Men's Clothing",
-        "description": "Shirts, trousers, kurtas, jackets and formal wear for men",
+        "name": "Cosmetics",
+        "description": "Makeup, lipsticks, eye products and beauty essentials",
         "products": [
-            {"name": "Bonanza Satrangi Men's Kurta", "price": 3499, "original_price": 4500, "stock": 80, "sku": "BON-KRT-MN001", "description": "Premium lawn kurta with embroidered detailing. Available in comfortable summer fabric."},
-            {"name": "Levi's 511 Slim Fit Jeans", "price": 8999, "original_price": 11000, "stock": 55, "sku": "LEV-511-32X30", "description": "Classic slim fit jeans in stretch denim. 5-pocket styling, button fly."},
-            {"name": "Khaadi Men's Casual Shirt", "price": 2899, "original_price": 3800, "stock": 90, "sku": "KHD-CAS-SHT01", "description": "Pure cotton casual shirt with minimalist design, suitable for everyday wear."},
-            {"name": "Men's Formal Suit (3 Piece)", "price": 15999, "original_price": 19999, "stock": 20, "sku": "FRM-SUIT-3PC", "description": "Premium polyester-wool blend, tailored fit. Includes coat, waistcoat and trousers."},
-            {"name": "Nike Dri-FIT T-Shirt", "price": 3999, "original_price": 4999, "stock": 100, "sku": "NIK-DRF-TEE-M", "description": "Moisture-wicking fabric keeps you dry and comfortable during workouts."},
-        ]
+            ("Matte Liquid Lipstick Nude Rose", 1499, 1999, 90, "COS-LIP-NDR01", "Long-wear matte liquid lipstick in a soft nude rose shade. Smudge-proof for up to 12 hours."),
+            ("Waterproof Kajal Pencil", 599, 799, 150, "COS-KJL-WTR02", "Intense black waterproof kajal with a creamy, smooth glide. Smudge resistant."),
+            ("Eyeshadow Palette 18 Shades", 3299, 4199, 45, "COS-EYE-PAL03", "Mix of matte and shimmer shades in warm and neutral tones. Highly pigmented."),
+            ("HD Compact Powder", 1199, 1599, 80, "COS-CMP-HD04", "Oil control compact powder with a natural matte finish and SPF 15."),
+            ("Volumizing Mascara", 1299, 1699, 85, "COS-MSC-VOL05", "Lengthening and volumizing mascara with a curved brush. Clump-free formula."),
+            ("Makeup Brush Set 12 Pcs", 2799, 3599, 50, "COS-BRS-12PC06", "Soft synthetic bristles brush set with a travel pouch. Includes face and eye brushes."),
+        ],
     },
     {
-        "name": "Women's Clothing",
-        "description": "Shalwar kameez, western wear, abayas and ethnic collections",
+        "name": "Watches",
+        "description": "Analog, digital and smart watches for men and women",
         "products": [
-            {"name": "Gul Ahmed Stitched 3-Piece Suit", "price": 5999, "original_price": 7500, "stock": 65, "sku": "GA-3PC-SUM001", "description": "Premium lawn 3-piece with printed dupatta and trouser. Machine washable."},
-            {"name": "Sapphire Women's Embroidered Kurta", "price": 4499, "original_price": 5999, "stock": 50, "sku": "SAP-EMB-KRT02", "description": "Floral embroidered kurta in viscose fabric. Semi-formal, ideal for gatherings."},
-            {"name": "Zara Women's Midi Dress", "price": 9999, "original_price": 13999, "stock": 30, "sku": "ZAR-MDI-DRS01", "description": "Flowy midi dress in floral print, V-neck, ideal for brunches and casual outings."},
-            {"name": "Limelight Printed Palazzo Set", "price": 3299, "original_price": 4200, "stock": 75, "sku": "LML-PLZ-SET01", "description": "Comfortable cotton palazzo set with matching top. Easy to wear all day."},
-            {"name": "J. Junaid Jamshed Party Wear", "price": 12999, "original_price": 15999, "stock": 25, "sku": "JJ-PTY-WR001", "description": "Heavy embroidered chiffon suit, perfect for weddings and formal events."},
-        ]
+            ("Rose Gold Ladies Analog Watch", 6999, 8999, 30, "WTC-LDY-RSG01", "Slim rose gold case with mesh strap and a crystal-studded dial. Water resistant."),
+            ("Classic Leather Strap Men's Watch", 7999, 9999, 35, "WTC-MEN-LTH02", "Minimalist dial, genuine leather strap, date display and scratch-resistant glass."),
+            ("Smart Watch Pro Fitness Tracker", 12999, 16999, 25, "WTC-SMT-PRO03", "1.8-inch AMOLED display, heart rate and SpO2 monitor, 7-day battery, IP68."),
+            ("Stainless Steel Chronograph", 14999, 18999, 18, "WTC-CHR-STL04", "Stainless steel chronograph with three sub-dials, luminous hands, 50m water resistance."),
+            ("Couple Watch Set Black and Silver", 9999, 12999, 22, "WTC-CPL-SET05", "Matching pair for him and her, stainless steel bands with a gift box."),
+            ("Kids Digital Sports Watch", 1999, 2599, 70, "WTC-KID-DGT06", "Colourful digital watch with backlight, stopwatch and an alarm. Shock resistant."),
+        ],
     },
     {
-        "name": "Footwear",
-        "description": "Shoes, sandals, sneakers and boots for men and women",
+        "name": "Rings",
+        "description": "Diamond, gemstone, silver and adjustable rings",
         "products": [
-            {"name": "Nike Air Max 270", "price": 24999, "original_price": 29999, "stock": 40, "sku": "NIK-AM270-WHT", "description": "Lifestyle shoe with large Air unit for all-day comfort. Mesh upper for breathability."},
-            {"name": "Adidas Ultraboost 22", "price": 27999, "original_price": 32999, "stock": 35, "sku": "ADI-UB22-BLK", "description": "Running shoe with BOOST midsole technology. Primeknit+ upper, supportive fit."},
-            {"name": "Bata Formal Oxford Shoes", "price": 5999, "original_price": 7999, "stock": 60, "sku": "BAT-OXF-MN001", "description": "Classic leather oxford for office and formal occasions. Slip-resistant sole."},
-            {"name": "Servis Women's Heeled Sandals", "price": 3499, "original_price": 4500, "stock": 70, "sku": "SRV-HEL-SND01", "description": "Block heel sandals with adjustable ankle strap. Comfortable for extended wear."},
-            {"name": "Skechers Go Walk Arch Fit", "price": 14999, "original_price": 17999, "stock": 45, "sku": "SKC-GWK-AF001", "description": "Podiatrist-certified arch support, lightweight design, machine washable."},
-        ]
+            ("Sterling Silver Solitaire Ring", 4999, 6499, 40, "RNG-SLV-SOL01", "925 sterling silver ring with a cubic zirconia solitaire. Rhodium plated."),
+            ("Gold Plated Adjustable Ring", 1499, 1999, 90, "RNG-GLD-ADJ02", "Adjustable open band ring with delicate leaf design. Fits most sizes."),
+            ("Turquoise Firoza Stone Ring", 5999, 7499, 30, "RNG-FRZ-STN03", "Natural firoza stone set in oxidized silver, traditional design."),
+            ("Rose Gold Couple Rings Pair", 3999, 4999, 45, "RNG-CPL-RSG04", "Matching promise rings in rose gold plating with a polished finish."),
+            ("Emerald Cut Engagement Ring", 24999, 29999, 10, "RNG-ENG-EMR05", "Emerald cut stone with side accents, 18k gold plated silver base. Comes in a velvet box."),
+            ("Stackable Ring Set of 5", 2299, 2999, 65, "RNG-STK-SET06", "Five thin stackable rings in mixed gold and silver tones, mix and match daily."),
+        ],
     },
     {
-        "name": "Home & Kitchen",
-        "description": "Appliances, cookware, bedding and home decor",
+        "name": "Abayas",
+        "description": "Modern, embroidered and everyday abayas and jilbabs",
         "products": [
-            {"name": "Dawlance Refrigerator 20 CFT", "price": 119999, "original_price": 134999, "stock": 10, "sku": "DAW-REF-20CFT", "description": "Frost-free refrigerator, twin inverter technology, 5-star energy rating, glass shelves."},
-            {"name": "Anex Stand Mixer", "price": 18999, "original_price": 22999, "stock": 20, "sku": "ANX-MXR-600W", "description": "600W motor, 6 speed settings, 5L stainless steel bowl, includes dough hook and whisk."},
-            {"name": "Westpoint Microwave Oven 30L", "price": 24999, "original_price": 28999, "stock": 18, "sku": "WP-MWO-30L", "description": "30-litre capacity, 900W power, 10 power levels, child lock, auto-cook menus."},
-            {"name": "Royal Comfort Bed Sheet Set", "price": 4999, "original_price": 6500, "stock": 50, "sku": "RC-BSS-KING01", "description": "1000 thread count Egyptian cotton, King size, includes 2 pillowcases and fitted sheet."},
-            {"name": "Prestige Pressure Cooker 7L", "price": 6999, "original_price": 8999, "stock": 35, "sku": "PRE-PC-7L-SS", "description": "Stainless steel pressure cooker, induction compatible, safety valve, 5-year warranty."},
-        ]
+            ("Nida Black Open Abaya", 5999, 7499, 50, "ABY-NDA-BLK01", "Premium nida fabric open front abaya with a belt. Lightweight, wrinkle resistant."),
+            ("Embroidered Butterfly Abaya", 8999, 11499, 30, "ABY-EMB-BTF02", "Butterfly cut abaya with hand embroidered sleeves and cuffs. Comes with a matching scarf."),
+            ("Dubai Style Kaftan Abaya", 7499, 9499, 35, "ABY-DXB-KFT03", "Loose kaftan fit with wide sleeves in soft crepe. Available in navy and black."),
+            ("Pearl Detail Formal Abaya", 12999, 15999, 20, "ABY-PRL-FRM04", "Formal abaya with pearl trimmed sleeves and front panel. Ideal for events and Eid."),
+            ("Everyday Zipper Abaya", 3999, 4999, 80, "ABY-ZIP-DLY05", "Simple front zipper abaya in breathable fabric, comfortable for daily wear."),
+            ("Kids Girls Abaya Set", 2999, 3799, 45, "ABY-KID-GRL06", "Girls abaya with a matching hijab. Soft fabric, sizes for ages 5 to 12."),
+        ],
     },
     {
-        "name": "Beauty & Personal Care",
-        "description": "Skincare, makeup, haircare and grooming products",
+        "name": "Hijabs & Scarves",
+        "description": "Chiffon, jersey and silk hijabs, scarves and underscarves",
         "products": [
-            {"name": "L'Oreal Paris Revitalift Serum", "price": 3999, "original_price": 4999, "stock": 60, "sku": "LOR-RVL-SRM30", "description": "1.5% pure Hyaluronic Acid + Vitamin C serum, reduces wrinkles, plumps skin in 1 week."},
-            {"name": "Maybelline Fit Me Foundation", "price": 1899, "original_price": 2500, "stock": 90, "sku": "MAY-FTM-FND120", "description": "Natural finish foundation, SPF 18, pore-minimizing, available in 20 shades."},
-            {"name": "Dove Intensive Repair Shampoo", "price": 899, "original_price": 1100, "stock": 120, "sku": "DOV-SHP-700ML", "description": "700ml, Keratin Repair Actives, reduces breakage by up to 98%, for damaged hair."},
-            {"name": "Gillette Mach3 Razor Set", "price": 2499, "original_price": 2999, "stock": 80, "sku": "GIL-M3-SET05", "description": "5 cartridges + handle, 3 Lubrastrip blades, flexible head for close shave."},
-            {"name": "Neutrogena Hydro Boost Moisturizer", "price": 2799, "original_price": 3499, "stock": 55, "sku": "NEU-HB-MCR50", "description": "Water gel formula, Hyaluronic Acid, oil-free, non-comedogenic, 50ml."},
-        ]
+            ("Premium Chiffon Hijab", 1299, 1699, 120, "HJB-CHF-PRM01", "Soft georgette chiffon hijab, 180x75cm, easy to drape in 20+ colours."),
+            ("Instant Jersey Hijab", 999, 1299, 140, "HJB-JRS-INS02", "Ready to wear slip-on jersey hijab, breathable and stretchable, no pins needed."),
+            ("Pure Silk Printed Scarf", 3499, 4499, 40, "HJB-SLK-PRT03", "Pure silk scarf with a floral print and hand rolled edges. Large square size."),
+            ("Cotton Underscarf Cap Pack of 3", 899, 1199, 160, "HJB-CAP-3PK04", "Anti-slip cotton caps in black, white and beige. Keep the hijab firmly in place."),
+            ("Lawn Printed Dupatta Hijab", 1599, 2099, 75, "HJB-LWN-DUP05", "Lightweight lawn hijab with digital print, ideal for summer."),
+            ("Hijab Pins and Magnets Set", 799, 1099, 200, "HJB-PIN-SET06", "Set of 40 pearl head pins plus 6 magnetic hijab pins, no fabric damage."),
+        ],
     },
     {
-        "name": "Sports & Fitness",
-        "description": "Exercise equipment, sportswear and outdoor gear",
+        "name": "Perfumes & Attar",
+        "description": "Eau de parfum, oud, musk and traditional attar oils",
         "products": [
-            {"name": "PowerMax Treadmill TDM-100", "price": 79999, "original_price": 94999, "stock": 8, "sku": "PMX-TDM100", "description": "3HP motor, 1-12 km/h speed, 12 preset programs, LCD display, max user weight 120kg."},
-            {"name": "Decathlon Yoga Mat 10mm", "price": 3999, "original_price": 4999, "stock": 75, "sku": "DCA-YGM-10MM", "description": "Non-slip surface, eco-friendly TPE material, carrying strap included, 183x61cm."},
-            {"name": "Wilson Tennis Racket Pro", "price": 12999, "original_price": 15999, "stock": 25, "sku": "WLS-TEN-PRO", "description": "Carbon graphite frame, 100sq inch head, pre-strung, suitable for intermediate players."},
-            {"name": "Everlast Boxing Gloves 16oz", "price": 7999, "original_price": 9999, "stock": 30, "sku": "EVL-BOX-16OZ", "description": "Leather palm, foam padding, hook-and-loop wrist closure, suitable for sparring."},
-            {"name": "Speedo Swimming Goggles", "price": 2999, "original_price": 3999, "stock": 50, "sku": "SPD-GGL-UV", "description": "UV protection lenses, anti-fog coating, adjustable nose bridge, silicone seals."},
-        ]
+            ("Royal Oud Eau de Parfum 100ml", 8999, 11499, 30, "PRF-OUD-100M01", "Rich woody fragrance with oud, amber and sandalwood notes. Long lasting."),
+            ("Rose Musk Attar 12ml", 1999, 2599, 80, "PRF-ROS-ATR02", "Alcohol-free attar oil with Taif rose and white musk. Roll-on bottle."),
+            ("Floral Bloom Women's Perfume 50ml", 4999, 6499, 45, "PRF-FLR-BLM03", "Fresh floral scent with jasmine, peony and vanilla. Everyday wear."),
+            ("Sport Fresh Men's Body Spray", 1299, 1699, 100, "PRF-SPT-FRS04", "Citrus and mint body spray for a lasting freshness after workouts."),
+            ("Bakhoor Incense Gift Box", 2999, 3799, 55, "PRF-BKH-GFT05", "Assorted bakhoor chips in a wooden gift box. Includes a small burner."),
+            ("Mini Perfume Travel Set of 4", 3499, 4499, 60, "PRF-MNI-TRV06", "Four 15ml travel-size fragrances, two for her and two for him."),
+        ],
     },
     {
-        "name": "Books & Stationery",
-        "description": "Books, notebooks, office supplies and art materials",
+        "name": "Handbags & Clutches",
+        "description": "Tote bags, shoulder bags, wallets and bridal clutches",
         "products": [
-            {"name": "Atomic Habits by James Clear", "price": 1499, "original_price": 1999, "stock": 100, "sku": "BK-ATOM-HAB", "description": "Bestselling self-improvement book. Learn to build good habits and break bad ones."},
-            {"name": "The Alchemist by Paulo Coelho", "price": 999, "original_price": 1299, "stock": 80, "sku": "BK-ALCH-PCO", "description": "A magical story about following your dreams. Over 65 million copies sold worldwide."},
-            {"name": "Moleskine Classic Notebook A5", "price": 2499, "original_price": 2999, "stock": 60, "sku": "MOL-NB-A5-BLK", "description": "Hardcover, 240 pages, elastic closure, ribbon bookmark, pocket at back."},
-            {"name": "Staedtler Colour Pencils Set 48", "price": 1999, "original_price": 2499, "stock": 70, "sku": "STD-CP-48SET", "description": "48 vibrant colors, break-resistant core, ideal for sketching and coloring."},
-            {"name": "Pilot G2 Gel Pen Pack (12)", "price": 999, "original_price": 1299, "stock": 150, "sku": "PLT-G2-12PK", "description": "Smooth gel ink, 0.7mm tip, retractable, smear and waterproof, 12 assorted colors."},
-        ]
+            ("Faux Leather Tote Bag", 6999, 8999, 35, "BAG-TOT-LTH01", "Spacious tote with an inner zip pocket and a laptop sleeve. Sturdy metal hardware."),
+            ("Embroidered Bridal Clutch", 3999, 5199, 40, "BAG-CLT-BRD02", "Handmade clutch with zardozi work and a detachable chain strap."),
+            ("Mini Crossbody Sling Bag", 3499, 4499, 60, "BAG-SLG-MNI03", "Compact crossbody bag with an adjustable strap, holds phone, cards and keys."),
+            ("Women's Long Zip Wallet", 2299, 2999, 85, "BAG-WLT-ZIP04", "Long wallet with 12 card slots, a coin pocket and a phone compartment."),
+            ("Quilted Shoulder Bag", 7999, 9999, 28, "BAG-QLT-SHD05", "Classic quilted design with a gold chain strap and a magnetic flap closure."),
+            ("Backpack Style Ladies Bag", 5499, 6999, 38, "BAG-BKP-LDY06", "Water resistant fashion backpack with multiple compartments and padded straps."),
+        ],
     },
     {
-        "name": "Toys & Games",
-        "description": "Educational toys, board games and outdoor play items",
+        "name": "Sunglasses & Eyewear",
+        "description": "Sunglasses, blue light glasses and eyewear accessories",
         "products": [
-            {"name": "LEGO City Police Station", "price": 15999, "original_price": 18999, "stock": 20, "sku": "LGO-CPS-60316", "description": "743-piece set, includes police station, truck and 5 minifigures. Age 6+."},
-            {"name": "Monopoly Classic Board Game", "price": 4999, "original_price": 6499, "stock": 35, "sku": "MNP-CLS-BRD", "description": "The original property trading game. 2-6 players, ages 8 and up."},
-            {"name": "Nerf Elite Disruptor Blaster", "price": 3499, "original_price": 4499, "stock": 45, "sku": "NRF-ELT-DSP", "description": "Fires up to 27m, 6-dart rotating drum, single fire and slam fire modes. Age 8+."},
-            {"name": "Fisher-Price Baby Activity Gym", "price": 7999, "original_price": 9999, "stock": 25, "sku": "FP-ACT-GYM01", "description": "5 activity stations, music and lights, tummy-time mirror, detachable toys. Age 0-12m."},
-            {"name": "Rubik's Cube 3x3", "price": 1499, "original_price": 1999, "stock": 80, "sku": "RBK-3X3-ORG", "description": "Original Rubik's Cube, smooth mechanism, vibrant colors, over 43 quintillion combinations."},
-        ]
+            ("Oversized Cat Eye Sunglasses", 2999, 3999, 70, "EYE-CAT-OVR01", "Trendy oversized cat eye frame with UV400 protection lenses."),
+            ("Polarized Aviator Sunglasses", 4499, 5799, 50, "EYE-AVT-POL02", "Metal aviator frame with polarized lenses that reduce glare while driving."),
+            ("Blue Light Blocking Glasses", 2499, 3299, 65, "EYE-BLU-BLK03", "Anti blue light computer glasses to reduce eye strain, lightweight frame."),
+            ("Round Retro Sunglasses", 2799, 3599, 60, "EYE-RND-RTR04", "Vintage round frame with tinted lenses, unisex design, UV400."),
+            ("Eyeglasses Hard Case with Cloth", 699, 999, 150, "EYE-CSE-HRD05", "Protective hard shell case with a microfiber cleaning cloth included."),
+            ("Kids Flexible Sunglasses", 1499, 1999, 75, "EYE-KID-FLX06", "Bendable rubber frame sunglasses with UV protection for ages 3 to 8."),
+        ],
     },
     {
-        "name": "Automotive",
-        "description": "Car accessories, tools and vehicle maintenance products",
+        "name": "Hair Accessories",
+        "description": "Clips, scrunchies, headbands and bridal hair pieces",
         "products": [
-            {"name": "Michelin Tyre 185/65 R15", "price": 18999, "original_price": 21999, "stock": 30, "sku": "MCH-TYR-18565", "description": "All-season tyre, rated for 91T speed, fuel efficient, excellent wet grip."},
-            {"name": "Meguiar's Car Care Kit", "price": 6999, "original_price": 8999, "stock": 40, "sku": "MEG-CCK-5PC", "description": "5-piece detailing kit: car wash, wax, glass cleaner, interior detailer and microfiber."},
-            {"name": "Bosch Car Battery 45Ah", "price": 19999, "original_price": 23999, "stock": 15, "sku": "BSH-BAT-45AH", "description": "Maintenance-free, 12V 45Ah, 400A CCA, suitable for small to mid-size vehicles."},
-            {"name": "Garmin DriveSmart GPS Navigator", "price": 34999, "original_price": 39999, "stock": 12, "sku": "GRM-GPS-DS65", "description": "6.95-inch touchscreen, lifetime maps, voice-activated navigation, traffic alerts."},
-            {"name": "Universal Car Seat Cover Set", "price": 8999, "original_price": 11999, "stock": 50, "sku": "CSC-UNI-FULL", "description": "Full 9-piece set, premium leatherette, water-resistant, airbag compatible, universal fit."},
-        ]
+            ("Pearl Hair Clip Set of 6", 1299, 1699, 110, "HAC-PRL-CLP01", "Six pearl embellished snap clips in assorted sizes for styling."),
+            ("Silk Scrunchies Pack of 5", 999, 1399, 130, "HAC-SLK-SCR02", "Soft satin scrunchies that are gentle on hair and prevent breakage."),
+            ("Bridal Hair Brooch Jooda Pin", 3499, 4499, 35, "HAC-BRD-JDA03", "Decorative jooda pin with stones and pearls, for bridal and party hairstyles."),
+            ("Velvet Padded Headband", 1199, 1599, 90, "HAC-VLV-HDB04", "Wide padded velvet headband, comfortable all day, available in 6 colours."),
+            ("Claw Clip Set Matte Finish", 1099, 1499, 100, "HAC-CLW-MAT05", "Set of 4 large matte claw clips with a strong grip for thick hair."),
+            ("Hair Bun Maker and Pins Kit", 899, 1199, 120, "HAC-BUN-KIT06", "Foam bun maker with 20 hair pins for quick, neat updos."),
+        ],
     },
-    {
-        "name": "Grocery & Food",
-        "description": "Dry food, beverages, snacks and everyday grocery items",
-        "products": [
-            {"name": "Shan Biryani Masala (Pack of 6)", "price": 699, "original_price": 849, "stock": 200, "sku": "SHN-BRY-6PK", "description": "Authentic biryani spice mix, family recipe, 60g each pack. Makes 2kg rice."},
-            {"name": "National Basmati Rice 5kg", "price": 1299, "original_price": 1599, "stock": 150, "sku": "NAT-RCE-5KG", "description": "Premium aged basmati, long grain, aromatic, sella variety. 5kg pack."},
-            {"name": "Lipton Green Tea (100 bags)", "price": 899, "original_price": 1099, "stock": 180, "sku": "LPT-GTE-100", "description": "100 individually wrapped tea bags, natural antioxidants, light refreshing taste."},
-            {"name": "Olpers Full Cream Milk 1.5L", "price": 399, "original_price": 449, "stock": 250, "sku": "OLP-FCM-15L", "description": "UHT full cream milk, 6 months shelf life, rich in calcium and vitamins."},
-            {"name": "Sunridge Farm Mixed Nuts 500g", "price": 1999, "original_price": 2499, "stock": 100, "sku": "SRF-MNT-500", "description": "Premium mix of almonds, cashews, pistachios and walnuts. Unsalted, no preservatives."},
-        ]
-    },
-    {
-        "name": "Health & Wellness",
-        "description": "Vitamins, supplements, medical devices and health monitors",
-        "products": [
-            {"name": "Centrum Men Multivitamin (60 tabs)", "price": 2999, "original_price": 3499, "stock": 70, "sku": "CTR-MEN-60T", "description": "Complete daily multivitamin for men, 22 essential nutrients, supports energy and immunity."},
-            {"name": "Omron Blood Pressure Monitor", "price": 12999, "original_price": 14999, "stock": 25, "sku": "OMR-BPM-HEM", "description": "Upper arm type, clinically validated, stores 60 readings, irregular heartbeat detector."},
-            {"name": "Dr. Morepen Glucometer Kit", "price": 4999, "original_price": 5999, "stock": 35, "sku": "DRM-GLU-KIT", "description": "Blood glucose monitor, 25 test strips + lancets included, 5-second results, 250 reading memory."},
-            {"name": "Ensure Gold Nutrition Powder 400g", "price": 3499, "original_price": 3999, "stock": 50, "sku": "ENS-GLD-400", "description": "Complete balanced nutrition, 26 vitamins and minerals, high protein, vanilla flavour."},
-            {"name": "Himalaya Ashwagandha Tablets (60)", "price": 1299, "original_price": 1599, "stock": 90, "sku": "HIM-ASH-60T", "description": "Pure ashwagandha root extract, reduces stress and anxiety, improves energy and stamina."},
-        ]
-    },
-]
-
-DISCOUNTS = [
-    {
-        "code": "WELCOME10",
-        "type": "percent",
-        "value": 10,
-        "min_order_amount": 2000,
-        "description": "10% off on your first order",
-    },
-    {
-        "code": "SAVE500",
-        "type": "fixed",
-        "value": 500,
-        "min_order_amount": 5000,
-        "description": "Rs 500 flat off on orders above Rs 5000",
-    },
-    {
-        "code": "EID25",
-        "type": "percent",
-        "value": 25,
-        "min_order_amount": 10000,
-        "description": "25% Eid special discount",
-    },
-    {
-        "code": "FREESHIP",
-        "type": "fixed",
-        "value": 200,
-        "min_order_amount": 1500,
-        "description": "Rs 200 off (free shipping equivalent)",
-    },
-]
-
-CUSTOMERS = [
-    {"name": "Ayesha Siddiqui", "email": "ayesha.siddiqui@gmail.com", "phone": "03001234567"},
-    {"name": "Muhammad Usman", "email": "m.usman.pk@gmail.com", "phone": "03219876543"},
-    {"name": "Fatima Zahra", "email": "fatima.zahra.95@gmail.com", "phone": "03331112222"},
-    {"name": "Ahmed Raza", "email": "ahmed.raza.official@gmail.com", "phone": "03114445566"},
-    {"name": "Sana Malik", "email": "sana.malik.art@gmail.com", "phone": "03457778899"},
 ]
 
 
 class Command(BaseCommand):
-    help = 'Seeds the database with realistic ecommerce data — categories, products, customers, orders, discounts.'
+    help = 'Seeds categories and products (with images). Does not create users or customers.'
 
     def add_arguments(self, parser):
-        parser.add_argument('--clear', action='store_true', help='Delete existing data before seeding (use with care!)')
+        parser.add_argument(
+            '--clear',
+            action='store_true',
+            help='Soft-delete existing products and categories before seeding',
+        )
 
     @transaction.atomic
     def handle(self, *args, **options):
 
-      if options['clear']:
-        self.stdout.write(self.style.WARNING('Clearing existing data...'))
+        if options['clear']:
+            self.stdout.write(self.style.WARNING('Soft-deleting existing products and categories...'))
+            Product.objects.update(is_delete=True, is_active=False)
+            Category.objects.update(is_delete=True, is_active=False)
+            self.stdout.write(self.style.SUCCESS('Old products and categories cleared.'))
 
-        # Customer data
-        Customer.objects.all().delete()
+        # ── Store and admin must already exist ────────────────────────────
+        store = Store.objects.first()
+        if not store:
+            self.stdout.write(self.style.ERROR('No store found!'))
+            return
+        self.stdout.write(f'Using store: {store.name}')
 
-        # Soft delete Products
-        Product.objects.update(
-            is_delete=True,
-            is_active=False,
-        )
+        if not User.objects.filter(role='admin').exists():
+            self.stdout.write(self.style.ERROR('No admin user found!'))
+            return
 
-        # Soft delete Categories
-        Category.objects.update(
-            is_delete=True,
-            is_active=False,
-        )
+        # ── Categories ────────────────────────────────────────────────────
+        self.stdout.write('Creating categories...')
+        category_objs = {}
+        cat_images_added = 0
 
-        # Soft delete Discounts
-        Discount.objects.update(
-            is_delete=True,
-            is_active=False,
-        )
+        for cat_data in CATEGORIES:
+            cat, created = Category.objects.get_or_create(
+                name=cat_data['name'],
+                store=store,
+                defaults={
+                    'description': cat_data['description'],
+                    'is_active': True,
+                    'is_delete': False,
+                },
+            )
 
-        # Soft delete Users (except superuser)
-        User.objects.filter(
-            is_superuser=False
-        ).update(
-            is_delete=True,
-            is_active=False,
-        )
+            # Revive the category if an earlier --clear soft-deleted it
+            if not created and (not cat.is_active or cat.is_delete):
+                cat.is_active = True
+                cat.is_delete = False
+                cat.save(update_fields=['is_active', 'is_delete'])
 
-        self.stdout.write(self.style.SUCCESS('Data cleared.'))
+            image = upload_stock_photo(cat_data['name'], folder='categories')
+            if image:
+                cat.image = image
+                cat.save(update_fields=['image'])
+                cat_images_added += 1
 
-      # ── 1. Store ──────────────────────────────────────────────────────────
-      store = Store.objects.first()
-      if not store:
-          self.stdout.write(self.style.ERROR('No store found! Run "python manage.py seed_store" first.'))
-          return
-      self.stdout.write(f'Using store: {store.name}')
+            category_objs[cat_data['name']] = cat
 
-      # ── 2. Admin user ─────────────────────────────────────────────────────
-      admin = User.objects.filter(role='admin').first()
-      if not admin:
-          self.stdout.write(self.style.ERROR('No admin user found! Run "python manage.py seed_store" first.'))
-          return
+        self.stdout.write(self.style.SUCCESS(
+            f'  {len(category_objs)} categories ready ({cat_images_added} images uploaded)'
+        ))
 
-      # ── 3. Customer Users ─────────────────────────────────────────────────
-      self.stdout.write('Creating customer users...')
-      user_objs = []
-      for idx, c in enumerate(CUSTOMERS):
-          user, created = User.objects.get_or_create(
-              email=c['email'],
-              defaults={
-                  'name': c['name'],
-                  'phone': c['phone'],
-                  'role': 'customer',
-                  'is_active': True,
-              }
-          )
-          if created:
-              user.set_password('Customer@123')
-              user.save()
-          user_objs.append(user)
-      self.stdout.write(self.style.SUCCESS(f'  {len(user_objs)} customer users ready'))
+        # ── Products ──────────────────────────────────────────────────────
+        self.stdout.write('Creating products...')
+        new_count = 0
+        total = 0
+        images_added = 0
 
-      # ── 4. Categories ─────────────────────────────────────────────────────
-      self.stdout.write('Creating categories...')
-      category_objs = {}
-      cat_images_added = 0
-      for cat_data in CATEGORIES:
-          cat, created = Category.objects.get_or_create(
-              name=cat_data['name'],
-              store=store,
-              defaults={
-                  'description': cat_data['description'],
-                  'is_active': True,
-                  'is_delete': False,
-              }
-          )
+        for cat_data in CATEGORIES:
+            cat_obj = category_objs[cat_data['name']]
 
-          # B-FIX: if the category already existed (e.g. a previous
-          # --clear run soft-deleted it), get_or_create() finds that
-          # same row by name+store and 'defaults' above is ignored.
-          # Without this, the category stays is_active=False /
-          # is_delete=True forever and disappears from the customer
-          # side even after images are re-added.
-          if not created and (not cat.is_active or cat.is_delete):
-              cat.is_active = True
-              cat.is_delete = False
-              cat.save(update_fields=['is_active', 'is_delete'])
+            for name, price, original_price, stock, sku, description in cat_data['products']:
+                prod, created = Product.objects.get_or_create(
+                    sku=sku,
+                    defaults={
+                        'store': store,
+                        'category': cat_obj,
+                        'name': name,
+                        'description': description,
+                        'price': p(price),
+                        'original_price': p(original_price),
+                        'stock': stock,
+                        'low_stock_threshold': 5,
+                        'is_active': True,
+                    },
+                )
+                if created:
+                    new_count += 1
+                elif not prod.is_active or prod.is_delete:
+                    prod.is_active = True
+                    prod.is_delete = False
+                    prod.save(update_fields=['is_active', 'is_delete'])
 
-          upload_result = upload_stock_photo(cat_data['name'], folder='categories')
-          if upload_result:
-              cat.image = upload_result
-              cat.save(update_fields=['image'])
-              cat_images_added += 1
-          category_objs[cat_data['name']] = cat
-      self.stdout.write(self.style.SUCCESS(f'  {len(category_objs)} categories ready ({cat_images_added} images uploaded)'))
+                total += 1
 
-      # ── 5. Products ───────────────────────────────────────────────────────
-      self.stdout.write('Creating products...')
-      product_count = 0
-      prod_images_added = 0
-      all_products = []
+                image = upload_stock_photo(sku, folder='products')
+                if image:
+                    prod.images.all().delete()
+                    ProductImage.objects.create(product=prod, image=image, is_primary=True)
+                    images_added += 1
 
-      for cat_data in CATEGORIES:
-          cat_obj = category_objs[cat_data['name']]
-          for prod_data in cat_data['products']:
-              prod, created = Product.objects.get_or_create(
-                  sku=prod_data['sku'],
-                  defaults={
-                      'store': store,
-                      'category': cat_obj,
-                      'name': prod_data['name'],
-                      'description': prod_data['description'],
-                      'price': p(prod_data['price']),
-                      'original_price': p(prod_data['original_price']),
-                      'stock': prod_data['stock'],
-                      'low_stock_threshold': 5,
-                      'is_active': True,
-                  }
-              )
-              if created:
-                  product_count += 1
-              upload_result = upload_stock_photo(prod_data['sku'], folder='products')
-              if upload_result:
-                  prod.images.all().delete()
-                  ProductImage.objects.create(
-                      product=prod,
-                      image=upload_result,
-                      is_primary=True,
-                  )
-                  prod_images_added += 1
-              all_products.append(prod)
+        self.stdout.write(self.style.SUCCESS(
+            f'  {new_count} new products created ({total} total, {images_added} images uploaded)'
+        ))
 
-      self.stdout.write(self.style.SUCCESS(f'  {product_count} new products created ({len(all_products)} total, {prod_images_added} images uploaded)'))
-
-      # ── 6. Discounts ──────────────────────────────────────────────────────
-      self.stdout.write('Creating discount codes...')
-      now = timezone.now()
-      discount_count = 0
-      for d in DISCOUNTS:
-          _, created = Discount.objects.get_or_create(
-              code=d['code'],
-              defaults={
-                  'store': store,
-                  'type': d['type'],
-                  'value': p(d['value']),
-                  'min_order_amount': p(d['min_order_amount']),
-                  'start_date': now - timedelta(days=30),
-                  'end_date': now + timedelta(days=180),
-                  'is_active': True,
-              }
-          )
-          if created:
-              discount_count += 1
-      self.stdout.write(self.style.SUCCESS(f'  {discount_count} discount codes ready'))
-
-      # ── 7. Customer Profiles ──────────────────────────────────────────────
-      self.stdout.write('Creating customer profiles...')
-      customer_objs = []
-      addresses = [
-          'House 12, Street 4, F-10/2, Islamabad',
-          'Flat 3B, DHA Phase 5, Lahore',
-          'Shop 7, Saddar Market, Karachi',
-          'Plot 45, Gulshan-e-Iqbal Block 13, Karachi',
-          'House 88, G-9/3, Islamabad',
-      ]
-      for idx, user in enumerate(user_objs):
-          cdata = CUSTOMERS[idx]
-          cust, _ = Customer.objects.get_or_create(
-              user=user,
-              store=store,
-              defaults={
-                  'name': cdata['name'],
-                  'phone': cdata['phone'],
-                  'email': cdata['email'],
-                  'address': addresses[idx],
-              }
-          )
-          customer_objs.append(cust)
-      self.stdout.write(self.style.SUCCESS(f'  {len(customer_objs)} customer profiles ready'))
-
-
-      # ── Final Summary ─────────────────────────────────────────────────────
-      self.stdout.write('')
-      self.stdout.write(self.style.SUCCESS('=' * 50))
-      self.stdout.write(self.style.SUCCESS('Seeding complete! Summary:'))
-      self.stdout.write(self.style.SUCCESS('=' * 50))
-      self.stdout.write(f'  Store:      {Store.objects.count()}')
-      self.stdout.write(f'  Users:      {User.objects.count()} ({User.objects.filter(role="customer").count()} customers)')
-      self.stdout.write(f'  Categories: {Category.objects.count()}')
-      self.stdout.write(f'  Products:   {Product.objects.count()}')
-      self.stdout.write(f'  Discounts:  {Discount.objects.count()}')
-      self.stdout.write('')
-      self.stdout.write('Test credentials:')
-      self.stdout.write('  Admin  → admin@store.com / Admin@12345')
-      self.stdout.write('  Customer → ayesha.siddiqui@gmail.com / Customer@123')
+        # ── Summary ───────────────────────────────────────────────────────
+        self.stdout.write('')
+        self.stdout.write(self.style.SUCCESS('Seeding complete!'))
+        self.stdout.write(f'  Categories: {Category.objects.filter(is_delete=False).count()}')
+        self.stdout.write(f'  Products:   {Product.objects.filter(is_delete=False).count()}')
