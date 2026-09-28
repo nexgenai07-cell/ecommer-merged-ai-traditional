@@ -334,7 +334,7 @@ class ComplaintMessageView(APIView):
             "sender_name": complaint_message.sender.name,
             "sender_role": "admin" if sender_is_admin else "customer",
             "message": complaint_message.message,
-            "created_at": complaint_message.created_at,
+            "created_at": complaint_message.created_at.isoformat(),
         }
 
         # NEW (Sep 2026 — Complaint chat live updates): pushes this same
