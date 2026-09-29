@@ -290,3 +290,42 @@ class PhoneChangeRequest(models.Model):
 
     def is_valid(self):
         return timezone.now() < self.otp_expires_at
+
+
+# NEW (Sep 2026 — Profile: password change now needs an emailed OTP).
+# Before this, POST /change-password/ changed the password immediately
+# after checking only the current password — anyone with a briefly
+# unlocked/hijacked session could change it. Now the flow is 2-step, same
+# idea as EmailChangeRequest / PhoneChangeRequest above:
+#   1. POST /change-password/          -> checks current password, sends a
+#                                         6-digit OTP to the account email.
+#                                         Password is NOT changed yet.
+#   2. POST /change-password/confirm/  -> only a correct, unexpired OTP
+#                                         actually changes the password.
+#
+# The new password is stored here ALREADY HASHED (make_password), never
+# in plain text, so the user does not have to type it a second time.
+# One row per user (OneToOneField) — a new request overwrites any still-
+# pending one, so only the most recent code is ever valid.
+# `attempts` caps wrong OTP guesses (a 6-digit code is only 1,000,000
+# combinations, so unlimited guessing would be brute-forceable).
+class PasswordChangeRequest(models.Model):
+    user            = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='password_change_request',
+    )
+    new_password_hash = models.CharField(max_length=255)
+    otp_code        = models.CharField(max_length=6)
+    otp_expires_at  = models.DateTimeField()
+    attempts        = models.PositiveSmallIntegerField(default=0)
+    created_at      = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'password_change_requests'
+
+    def __str__(self):
+        return f'Password change for {self.user.email}'
+
+    def is_valid(self):
+        return timezone.now() < self.otp_expires_at

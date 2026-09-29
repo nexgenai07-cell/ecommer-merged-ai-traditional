@@ -52,6 +52,36 @@ def order_can_track(order):
     return order.status != "cancelled"
 
 
+# NEW (Bug fix, Sep 2026 — Return option kept showing after an order was
+# already returned): a delivered order should only offer "Return" once,
+# ever. Once ANY Return row exists for the order — pending, approved, OR
+# rejected — the option stops being offered for that order, even though
+# other delivered orders still show it normally. (Decision confirmed:
+# a rejected return does NOT re-open the option.)
+#
+# Imported lazily inside the function, not at module level, to avoid a
+# circular import: apps.returns.models.Return has a string FK to
+# "orders.Order", but apps.orders.return_views already imports
+# apps.returns.models directly at module level with no issue, so this
+# is just being extra safe since serializers.py is imported very early
+# (by views.py, admin.py, etc).
+def order_can_return(order):
+    if order.status != "delivered":
+        return False
+
+    from datetime import timedelta
+
+    from .return_views import RETURN_WINDOW_DAYS, order_delivered_at
+    from apps.returns.models import Return
+    from django.utils import timezone
+
+    delivered_at = order_delivered_at(order)
+    if delivered_at is None or timezone.now() > delivered_at + timedelta(days=RETURN_WINDOW_DAYS):
+        return False
+
+    return not Return.objects.filter(order=order).exists()
+
+
 # Converts each order item into API response format.
 # Used inside OrderDetailSerializer.
 class OrderItemSerializer(serializers.ModelSerializer):
@@ -257,6 +287,10 @@ class OrderListSerializer(serializers.ModelSerializer):
     can_cancel = serializers.SerializerMethodField()
     can_track = serializers.SerializerMethodField()
 
+    # NEW (Bug fix, Sep 2026): tells the frontend whether to show the
+    # "Return" option for this order (see order_can_return above).
+    can_return = serializers.SerializerMethodField()
+
     class Meta:
         model = Order
         fields = [
@@ -272,6 +306,7 @@ class OrderListSerializer(serializers.ModelSerializer):
             "items",
             "can_cancel",
             "can_track",
+            "can_return",
         ]
 
     def get_can_cancel(self, obj):
@@ -279,6 +314,9 @@ class OrderListSerializer(serializers.ModelSerializer):
 
     def get_can_track(self, obj):
         return order_can_track(obj)
+
+    def get_can_return(self, obj):
+        return order_can_return(obj)
 
     def get_items(self, obj):
         # Only the first 3 items are needed for the My Orders preview.
@@ -403,6 +441,11 @@ class OrderDetailSerializer(serializers.ModelSerializer):
     can_cancel = serializers.SerializerMethodField()
     can_track = serializers.SerializerMethodField()
 
+    # NEW (Bug fix, Sep 2026): same "already returned" flag as
+    # OrderListSerializer, so the order detail page also stops offering
+    # "Return" once a return exists for this order.
+    can_return = serializers.SerializerMethodField()
+
     # NEW (Sep 2026 — expected delivery time on order page): computed from
     # shipping_method + created_at, not stored on the model, so it always
     # reflects SHIPPING_DELIVERY_ESTIMATES above even for older orders.
@@ -441,6 +484,7 @@ class OrderDetailSerializer(serializers.ModelSerializer):
             "payment",
             "can_cancel",
             "can_track",
+            "can_return",
             "expected_delivery",
             "estimated_delivery_from",
             "estimated_delivery_to",
@@ -468,6 +512,9 @@ class OrderDetailSerializer(serializers.ModelSerializer):
 
     def get_can_track(self, obj):
         return order_can_track(obj)
+
+    def get_can_return(self, obj):
+        return order_can_return(obj)
 
 # Returns complete customer information for the order.
     def get_customer(self, obj):

@@ -62,8 +62,20 @@ class CustomerAdminSerializer(serializers.ModelSerializer):
     # out_for_delivery / delivered) as an explicit include-list instead,
     # so this can never silently start counting a new not-yet-paid
     # status again if one gets added later.
+    # UPDATED (Bug fix, Sep 2026 — returned/refunded orders still counted
+    # as revenue): status__in=REVENUE_STATUSES alone isn't enough anymore
+    # — an order that was delivered and then RETURNED stays
+    # status="delivered" forever (there is no separate "returned" Order
+    # status), but its payment is flipped to "refunded" the moment the
+    # return is approved (see AdminReturnStatusUpdateView). Excluding
+    # payment__status="refunded" here removes that money the same way a
+    # cancelled+refunded order was already excluded via status alone.
     def get_total_orders(self, obj):
-        return obj.orders.filter(status__in=Order.REVENUE_STATUSES).count()
+        return (
+            obj.orders.filter(status__in=Order.REVENUE_STATUSES)
+            .exclude(payment__status="refunded")
+            .count()
+        )
 
     # Returns total amount actually spent — only orders in
     # Order.REVENUE_STATUSES count (confirmed / shipped /
@@ -81,11 +93,14 @@ class CustomerAdminSerializer(serializers.ModelSerializer):
     # depended on whether the customer had orders. Decimal("0.00") as an
     # explicit start value makes this always return a Decimal (=> always
     # a JSON string).
+    # UPDATED (Bug fix, Sep 2026): see get_total_orders above — a
+    # returned order's refunded payment must not count as spent either.
     def get_total_spent(self, obj):
         return sum(
             (
                 order.total_amount
                 for order in obj.orders.filter(status__in=Order.REVENUE_STATUSES)
+                .exclude(payment__status="refunded")
             ),
             Decimal("0.00"),
         )

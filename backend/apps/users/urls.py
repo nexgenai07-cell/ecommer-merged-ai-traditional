@@ -10,7 +10,6 @@ from .views import (
     PasswordResetRequestView,
     PasswordResetConfirmView,
     MeView,
-    ChangePasswordView,
     DeleteAccountView,
     SessionListView,
     RevokeAllSessionsView,
@@ -39,6 +38,12 @@ from .email_verification_views import (
 from .email_change_views import (
     RequestEmailChangeView,
     ConfirmEmailChangeView,
+)
+
+# NEW (Sep 2026 — Profile: password change with email OTP verification)
+from .password_change_views import (
+    ChangePasswordView,
+    ConfirmPasswordChangeView,
 )
 
 # NEW (Sep 2026 — Profile: editable phone with OTP code-entry verification)
@@ -120,10 +125,20 @@ urlpatterns = [
     # Account Security
     # ==========================================================
 
+    # UPDATED (Sep 2026): step 1 of 2 — validates current + new password
+    # and emails a 6-digit OTP. The password is NOT changed here.
     path(
         "change-password/",
         ChangePasswordView.as_view(),
         name="change_password",
+    ),
+
+    # NEW (Sep 2026): step 2 of 2 — password changes only after the
+    # emailed OTP is verified.
+    path(
+        "change-password/confirm/",
+        ConfirmPasswordChangeView.as_view(),
+        name="change_password_confirm",
     ),
 
     path(

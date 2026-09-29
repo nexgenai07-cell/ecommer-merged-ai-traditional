@@ -418,6 +418,60 @@ def confirm_stock_for_order(order, user=None):
     return deduct_stock_for_order(order, user=user)
 
 
+# NEW (Bug fix, Sep 2026 — returned products weren't restocked): when a
+# return is approved, the order's items were never added back to
+# inventory — total_stock stayed exactly as it was at payment
+# confirmation, forever short by whatever the customer returned.
+#
+# Called ONLY from AdminReturnStatusUpdateView (apps/orders/return_views.py)
+# the moment a return's status becomes "approved". Safe to call exactly
+# once per return: Return.can_update_status / RESOLVED_STATUSES already
+# make "pending -> approved" a one-way transition (approved can never be
+# set again on the same Return), so there is no separate flag to guard
+# against double-restocking here — the caller can only reach this once.
+#
+# A delivered order always has stock_deducted=True and reserved_stock
+# already back to 0 for its own items (deduct_stock_for_order already
+# dropped reserved_stock at payment confirmation), so — unlike
+# release_reserved_stock_for_order — only total_stock needs to move here.
+def restock_returned_order(order, user=None):
+    items = list(order.items.select_related("product").all())
+    product_ids = [item.product_id for item in items if item.product_id]
+
+    if not product_ids:
+        return
+
+    with transaction.atomic():
+        locked_products = {
+            p.id: p
+            for p in Product.objects.select_for_update().filter(id__in=product_ids)
+        }
+
+        for item in items:
+            product = locked_products.get(item.product_id)
+            if not product:
+                continue
+
+            old_total = product.total_stock
+            new_total = old_total + item.quantity
+
+            product.total_stock = new_total
+            product.save(update_fields=["total_stock"])
+
+            StockMovement.objects.create(
+                product=product,
+                changed_by=user,
+                old_stock=old_total,
+                new_stock=new_total,
+                delta=item.quantity,
+                reason="return_approved",
+                note=(
+                    f"Order {order.order_number} return approved - "
+                    f"restocked {item.quantity} units"
+                ),
+            )
+
+
 # NEW (B27): when an admin cancels an order, suggest in-stock alternatives
 # for any item that was out of stock.
 #
@@ -660,6 +714,41 @@ class CheckoutView(APIView):
             request.user,
             store_id=checkout_store_id,
         )
+
+        # NEW (Bug fix, Sep 2026 — one unpaid order at a time): a customer
+        # could place order after order while an earlier one was still
+        # unpaid — QR "order_placed" (10-minute window, +5 if extended —
+        # see ExtendQRUploadTimeView), QR "pending_payment" with a proof
+        # awaiting admin review or a rejected proof awaiting re-upload
+        # (1-hour window), or Stripe "pending_payment" (30-minute
+        # window) — each one reserving stock of its own. Now the
+        # customer must finish (pay/get reviewed) or let auto-cancel
+        # clear out any such order before checkout accepts a new one.
+        # "unpaid/pending" is exactly Order.status in
+        # ("order_placed", "pending_payment") — every one of the cases
+        # above, regardless of payment method or which stage of its own
+        # timeout it's currently in.
+        blocking_order = (
+            Order.objects.filter(
+                customer=customer,
+                status__in=["order_placed", "pending_payment"],
+            )
+            .order_by("-created_at")
+            .first()
+        )
+
+        if blocking_order:
+            return Response(
+                {
+                    "error": (
+                        f"You already have an unpaid order "
+                        f"({blocking_order.order_number}). Please "
+                        "complete or wait for that payment before "
+                        "placing a new order."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # ============================================================
         # ADDRESS RESOLUTION

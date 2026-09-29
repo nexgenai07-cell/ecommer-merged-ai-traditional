@@ -1,13 +1,13 @@
 # PATH: apps/cart/views.py
 
 import uuid
+import logging
 from rest_framework import status, permissions
 from django.db import transaction
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from django.utils import timezone
 from django.db.models import Sum
-from sympy import python
 
 from .models import Cart, CartItem
 from .serializers import (
@@ -16,6 +16,9 @@ from .serializers import (
 )
 from apps.products.models import Discount
 from apps.stores.models import Store
+from .wishlist_views import merge_guest_wishlist_into_user_wishlist
+
+logger = logging.getLogger(__name__)
 
 
 def get_or_create_cart_for_request(request):
@@ -83,6 +86,14 @@ def merge_guest_cart_into_user_cart(request, user):
 
     if not session_key:
         return False
+
+    # NEW: the guest's wishlist (same session key) is merged at the same
+    # moment as the cart, so no change is needed in the login view.
+    # A wishlist problem must never break login, hence the try/except.
+    try:
+        merge_guest_wishlist_into_user_wishlist(request, user)
+    except Exception:
+        logger.exception("guest wishlist merge failed (user %s)", user.pk)
 
     store = Store.objects.first()
 

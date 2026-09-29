@@ -102,12 +102,30 @@ def filter_orders_by_status(qs, status_param):
     """
     status_param = (status_param or "sold").lower()
 
+    # UPDATED (Bug fix, Sep 2026 — returned/refunded orders still counted
+    # as revenue): a returned order stays status="delivered" forever (no
+    # separate "returned" Order.status exists) but its payment is flipped
+    # to "refunded" the moment the return is approved (see
+    # AdminReturnStatusUpdateView in apps/orders/return_views.py) — same
+    # payment.status="refunded" signal a cancelled order's refund already
+    # used. "sold" now excludes it here too, same as every other
+    # REVENUE_STATUSES-based total (dashboard, customer list, customer
+    # stats).
     if status_param == "sold":
-        return qs.filter(status__in=Order.REVENUE_STATUSES)
+        return qs.filter(status__in=Order.REVENUE_STATUSES).exclude(
+            payment__status="refunded"
+        )
     if status_param == "cancelled":
         return qs.filter(status="cancelled").exclude(payment__status="refunded")
+    # UPDATED (Bug fix, Sep 2026): "refunded" used to require
+    # status="cancelled" too, which only matched a cancelled order whose
+    # payment was refunded — a delivered order that was later RETURNED
+    # and refunded (status stays "delivered") never showed up in this
+    # bucket even though money was genuinely given back. Now any order
+    # with payment.status="refunded" counts here, whichever way the
+    # refund happened.
     if status_param == "refunded":
-        return qs.filter(status="cancelled", payment__status="refunded")
+        return qs.filter(payment__status="refunded")
     if status_param == "all":
         return qs
 
@@ -115,7 +133,9 @@ def filter_orders_by_status(qs, status_param):
     if status_param in valid_statuses:
         return qs.filter(status=status_param)
 
-    return qs.filter(status__in=Order.REVENUE_STATUSES)
+    return qs.filter(status__in=Order.REVENUE_STATUSES).exclude(
+        payment__status="refunded"
+    )
 
 
 def format_phone_for_csv(phone):
@@ -338,7 +358,11 @@ class DashboardView(APIView):
         # Order.REVENUE_STATUSES (confirmed / shipped / out_for_delivery / delivered) —
         # same rule used everywhere else (admin customer list, customer's own
         # dashboard, CSV export) so every 'revenue'/'total_spent' number agrees.
-        delivered_orders = Order.objects.filter(status__in=Order.REVENUE_STATUSES)
+        # UPDATED (Bug fix, Sep 2026): see filter_orders_by_status() above
+        # for why payment__status="refunded" must also be excluded here.
+        delivered_orders = Order.objects.filter(
+            status__in=Order.REVENUE_STATUSES
+        ).exclude(payment__status="refunded")
 
 
         # UPDATED (Sep 2026 — profit/markup/margin concepts): revenue is
@@ -765,7 +789,11 @@ class BestSellersView(generics.GenericAPIView):
 
 
         # FIX (Sep 2026 — Total Spent / Revenue consistency): see DashboardView above.
-        qs = OrderItem.objects.filter(order__status__in=Order.REVENUE_STATUSES)
+        # UPDATED (Bug fix, Sep 2026): also excludes returned/refunded
+        # orders — see filter_orders_by_status() above.
+        qs = OrderItem.objects.filter(
+            order__status__in=Order.REVENUE_STATUSES
+        ).exclude(order__payment__status="refunded")
 
 
         if start_date:
@@ -838,8 +866,11 @@ class LowPerformingProductsView(generics.GenericAPIView):
 
 
         # FIX (Sep 2026 — Total Spent / Revenue consistency): see DashboardView above.
+        # UPDATED (Bug fix, Sep 2026): also excludes returned/refunded
+        # orders — see filter_orders_by_status() above.
         sold_product_ids = (
             OrderItem.objects.filter(order__status__in=Order.REVENUE_STATUSES)
+            .exclude(order__payment__status="refunded")
             .values('product_id')
             .annotate(total_sold=Sum('quantity'))
         )
@@ -1912,12 +1943,17 @@ class AnalyticsExportView(APIView):
             qs = qs.filter(created_at__date__lte=end_date)
 
         # FIX (Sep 2026 — Total Spent / Revenue consistency): see DashboardView above.
+        # UPDATED (Bug fix, Sep 2026): also excludes returned/refunded
+        # orders — see filter_orders_by_status() above.
+        REVENUE_Q = Q(orders__status__in=Order.REVENUE_STATUSES) & ~Q(
+            orders__payment__status="refunded"
+        )
         qs = qs.annotate(
             _total_orders=Count(
-                'orders', filter=Q(orders__status__in=Order.REVENUE_STATUSES), distinct=True,
+                'orders', filter=REVENUE_Q, distinct=True,
             ),
             _total_spent=Coalesce(
-                Sum('orders__total_amount', filter=Q(orders__status__in=Order.REVENUE_STATUSES)),
+                Sum('orders__total_amount', filter=REVENUE_Q),
                 Value(0), output_field=DecimalField(),
             ),
         )

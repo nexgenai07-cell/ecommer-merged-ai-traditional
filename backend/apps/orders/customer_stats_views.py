@@ -49,7 +49,12 @@ class MyOrderStatsView(APIView):
 
         all_orders = Order.objects.filter(customer_id__in=customer_ids)
 
-        paid_orders = all_orders.filter(status__in=Order.REVENUE_STATUSES)
+        # UPDATED (Bug fix, Sep 2026): a returned order's refunded payment
+        # must not count as spent either — see CustomerAdminSerializer
+        # (apps/orders/customer_serializers.py) for the full rationale.
+        paid_orders = all_orders.filter(
+            status__in=Order.REVENUE_STATUSES
+        ).exclude(payment__status="refunded")
 
         total_spent = sum(
             (order.total_amount for order in paid_orders),

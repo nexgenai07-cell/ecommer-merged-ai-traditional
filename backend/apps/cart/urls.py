@@ -7,7 +7,7 @@ from .views import (
 )
 from .wishlist_views import (
     WishlistView, AddToWishlistView, RemoveFromWishlistView,
-    BulkRemoveFromWishlistView,
+    BulkRemoveFromWishlistView, ClearWishlistView,
 )
 
 urlpatterns = [
@@ -27,4 +27,6 @@ wishlist_urlpatterns = [
     # NEW: bulk delete — pass {"item_ids": [1,2,3]} to delete multiple
     # selected wishlist items together, in one request/one DB query.
     path('bulk-remove/', BulkRemoveFromWishlistView.as_view(), name='wishlist-bulk-remove'),
+    # NEW: same as cart/clear/ — removes every item from the wishlist.
+    path('clear/', ClearWishlistView.as_view(), name='wishlist-clear'),
 ]

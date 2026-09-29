@@ -7,6 +7,7 @@ class WishlistAdmin(admin.ModelAdmin):
     list_display = [
         'id',
         'user',
+        'session_key',
         'created_at',
     ]
 

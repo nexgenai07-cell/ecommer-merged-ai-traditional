@@ -144,10 +144,23 @@ class CartItem(models.Model):
 
 
 class Wishlist(models.Model):
+    # NEW: same as Cart — user is optional so guests (not logged in) can
+    # also have a wishlist. On login, the guest wishlist is merged into
+    # the user's wishlist (see merge_guest_wishlist_into_user_wishlist).
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name="wishlists",
+        null=True,
+        blank=True,
+    )
+
+    # NEW: used for anonymous users (same X-Cart-Session value as the cart)
+    session_key = models.CharField(
+        max_length=100,
+        null=True,
+        blank=True,
+        db_index=True,
     )
 
     store = models.ForeignKey(
@@ -159,10 +172,24 @@ class Wishlist(models.Model):
 
     class Meta:
         db_table = "wishlists"
-        unique_together = ["user", "store"]
+
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "store"],
+                condition=models.Q(user__isnull=False),
+                name="unique_user_wishlist_per_store",
+            ),
+            models.UniqueConstraint(
+                fields=["session_key", "store"],
+                condition=models.Q(session_key__isnull=False),
+                name="unique_session_wishlist_per_store",
+            ),
+        ]
 
     def __str__(self):
-        return f"Wishlist of {self.user.email}"
+        if self.user:
+            return f"Wishlist of {self.user.email}"
+        return f"Wishlist of session {self.session_key}"
 
 
 class WishlistItem(models.Model):

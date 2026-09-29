@@ -82,16 +82,26 @@ class AdminCustomerListView(generics.ListAPIView):
         # separately, in Python, by the serializer). Coalesce forces the
         # NULL to a real 0 before ordering, so 0-spend customers now
         # correctly sort to the bottom on descending / top on ascending.
+        # UPDATED (Bug fix, Sep 2026 — returned/refunded orders still
+        # counted as revenue): same fix as CustomerAdminSerializer
+        # (customer_serializers.py) — a returned order stays
+        # status="delivered" but its payment becomes "refunded" once the
+        # return is approved, so that must also be excluded here for the
+        # sort annotation to agree with what the serializer displays.
+        REVENUE_Q = Q(orders__status__in=Order.REVENUE_STATUSES) & ~Q(
+            orders__payment__status="refunded"
+        )
+
         qs = qs.annotate(
             _total_orders=Count(
                 'orders',
-                filter=Q(orders__status__in=Order.REVENUE_STATUSES),
+                filter=REVENUE_Q,
                 distinct=True,
             ),
             _total_spent=Coalesce(
                 Sum(
                     'orders__total_amount',
-                    filter=Q(orders__status__in=Order.REVENUE_STATUSES),
+                    filter=REVENUE_Q,
                 ),
                 Value(0),
                 output_field=DecimalField(),

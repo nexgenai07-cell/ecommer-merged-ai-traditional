@@ -10,7 +10,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 
-from apps.returns.models import Complaint, ComplaintMessage
+from apps.returns.models import Complaint, ComplaintMessage, Return
 from apps.returns.complaint_serializers import (
     ComplaintSerializer,
     CreateComplaintSerializer,
@@ -110,6 +110,26 @@ class CreateComplaintView(generics.ListCreateAPIView):
                 {"error": "Invalid order."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # NEW (Bug fix, Sep 2026): a customer must not be able to file a
+        # complaint about an order that's already cancelled, or that was
+        # delivered and then returned (approved return — same "already
+        # returned" definition as order_can_return() in serializers.py).
+        # A general complaint with no order attached (order=None) is
+        # unaffected — this only blocks complaints tied to one specific
+        # order.
+        if order:
+            if order.status == "cancelled":
+                return Response(
+                    {"error": "Complaints cannot be filed for a cancelled order."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if Return.objects.filter(order=order, status="approved").exists():
+                return Response(
+                    {"error": "Complaints cannot be filed for a returned order."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         complaint = serializer.save(
             customer=customer,

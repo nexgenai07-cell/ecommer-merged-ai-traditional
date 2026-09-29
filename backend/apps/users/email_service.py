@@ -292,3 +292,53 @@ def send_phone_change_code(user, new_phone, code):
     except Exception:
         logger.exception("send_phone_change_code: failed to send code to %s", user.email)
         return False
+
+
+def send_password_change_code(user, code):
+    """
+    NEW (Sep 2026 — Profile: password change needs email OTP).
+
+    Emails the 6-digit code to the account's registered email. The
+    password is NOT changed until this code is entered back in the app
+    (ConfirmPasswordChangeView). Same 6-digit / 10-minute pattern as every
+    other OTP email in this file.
+    """
+    subject = "Confirm your password change"
+    message = (
+        f"Your password change verification code is: {code}\n\n"
+        "Enter this code in the app to confirm changing your password. "
+        "This code is valid for 10 minutes. If you did not request this, "
+        "please ignore this email — your password will stay unchanged — "
+        "and consider changing your password, since someone may have "
+        "access to your account."
+    )
+    html_message = f"""
+        <html>
+            <body>
+                <h2>Confirm your password change</h2>
+                <p>We received a request to change the password of your
+                account.</p>
+                <p>Use this code to confirm the change:</p>
+                <h1 style="letter-spacing: 4px;">{code}</h1>
+                <p>This code is valid for 10 minutes.</p>
+                <p>If you did not request this, you can safely ignore this
+                email — your password will not change. Someone may have
+                access to your account, so we recommend resetting your
+                password.</p>
+            </body>
+        </html>
+    """
+
+    try:
+        email_msg = EmailMultiAlternatives(
+            subject=subject,
+            body=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[user.email],
+        )
+        email_msg.attach_alternative(html_message, "text/html")
+        email_msg.send(fail_silently=False)
+        return True
+    except Exception:
+        logger.exception("send_password_change_code: failed to send code to %s", user.email)
+        return False

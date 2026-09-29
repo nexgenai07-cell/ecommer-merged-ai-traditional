@@ -35,7 +35,6 @@ from .serializers import (
     UserProfileSerializer,
     PasswordResetRequestSerializer,
     PasswordResetConfirmSerializer,
-    ChangePasswordSerializer,
     DeleteAccountSerializer,
     UserSessionSerializer,
 )
@@ -427,26 +426,8 @@ class MeView(generics.RetrieveUpdateAPIView):
         return self.request.user
 
 
-# Allows authenticated users to securely
-# change their password.
-class ChangePasswordView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
-
-    def post(self, request):
-        serializer = ChangePasswordSerializer(
-            data=request.data,
-            context={"request": request},
-        )
-        serializer.is_valid(raise_exception=True)
-
-        user = request.user
-        user.set_password(serializer.validated_data["new_password"])
-        user.save()
-
-        return Response(
-            {"message": "Password changed successfully."},
-            status=status.HTTP_200_OK,
-        )
+# NOTE (Sep 2026): ChangePasswordView now lives in
+# password_change_views.py — password change needs an emailed OTP.
 
 
 # Soft deletes the user account and revokes

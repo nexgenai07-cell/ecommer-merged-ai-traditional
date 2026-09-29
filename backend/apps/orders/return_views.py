@@ -4,6 +4,7 @@ import re
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Q
 from django.utils import timezone
+from datetime import timedelta
 from rest_framework import status, permissions, generics
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -17,9 +18,36 @@ from apps.returns.serializers import (
 from apps.notifications.utils import create_notification, notify_store_admins
 from apps.ai.audit import log_manual_admin_action as log_admin_action
 from .models import Order, OrderStatusHistory
+from .views import restock_returned_order
 from apps.users.permissions import IsAdmin
 from core.pagination import StandardResultsPagination
 from core.date_range import filter_by_date_range
+
+# NEW (Bug fix, Sep 2026 — return window): a customer can only request a
+# return within this many days of their order being marked "delivered".
+# Shared with order_can_return() in serializers.py (used for the
+# customer-facing "Return" button) so the button and this API always
+# agree on the exact same deadline.
+RETURN_WINDOW_DAYS = 7
+
+
+def order_delivered_at(order):
+    """
+    The moment this order was last marked "delivered", or None if it
+    never has been. Order has no dedicated delivered_at column — every
+    admin status change already writes an OrderStatusHistory row (see
+    AdminOrderStatusUpdateView in views.py), so that's the single source
+    of truth for exactly when delivery happened. Uses the most recent
+    "delivered" entry, in the unlikely case a status ever moved off
+    "delivered" and back.
+    """
+    entry = (
+        order.status_history
+        .filter(status="delivered")
+        .order_by("-changed_at")
+        .first()
+    )
+    return entry.changed_at if entry else None
 
 
 # NEW (Sep 2026 — Returns/Complaints ID search bug report): the admin table
@@ -96,10 +124,33 @@ class CreateReturnView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if Return.objects.filter(
-            order=order,
-            status__in=["pending", "approved"],
-        ).exists():
+        # NEW (Bug fix, Sep 2026 — return window): return is only allowed
+        # within RETURN_WINDOW_DAYS of the order actually being delivered
+        # — not from the order date, and not open-ended. delivered_at is
+        # None only if this order somehow has no "delivered" history row
+        # (shouldn't happen for a delivered order, but fails safe by
+        # blocking the return rather than allowing one with no reference
+        # date).
+        delivered_at = order_delivered_at(order)
+
+        if delivered_at is None or timezone.now() > delivered_at + timedelta(days=RETURN_WINDOW_DAYS):
+            return Response(
+                {
+                    "error": (
+                        f"The {RETURN_WINDOW_DAYS}-day return window for "
+                        "this order has passed."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # UPDATED (Bug fix, Sep 2026): previously only "pending"/"approved"
+        # blocked a new return, so a REJECTED return let the customer try
+        # again on the same order. Now a single return per order is final,
+        # whatever its outcome — matches order_can_return() in
+        # serializers.py, so the API itself refuses even if a hidden/old
+        # frontend still shows the button.
+        if Return.objects.filter(order=order).exists():
             return Response(
                 {"error": "A return request already exists for this order."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -315,6 +366,52 @@ class AdminReturnStatusUpdateView(APIView):
                 "returned",
                 note=f"Return approved: {return_request.reason}",
             )
+
+            # NEW (Bug fix, Sep 2026): the order's items go back into
+            # inventory the moment the return is approved — see
+            # restock_returned_order() in views.py for why this is safe
+            # to call exactly once here and nowhere else.
+            restock_returned_order(return_request.order, user=request.user)
+
+            # NEW (Bug fix, Sep 2026 — returned orders still counted as
+            # revenue): a return approval never touched Payment at all
+            # before, so the order kept status="delivered" AND
+            # payment.status="paid" forever — Order.REVENUE_STATUSES-based
+            # totals (admin dashboard, sales/revenue reports, customer
+            # total_spent, CSV exports) kept counting money that had
+            # actually been given back. This mirrors exactly what
+            # OrderCancelView / AdminOrderStatusUpdateView already do for
+            # a cancelled order's refund — same payment.status="refunded"
+            # + refunded_at signal — except the order's own status stays
+            # "delivered" (a return is not a cancellation; there is
+            # deliberately no separate "returned" Order.status). Every
+            # REVENUE_STATUSES-based total elsewhere now also excludes
+            # payment__status="refunded", which is what actually removes
+            # this order from revenue.
+            order = return_request.order
+            if hasattr(order, "payment") and order.payment.status == "paid":
+                order.payment.status = "refunded"
+                order.payment.refunded_at = timezone.now()
+                order.payment.save(update_fields=["status", "refunded_at"])
+
+                OrderStatusHistory.record(
+                    order,
+                    "refunded",
+                    note=f"Rs. {order.payment.amount} refunded (return approved)",
+                )
+
+                create_notification(
+                    user=return_request.customer.user,
+                    store=order.store,
+                    title="Refund processed",
+                    message=(
+                        f"Rs. {order.payment.amount} has been refunded for "
+                        f"your returned order {order.order_number}."
+                    ),
+                    notification_type="order",
+                    reference_type="order",
+                    reference_id=order.order_number,
+                )
 
         create_notification(
             user=return_request.customer.user,
