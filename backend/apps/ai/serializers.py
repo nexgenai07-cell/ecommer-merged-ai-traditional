@@ -48,10 +48,26 @@ class AuditLogSerializer(serializers.ModelSerializer):
     # user=None case (e.g. an automated/system-triggered action).
     user_name = serializers.CharField(source='user.name', read_only=True, default='System')
 
+    # NEW: name of the CUSTOMER the action was about (complaint / return /
+    # order / payment / notification sent to one customer), shown next to
+    # the Entity ID. Null for entities with no customer (product,
+    # category, ...). See apps/ai/audit_customer.py.
+    customer_name = serializers.SerializerMethodField()
+
     class Meta:
         model = AuditLog
         fields = [
             'id', 'user', 'user_name', 'user_email', 'action', 'entity', 'entity_id',
+            'customer_name',
             'old_data', 'new_data', 'ip_address', 'source', 'created_at',
         ]
         read_only_fields = fields  # nothing on AuditLog should be editable through the API
+
+    def get_customer_name(self, obj):
+        # The list view pre-computes names for the whole page in a few
+        # queries; a single-object call falls back to a one-off lookup.
+        names = self.context.get('customer_names')
+        if names is None:
+            from .audit_customer import customer_names_for_logs
+            names = customer_names_for_logs([obj])
+        return names.get((obj.entity, obj.entity_id))

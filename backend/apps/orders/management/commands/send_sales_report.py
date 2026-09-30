@@ -17,6 +17,8 @@ from django.db.models import Count, Sum
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
+from apps.notifications.email_templates import sales_report_html
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +51,9 @@ class Command(BaseCommand):
                 week_orders, week_revenue = period_stats(store, today_start - timedelta(days=7), today_start)
                 body_lines.append(f"Last 7 days: {week_orders} orders, Rs. {week_revenue} revenue.")
             body = "\n".join(body_lines)
+            sections = [(f"Yesterday ({yesterday_start:%d %b %Y})", day_orders, day_revenue)]
+            if is_monday:
+                sections.append(("Last 7 days", week_orders, week_revenue))
 
             try:
                 notify_store_admins(
@@ -57,18 +62,18 @@ class Command(BaseCommand):
                     message=body,
                     notification_type="system",
                 )
-                self._email_admins(store, f"Sales report — {store.name} — {yesterday_start:%d %b %Y}", body)
+                self._email_admins(store, f"Sales report — {store.name} — {yesterday_start:%d %b %Y}", body, sections)
                 sent += 1
             except Exception:
                 logger.exception("sales report failed for store %s", store.id)
 
         self.stdout.write(self.style.SUCCESS(f"Sales report sent for {sent} store(s)."))
 
-    def _email_admins(self, store, subject, body):
+    def _email_admins(self, store, subject, body, sections=None):
         emails = [u.email for u in store.admins.all() if u.email]
         if not emails:
             return
-        html_message = f"<html><body><pre>{body}</pre></body></html>"
+        html_message = sales_report_html(store.name, sections or [], body)
         try:
             msg = EmailMultiAlternatives(
                 subject=subject, body=body, from_email=settings.DEFAULT_FROM_EMAIL, to=emails,

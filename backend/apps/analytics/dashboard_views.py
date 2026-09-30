@@ -1187,6 +1187,9 @@ class AnalyticsExportView(APIView):
         'complaints', 'social_posts', 'customers', 'revenue', 'products',
         # NEW (16 Sep 2026 — Filtering Fix):
         'categories', 'audit_logs', 'whatsapp_numbers', 'whatsapp_conversation',
+        # NEW: QR Payments page export (same filters as GET
+        # /api/v1/admin/payments/qr/ - see apps/payments/qr_filters.py)
+        'qr_payments',
     }
 
     def get(self, request):
@@ -1713,11 +1716,56 @@ class AnalyticsExportView(APIView):
         if search:
             qs = qs.filter(Q(action__icontains=search))
 
-        writer.writerow(['User', 'Action', 'Entity', 'Entity ID', 'IP Address', 'Source', 'Created At'])
-        for log in qs:
+        # NEW: trailing 'Customer' column (name of the customer the action
+        # was about). Added at the END so the existing columns keep their
+        # positions.
+        from apps.ai.audit_customer import customer_names_for_logs
+        logs = list(qs)
+        customer_names = customer_names_for_logs(logs)
+
+        writer.writerow(['User', 'Action', 'Entity', 'Entity ID', 'IP Address', 'Source', 'Created At', 'Customer'])
+        for log in logs:
             writer.writerow([
                 log.user.email if log.user else 'system', log.action, log.entity,
                 log.entity_id or '', log.ip_address or '', log.source, log.created_at,
+                csv_safe_text(customer_names.get((log.entity, log.entity_id)) or ''),
+            ])
+
+    def _export_qr_payments(self, writer, start_date, end_date):
+        # NEW: exports exactly what the QR Payments page shows for the
+        # same filters. The filtering itself is NOT re-written here - it
+        # calls the SAME apply_qr_filters() the page's list endpoint uses
+        # (GET /api/v1/admin/payments/qr/), so the two can never drift
+        # apart. Params: status (under_review|paid|rejected|refunded|all;
+        # aliases pending/approved), search, start_date/end_date (day the
+        # proof was submitted), min_amount, max_amount, duplicate,
+        # ordering. A bad amount returns 400, same as the page.
+        from apps.payments.qr_filters import apply_qr_filters, base_qr_queryset
+
+        qs = apply_qr_filters(
+            base_qr_queryset(), self.request.query_params, start_date, end_date
+        )
+
+        writer.writerow([
+            'Order Number', 'Customer', 'Phone', 'Amount', 'Transaction ID',
+            'Status', 'Duplicate Warning', 'Rejection Count', 'Reject Reason',
+            'Submitted At', 'Paid At',
+        ])
+        for p in qs:
+            order = p.order
+            customer = order.customer
+            writer.writerow([
+                order.order_number,
+                csv_safe_text(customer.name if customer else ''),
+                format_phone_for_csv(customer.phone if customer else ''),
+                order.total_amount,
+                csv_safe_text(p.qr_transaction_id or ''),
+                p.status,
+                'Yes' if p.qr_duplicate_warning else 'No',
+                p.qr_rejection_count,
+                csv_safe_text(p.qr_reject_reason or ''),
+                p.qr_submitted_at or '',
+                p.paid_at or '',
             ])
 
     def _export_whatsapp_numbers(self, writer, start_date, end_date):

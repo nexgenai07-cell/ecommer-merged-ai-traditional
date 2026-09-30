@@ -17,7 +17,7 @@ stripe.api_key = settings.STRIPE_SECRET_KEY
 
 logger = logging.getLogger(__name__)
 
-from django.db.models import Q, F, ExpressionWrapper, IntegerField
+from django.db.models import Q, F, ExpressionWrapper, IntegerField, Prefetch
 from django.db.models.functions import Lower
 from django.db import transaction, IntegrityError
 from django.utils import timezone
@@ -1340,9 +1340,29 @@ class OrderListView(generics.ListAPIView):
     pagination_class = StandardResultsPagination
 
     def get_queryset(self): # Fetches customer order history.
+        # PERFORMANCE (Sep 2026): this endpoint was slow (~7s) because the
+        # serializer ran a fresh set of queries for EVERY order on the page
+        # (items, each item's product, each product's images, the item
+        # count, delivery history, return check) - over a hundred round
+        # trips to the database for a page of 10. Everything the page needs
+        # is now loaded up front in a handful of queries; the response
+        # itself is unchanged.
         qs = (
             Order.objects.filter(
                 customer__user=self.request.user
+            )
+            .prefetch_related(
+                Prefetch(
+                    "items",
+                    queryset=(
+                        OrderItem.objects
+                        .select_related("product")
+                        .prefetch_related("product__images")
+                        .order_by("id")
+                    ),
+                ),
+                "status_history",
+                "returns",
             )
             .order_by("-created_at")
         )

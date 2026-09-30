@@ -22,6 +22,8 @@ from django.core.mail import EmailMultiAlternatives
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
+from apps.notifications.email_templates import abandoned_cart_html
+
 logger = logging.getLogger(__name__)
 
 REMINDER_AFTER_HOURS = 24
@@ -86,7 +88,11 @@ class Command(BaseCommand):
             lines.append(f"  - {i.quantity} x {i.product.name}")
         lines += ["", "Complete your order before it sells out."]
         message = "\n".join(lines)
-        html_message = f"<html><body><pre>{message}</pre></body></html>"
+        html_message = abandoned_cart_html(
+            customer.name,
+            [(i.product.name, i.quantity) for i in items],
+            message,
+        )
 
         try:
             email_msg = EmailMultiAlternatives(

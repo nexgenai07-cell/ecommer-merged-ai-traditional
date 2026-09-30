@@ -75,11 +75,51 @@ def order_can_return(order):
     from apps.returns.models import Return
     from django.utils import timezone
 
-    delivered_at = order_delivered_at(order)
+    # PERFORMANCE (Sep 2026): when the list view has already prefetched
+    # status_history / returns for the whole page, read them from memory
+    # instead of running 2 extra queries for EVERY delivered order.
+    # Without a prefetch (detail view etc.) it falls back to the exact
+    # same queries as before, so the result is identical either way.
+    prefetched = getattr(order, "_prefetched_objects_cache", {})
+
+    if "status_history" in prefetched:
+        delivered_times = [
+            h.changed_at for h in order.status_history.all()
+            if h.status == "delivered"
+        ]
+        delivered_at = max(delivered_times) if delivered_times else None
+    else:
+        delivered_at = order_delivered_at(order)
+
     if delivered_at is None or timezone.now() > delivered_at + timedelta(days=RETURN_WINDOW_DAYS):
         return False
 
+    if "returns" in prefetched:
+        return len(order.returns.all()) == 0
+
     return not Return.objects.filter(order=order).exists()
+
+
+# PERFORMANCE (Sep 2026): shared "which image represents this product"
+# lookup for OrderItemSerializer and OrderListItemSerializer. It used to
+# run 2-3 separate queries PER ITEM (filter(is_primary).first(), then
+# images.first()). Now it reads product.images.all() ONCE - a single
+# query, or zero when the list view has prefetched them - and picks the
+# same image as before: the first primary image, else the first image.
+def _pick_product_image(product):
+    images = list(product.images.all())
+    if not images:
+        return None
+
+    # Same order .first() used: the model's own ordering, or by id when
+    # it has none.
+    if not product.images.model._meta.ordering:
+        images.sort(key=lambda i: i.pk)
+
+    for img in images:
+        if img.is_primary:
+            return img
+    return images[0]
 
 
 # Converts each order item into API response format.
@@ -111,7 +151,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
         if not product:
             return None
 
-        img = product.images.filter(is_primary=True).first() or product.images.first()
+        img = _pick_product_image(product)
         if not img or not img.image:
             return None
 
@@ -255,10 +295,7 @@ class OrderListItemSerializer(serializers.ModelSerializer):
         if not product:
             return None
 
-        img = (
-            product.images.filter(is_primary=True).first()
-            or product.images.first()
-        )
+        img = _pick_product_image(product)
 
         if not img or not img.image:
             return None
@@ -329,7 +366,12 @@ class OrderListSerializer(serializers.ModelSerializer):
         ).data
 
     def get_item_count(self, obj):
-        # IMPORTANT: this is the real total, NOT len(items).
+        # IMPORTANT: this is the real total, NOT len(items) of the 3-item
+        # preview. PERFORMANCE: counted from the prefetched items when the
+        # list view loaded them (no extra query per order); otherwise the
+        # same COUNT query as before.
+        if "items" in getattr(obj, "_prefetched_objects_cache", {}):
+            return len(obj.items.all())
         return obj.items.count()
 
 

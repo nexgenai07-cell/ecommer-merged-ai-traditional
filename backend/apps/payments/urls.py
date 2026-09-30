@@ -12,6 +12,16 @@ from .views import (
     AdminQRPaymentApproveView,
     AdminQRPaymentRejectView,
 )
+# NEW: QR Payments page - stat cards + filterable list (all statuses)
+from .qr_admin_views import (
+    AdminQRPaymentListView,
+    AdminQRPaymentStatsView,
+)
+# NEW: admin-uploaded payment QR image
+from .qr_image_views import (
+    StorePaymentQRView,
+    AdminStorePaymentQRView,
+)
 # NEW (Sep 2026 — Bulk Actions)
 from .bulk_views import (
     AdminQRPaymentBulkApproveView,
@@ -51,6 +61,12 @@ urlpatterns = [
         ExtendQRUploadTimeView.as_view(),
         name="qr-extend-upload-time",
     ),
+    # NEW: QR image the customer scans (uploaded by admin)
+    path(
+        "qr/image/",
+        StorePaymentQRView.as_view(),
+        name="store-payment-qr-image",
+    ),
 ]
 
 
@@ -67,6 +83,27 @@ admin_payment_urlpatterns = [
         "qr/pending/",
         AdminQRPaymentPendingView.as_view(),
         name="admin-qr-payment-pending",
+    ),
+    # NEW: QR Payments page. "qr/" (1 segment) and "qr/stats/" (2
+    # segments) can never clash with the 3-segment
+    # "qr/<order_number>/approve|reject/" patterns below, and "stats" is
+    # not an order-number pattern those would match without /approve/.
+    path(
+        "qr/",
+        AdminQRPaymentListView.as_view(),
+        name="admin-qr-payment-list",
+    ),
+    path(
+        "qr/stats/",
+        AdminQRPaymentStatsView.as_view(),
+        name="admin-qr-payment-stats",
+    ),
+    # NEW: admin uploads / replaces / removes the store's payment QR image.
+    # 2 path segments, so it can't clash with qr/<order_number>/approve/.
+    path(
+        "qr/image/",
+        AdminStorePaymentQRView.as_view(),
+        name="admin-store-payment-qr-image",
     ),
     # NEW (Sep 2026 — Bulk Actions): approve / reject many QR payment
     # proofs at once. These have only 2 path segments ("qr/bulk-approve/"),

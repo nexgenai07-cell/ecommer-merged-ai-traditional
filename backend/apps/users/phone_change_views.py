@@ -154,9 +154,16 @@ class ConfirmPhoneChangeView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        old_phone = user.phone
         user.phone = change_request.new_phone
         user.phone_verified = True
         user.save(update_fields=['phone', 'phone_verified'])
+
+        # NEW: keep the store-scoped Customer copy(ies), saved addresses
+        # and orders that carried the old number in step with the new
+        # one (see apps/users/customer_sync.py)
+        from .customer_sync import sync_customer_profiles
+        sync_customer_profiles(user, ["phone"], old_phone=old_phone)
 
         change_request.delete()
 

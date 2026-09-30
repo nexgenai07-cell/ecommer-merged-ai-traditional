@@ -425,6 +425,16 @@ class MeView(generics.RetrieveUpdateAPIView):
     def get_object(self):
         return self.request.user
 
+    # NEW: a changed name must also show up everywhere the store-scoped
+    # Customer row is read (admin customers/orders pages, order details,
+    # e-mails, ...). See apps/users/customer_sync.py.
+    def perform_update(self, serializer):
+        old_name = serializer.instance.name
+        user = serializer.save()
+        if user.name != old_name:
+            from .customer_sync import sync_customer_profiles
+            sync_customer_profiles(user, ["name"])
+
 
 # NOTE (Sep 2026): ChangePasswordView now lives in
 # password_change_views.py — password change needs an emailed OTP.

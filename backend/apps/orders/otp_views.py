@@ -23,6 +23,7 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.core.mail import EmailMultiAlternatives
+from apps.notifications.email_templates import otp_html
 from django.utils import timezone
 from rest_framework import permissions, status
 from rest_framework.response import Response
@@ -57,17 +58,14 @@ def send_checkout_otp_email(email, code):
         f"{CheckoutOTP.OTP_VALIDITY_MINUTES} minutes. If you did not "
         "request this, you can safely ignore this email."
     )
-    html_message = f"""
-        <html>
-            <body>
-                <h2>Order Confirmation OTP</h2>
-                <p>Enter this OTP to confirm and place your order:</p>
-                <h1 style="letter-spacing: 4px;">{code}</h1>
-                <p>This OTP is valid for {CheckoutOTP.OTP_VALIDITY_MINUTES} minutes.</p>
-                <p>If you did not request this, you can safely ignore this email.</p>
-            </body>
-        </html>
-    """
+    html_message = otp_html(
+        title="Order Confirmation OTP",
+        intro="Enter this OTP to confirm and place your order.",
+        code=code,
+        validity_text=f"This OTP is valid for {CheckoutOTP.OTP_VALIDITY_MINUTES} minutes.",
+        note="If you did not request this, you can safely ignore this email.",
+        plain_text=message,
+    )
 
     try:
         email_msg = EmailMultiAlternatives(

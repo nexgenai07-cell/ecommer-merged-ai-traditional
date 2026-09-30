@@ -162,6 +162,22 @@ class AuditLogListView(generics.ListAPIView):
 
         return qs
 
+    # NEW: customer names for the whole page in a few queries, instead of
+    # one lookup per row (see apps/ai/audit_customer.py).
+    def list(self, request, *args, **kwargs):
+        from .audit_customer import customer_names_for_logs
+
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        items = page if page is not None else list(queryset)
+
+        serializer = self.get_serializer(items, many=True)
+        serializer.child.context['customer_names'] = customer_names_for_logs(items)
+
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
+        return Response(serializer.data)
+
 
 class AuditLogEntityListView(APIView):
     """

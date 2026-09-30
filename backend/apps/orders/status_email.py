@@ -45,14 +45,24 @@ def send_order_status_email(order, title, message):
         return False
 
     subject = f"Order {order.order_number}: {title}"
-    html_message = f"""
-        <html>
-            <body>
-                <h2>{title}</h2>
-                <p>{message}</p>
-            </body>
-        </html>
-    """
+
+    # UPDATED: styled, branded HTML (see apps/notifications/email_templates.py).
+    # If that module can't be loaded for any reason, fall back to the
+    # original simple HTML so the status email still goes out.
+    try:
+        from apps.notifications.email_templates import order_status_html
+
+        html_message = order_status_html(order, title, message)
+    except Exception:
+        logger.exception("send_order_status_email: template failed, using plain HTML")
+        html_message = f"""
+            <html>
+                <body>
+                    <h2>{title}</h2>
+                    <p>{message}</p>
+                </body>
+            </html>
+        """
 
     try:
         email_msg = EmailMultiAlternatives(

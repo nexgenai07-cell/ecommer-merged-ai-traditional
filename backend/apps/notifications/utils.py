@@ -4,6 +4,7 @@ from django.conf import settings
 from django.core.mail import EmailMultiAlternatives
 
 from .models import Notification
+from .email_templates import order_confirmation_html, refund_html
 from apps.stores.models import Store
 
 logger = logging.getLogger(__name__)
@@ -103,7 +104,10 @@ def send_order_confirmation_email(order):
     ]
 
     message = "\n".join(lines)
-    html_message = f"<html><body><pre>{message}</pre></body></html>"
+    # UPDATED: was the plain text wrapped in <pre> (monospace, unstyled).
+    # Now a proper branded HTML email - see email_templates.py. The
+    # plain-text `message` above is still sent as the text alternative.
+    html_message = order_confirmation_html(order, customer, message)
 
     try:
         email_msg = EmailMultiAlternatives(
@@ -138,7 +142,7 @@ def send_refund_confirmation_email(order):
         "If you paid by card, please allow a few business days for the refund "
         "to reflect in your account."
     )
-    html_message = f"<html><body><pre>{message}</pre></body></html>"
+    html_message = refund_html(order, customer, message)
 
     try:
         email_msg = EmailMultiAlternatives(

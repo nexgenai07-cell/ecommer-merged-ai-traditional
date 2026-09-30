@@ -286,9 +286,15 @@ class VerifyPhoneView(APIView):
         if not verification.is_valid():
             return Response({'error': 'This verification link has expired or already been used.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        old_phone = user.phone
         user.phone = verification.phone
         user.phone_verified = True
         user.save()
+
+        # NEW: keep the store-scoped Customer copy(ies) in step with the
+        # newly verified number (see apps/users/customer_sync.py)
+        from .customer_sync import sync_customer_profiles
+        sync_customer_profiles(user, ["phone"], old_phone=old_phone)
 
         verification.is_used = True
         verification.save()

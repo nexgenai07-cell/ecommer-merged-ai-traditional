@@ -11,6 +11,9 @@ from core.pagination import StandardResultsPagination
 from .models import Notification
 from .serializers import NotificationSerializer
 from .utils import create_notification
+from .customer_names import customer_names_for
+from apps.ai.audit import log_manual_admin_action as log_admin_action
+from .email_broadcast import get_email_recipients, send_notification_email
 from apps.users.permissions import IsAdmin
 
 
@@ -44,10 +47,22 @@ class NotificationViewSet(
     # don't have this problem — they can only exist for an already-
     # registered user — so only the broadcast branch needs the extra
     # created_at >= registration-date filter.
+    #
+    # UPDATED (role-based): broadcasts (user=null) are messages an admin
+    # sends TO customers, so they are only ever visible to customers.
+    # Admins/moderators only see notifications addressed to themselves
+    # (new order, return, complaint, ...). Before this, a broadcast also
+    # showed up in the admin's own notification list (the admin's own
+    # sent messages), and because a broadcast is ONE shared row, a
+    # customer reading it flipped it to "read" for the admin too.
     def get_base_queryset(self):
+        user = self.request.user
+        if getattr(user, "role", None) != "customer":
+            return Notification.objects.filter(user=user).order_by("-created_at")
+
         return Notification.objects.filter(
-            Q(user=self.request.user)
-            | Q(user__isnull=True, created_at__gte=self.request.user.created_at)
+            Q(user=user)
+            | Q(user__isnull=True, created_at__gte=user.created_at)
         ).order_by("-created_at")
 
     # Applies optional notification-list filters:
@@ -86,15 +101,25 @@ class NotificationViewSet(
             for value, _label in Notification.TYPE_CHOICES
         }
 
+        # NEW: customer names for admin notifications, looked up for the
+        # whole page at once (see customer_names.py).
+        def names_for(items):
+            if getattr(request.user, "role", None) == "customer":
+                return None
+            return customer_names_for(items)
+
         page = self.paginate_queryset(queryset)
         if page is not None:
             serializer = self.get_serializer(page, many=True)
+            serializer.child.context["customer_names"] = names_for(page)
             response = self.get_paginated_response(serializer.data)
             response.data["unread_count"] = unread_count
             response.data["unread_by_type"] = unread_by_type
             return response
 
-        serializer = self.get_serializer(queryset, many=True)
+        items = list(queryset)
+        serializer = self.get_serializer(items, many=True)
+        serializer.child.context["customer_names"] = names_for(items)
         return Response(
             {
                 "unread_count": unread_count,
@@ -248,7 +273,46 @@ class SendNotificationView(APIView):
                 status=status.HTTP_409_CONFLICT,
             )
 
+        response_data = dict(NotificationSerializer(notification, context={"request": request}).data)
+
+        # NEW: record this send in the Audit Logs (who sent it, to whom, by
+        # which channel, from which IP). Uses the same fail-safe helper as
+        # the other admin actions - a logging problem can never stop the
+        # notification from going out.
+        log_admin_action(
+            store=notification.store,
+            user=request.user,
+            action="create_notification",
+            entity="notification",
+            entity_id=notification.id,
+            new_data={
+                "title": title,
+                "type": notif_type,
+                "sent_via": sent_via,
+                "audience": "specific_user" if target_user else "all_customers",
+                "recipient": (
+                    {"id": target_user.id, "name": target_user.name}
+                    if target_user else None
+                ),
+            },
+            request=request,
+        )
+
+        # NEW: "Email" channel now really sends an email (specific user ->
+        # that user's email; broadcast -> every active customer). The
+        # in-app notification above is still created exactly as before.
+        # Delivery happens in a background thread (see
+        # email_broadcast.py), so this response is never delayed.
+        if sent_via == "email":
+            recipients = get_email_recipients(target_user)
+            response_data["email_recipients"] = send_notification_email(
+                recipients,
+                title,
+                message,
+                store=notification.store,
+            )
+
         return Response(
-            NotificationSerializer(notification).data,
+            response_data,
             status=status.HTTP_201_CREATED,
         )

@@ -8,6 +8,28 @@ from apps.ai.models import AuditLog
 from apps.stores.models import Store
 
 
+def get_client_ip(request):
+    """
+    Real client IP. Behind Railway's proxy REMOTE_ADDR is empty or the
+    proxy's own address, so the forwarded headers come first - the same
+    order the login-session code already uses (apps/users/views.py
+    get_client_ip). Returns None if nothing is available.
+    """
+    if request is None:
+        return None
+    meta = getattr(request, "META", {}) or {}
+    forwarded = meta.get("HTTP_X_FORWARDED_FOR")
+    if forwarded:
+        first = forwarded.split(",")[0].strip()
+        if first:
+            return first[:50]
+    real_ip = (meta.get("HTTP_X_REAL_IP") or "").strip()
+    if real_ip:
+        return real_ip[:50]
+    remote = (meta.get("REMOTE_ADDR") or "").strip()
+    return remote[:50] or None
+
+
 # tool_name -> (entity_name, payload_key_for_entity_id)
 # 'create_*' tools ke liye entity_id pending payload mein nahi hota (naya
 # record abhi bana hi nahi tha) — us case mein result se nikalte hain.
@@ -132,9 +154,7 @@ def log_manual_admin_action(
       IP address is recorded; safe to omit.
     """
     try:
-        ip_address = None
-        if request is not None:
-            ip_address = request.META.get("REMOTE_ADDR")
+        ip_address = get_client_ip(request)
 
         AuditLog.objects.create(
             store=store,

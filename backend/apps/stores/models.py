@@ -29,6 +29,13 @@ class Store(models.Model):
     null=True
                  )
     subdomain  = models.CharField(max_length=100, unique=True)
+    # NEW: admin-uploaded payment QR (customers scan this and then upload
+    # payment proof). Per-store, so it carries over to multi-store later.
+    payment_qr_image = models.ImageField(
+                    upload_to='payment_qr/',
+                    blank=True,
+                    null=True,
+                 )
     phone      = models.CharField(max_length=20, blank=True, null=True)
     address    = models.TextField(blank=True, null=True)
     plan       = models.CharField(max_length=20, choices=PLAN_CHOICES, default='basic')

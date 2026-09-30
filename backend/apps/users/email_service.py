@@ -5,6 +5,8 @@ import logging
 from django.conf import settings
 from django.core.mail import EmailMultiAlternatives
 
+from apps.notifications import email_templates as tpl
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,47 +53,15 @@ def send_verification_with_resend(
     if html_intro is None:
         html_intro = "Click the button below to verify your email address."
 
-        html_message = f"""
-        <html>
-            <body style="margin:0; padding:0; background-color:#f4f4f7; font-family: Arial, Helvetica, sans-serif;">
-                <center>
-                    <table role="presentation" width="100%" align="center" cellpadding="0" cellspacing="0" style="background-color:#f4f4f7; padding: 40px 0;">
-                        <tr>
-                            <td align="center">
-                                <table role="presentation" width="480" align="center" cellpadding="0" cellspacing="0" style="background-color:#ffffff; border-radius: 8px; padding: 40px; margin: 0 auto; box-shadow: 0 2px 8px rgba(0,0,0,0.06);">
-                                    <tr>
-                                        <td align="center">
-                                            <h2 style="margin: 0 0 16px 0; color: #1a1a1a; font-size: 20px; text-align: center;">
-                                                {subject}
-                                            </h2>
-                                            <p style="margin: 0 0 24px 0; color: #444444; font-size: 15px; line-height: 1.6; text-align: center;">
-                                                {html_intro}
-                                            </p>
-                                            <table role="presentation" align="center" cellpadding="0" cellspacing="0" style="margin: 0 auto;">
-                                                <tr>
-                                                    <td align="center" style="border-radius: 6px; background-color: #16a34a;">
-                                                        <a href="{verify_link}"
-                                                           target="_blank"
-                                                           style="display: inline-block; padding: 14px 32px; font-size: 15px; font-weight: bold; color: #ffffff; text-decoration: none; border-radius: 6px;">
-                                                            {button_text}
-                                                        </a>
-                                                    </td>
-                                                </tr>
-                                            </table>
-                                            <p style="margin: 28px 0 0 0; color: #999999; font-size: 13px; line-height: 1.5; text-align: center;">
-                                                If the button above doesn't work, copy and paste this link into your browser:<br>
-                                                <a href="{verify_link}" style="color: #16a34a; word-break: break-all;">{verify_link}</a>
-                                            </p>
-                                        </td>
-                                    </tr>
-                                </table>
-                            </td>
-                        </tr>
-                    </table>
-                </center>
-            </body>
-        </html>
-    """
+    # FIX: the HTML body used to be built INSIDE the `if html_intro is None`
+    # block above, so whenever a caller passed its own html_intro (password
+    # reset, phone verification, account reactivation - all three do) the
+    # variable was never created and the send crashed with
+    # UnboundLocalError. It is now always built, using the shared template
+    # (see apps/notifications/email_templates.py).
+    html_message = tpl.verification_html(
+        subject, html_intro, verify_link, button_text, message
+    )
 
     try:
         email_msg = EmailMultiAlternatives(
@@ -125,16 +95,14 @@ def send_2fa_code_email(user, code):
         "This code is valid for 10 minutes. If you did not request this, "
         "please ignore this email."
     )
-    html_message = f"""
-        <html>
-            <body>
-                <h2>Your verification code</h2>
-                <p>Use this code to complete sign-in:</p>
-                <h1 style="letter-spacing: 4px;">{code}</h1>
-                <p>This code is valid for 10 minutes.</p>
-            </body>
-        </html>
-    """
+    html_message = tpl.otp_html(
+        title="Your verification code",
+        intro="Use this code to complete sign-in.",
+        code=code,
+        validity_text="This code is valid for 10 minutes.",
+        note="If you did not request this, please ignore this email.",
+        plain_text=message,
+    )
 
     try:
         email_msg = EmailMultiAlternatives(
@@ -168,18 +136,14 @@ def send_email_change_code(new_email, code):
         "please ignore this email and your account email will stay "
         "unchanged."
     )
-    html_message = f"""
-        <html>
-            <body>
-                <h2>Confirm your new email address</h2>
-                <p>Use this code to confirm this is your new email address:</p>
-                <h1 style="letter-spacing: 4px;">{code}</h1>
-                <p>This code is valid for 10 minutes.</p>
-                <p>If you did not request this, you can safely ignore this
-                email — your account email will not change.</p>
-            </body>
-        </html>
-    """
+    html_message = tpl.otp_html(
+        title="Confirm your new email address",
+        intro="Use this code to confirm this is your new email address.",
+        code=code,
+        validity_text="This code is valid for 10 minutes.",
+        note="If you did not request this, you can safely ignore this email. Your account email will not change.",
+        plain_text=message,
+    )
 
     try:
         email_msg = EmailMultiAlternatives(
@@ -213,19 +177,17 @@ def send_email_change_notice(old_email, new_email):
         f"{new_email} to confirm it.\n\n"
         "If this was NOT you, please change your password immediately."
     )
-    html_message = f"""
-        <html>
-            <body>
-                <h2>Email change requested</h2>
-                <p>A request was made to change your account email to
-                <strong>{new_email}</strong>.</p>
-                <p>If this was you, no action is needed here — enter the
-                code sent to {new_email} to confirm it.</p>
-                <p>If this was <strong>not</strong> you, please change your
-                password immediately.</p>
-            </body>
-        </html>
-    """
+    html_message = tpl.notice_html(
+        "Email change requested",
+        [
+            "A request was made to change your account email to "
+            f"<strong>{tpl.esc(new_email)}</strong>.",
+            "If this was you, no action is needed here. Enter the code sent to "
+            f"{tpl.esc(new_email)} to confirm it.",
+            "If this was <strong>not</strong> you, please change your password immediately.",
+        ],
+        plain_text=message,
+    )
 
     try:
         email_msg = EmailMultiAlternatives(
@@ -264,20 +226,15 @@ def send_phone_change_code(user, new_phone, code):
         "please ignore this email and your phone number will stay "
         "unchanged."
     )
-    html_message = f"""
-        <html>
-            <body>
-                <h2>Confirm your new phone number</h2>
-                <p>You requested to change your phone number to
-                <strong>{new_phone}</strong>.</p>
-                <p>Use this code to confirm the change:</p>
-                <h1 style="letter-spacing: 4px;">{code}</h1>
-                <p>This code is valid for 10 minutes.</p>
-                <p>If you did not request this, you can safely ignore this
-                email — your phone number will not change.</p>
-            </body>
-        </html>
-    """
+    html_message = tpl.otp_html(
+        title="Confirm your new phone number",
+        intro="Use this code to confirm the change.",
+        code=code,
+        validity_text="This code is valid for 10 minutes.",
+        note="If you did not request this, you can safely ignore this email. Your phone number will not change.",
+        extra_rows=[("New phone number", f"<strong>{tpl.esc(new_phone)}</strong>")],
+        plain_text=message,
+    )
 
     try:
         email_msg = EmailMultiAlternatives(
@@ -312,22 +269,18 @@ def send_password_change_code(user, code):
         "and consider changing your password, since someone may have "
         "access to your account."
     )
-    html_message = f"""
-        <html>
-            <body>
-                <h2>Confirm your password change</h2>
-                <p>We received a request to change the password of your
-                account.</p>
-                <p>Use this code to confirm the change:</p>
-                <h1 style="letter-spacing: 4px;">{code}</h1>
-                <p>This code is valid for 10 minutes.</p>
-                <p>If you did not request this, you can safely ignore this
-                email — your password will not change. Someone may have
-                access to your account, so we recommend resetting your
-                password.</p>
-            </body>
-        </html>
-    """
+    html_message = tpl.otp_html(
+        title="Confirm your password change",
+        intro="We received a request to change the password of your account. Use this code to confirm the change.",
+        code=code,
+        validity_text="This code is valid for 10 minutes.",
+        note=(
+            "If you did not request this, you can safely ignore this email. "
+            "Your password will not change. Someone may have access to your "
+            "account, so we recommend resetting your password."
+        ),
+        plain_text=message,
+    )
 
     try:
         email_msg = EmailMultiAlternatives(

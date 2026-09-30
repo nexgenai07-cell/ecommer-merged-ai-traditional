@@ -18,6 +18,7 @@ from django.dispatch import receiver
 
 from .live_events import push, user_group
 from .models import Notification
+from .customer_names import customer_names_for
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,15 @@ def notification_created(sender, instance, created, raw=False, **kwargs):
     if raw or not created or not instance.user_id:
         return
     try:
+        # NEW: admins also get the customer's name in the live event (same
+        # value the notification list returns as customer_name).
+        customer_name = None
+        recipient = instance.user
+        if getattr(recipient, "role", None) != "customer":
+            customer_name = customer_names_for([instance]).get(
+                (instance.reference_type, str(instance.reference_id))
+            )
+
         push(user_group(instance.user_id), "notification", {
             "id": instance.id,
             "title": instance.title,
@@ -36,6 +46,7 @@ def notification_created(sender, instance, created, raw=False, **kwargs):
             "reference_id": instance.reference_id,
             "is_read": instance.is_read,
             "created_at": instance.created_at.isoformat(),
+            "customer_name": customer_name,
         })
     except Exception:
         logger.exception("notification live push failed for notification %s", getattr(instance, "id", None))

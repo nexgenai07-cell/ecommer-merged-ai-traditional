@@ -152,6 +152,12 @@ class ConfirmEmailChangeView(APIView):
         user.email_verified = True
         user.save(update_fields=['email', 'email_verified'])
 
+        # NEW: keep the store-scoped Customer copy(ies) in step, so the
+        # new email shows on the admin customers/orders pages, in
+        # e-mails, etc. (see apps/users/customer_sync.py)
+        from .customer_sync import sync_customer_profiles
+        sync_customer_profiles(user, ["email"])
+
         change_request.delete()
 
         return Response(
