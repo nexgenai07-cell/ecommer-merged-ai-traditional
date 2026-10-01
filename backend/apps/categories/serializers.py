@@ -4,10 +4,22 @@ from rest_framework import serializers
 from .models import Category
 
 
+class OptionalBooleanField(serializers.BooleanField):
+    """
+    DRF's BooleanField treats a MISSING key in multipart/form-data as False.
+    That silently set is_active=False whenever the admin edited a category
+    (image upload => multipart) without sending is_active.
+    With default_empty_html = empty, a missing key is simply skipped, so the
+    existing value stays unchanged.
+    """
+    default_empty_html = serializers.empty
+
+
 class CategorySerializer(serializers.ModelSerializer):
     image = serializers.ImageField(required=False)
     image_url = serializers.SerializerMethodField(read_only=True)
     product_count = serializers.SerializerMethodField()
+    is_active = OptionalBooleanField(required=False)
 
     class Meta:
         model = Category
@@ -58,3 +70,4 @@ class CategorySerializer(serializers.ModelSerializer):
             )
 
         return value
+   
