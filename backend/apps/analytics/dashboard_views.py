@@ -1746,6 +1746,7 @@ class AnalyticsExportView(APIView):
         # aliases pending/approved), search, start_date/end_date (day the
         # proof was submitted), min_amount, max_amount, duplicate,
         # ordering. A bad amount returns 400, same as the page.
+        from apps.payments.customer_info import customer_name_phone
         from apps.payments.qr_filters import apply_qr_filters, base_qr_queryset
 
         qs = apply_qr_filters(
@@ -1760,10 +1761,17 @@ class AnalyticsExportView(APIView):
         for p in qs:
             order = p.order
             customer = order.customer
+            # UPDATED (Oct 2026): same name / phone the QR Payments page
+            # now shows - the customer's account first (see
+            # apps/payments/customer_info.py).
+            if customer:
+                customer_name, customer_phone = customer_name_phone(order)
+            else:
+                customer_name, customer_phone = '', ''
             writer.writerow([
                 order.order_number,
-                csv_safe_text(customer.name if customer else ''),
-                format_phone_for_csv(customer.phone if customer else ''),
+                csv_safe_text(customer_name),
+                format_phone_for_csv(customer_phone),
                 order.total_amount,
                 csv_safe_text(p.qr_transaction_id or ''),
                 p.status,

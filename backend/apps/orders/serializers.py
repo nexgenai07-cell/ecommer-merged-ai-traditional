@@ -137,6 +137,11 @@ class OrderItemSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "product",
+            # NEW (Oct 2026 — product variants): which variant was bought
+            # (null for a product without variants) and its readable
+            # label, e.g. "Black / Large".
+            "variant",
+            "variant_label",
             "product_name",
             "product_image",
             "price",
@@ -694,6 +699,15 @@ class CheckoutSerializer(serializers.Serializer):
         min_value=1,
         default=1,
         help_text="Buy Now: quantity of buy_now_product_id to order. Defaults to 1.",
+    )
+    # NEW (Oct 2026 — product variants): the variant (color / size-kit)
+    # of buy_now_product_id. Compulsory when that product has variants,
+    # must be left out when it has none (checked in CheckoutView, where
+    # the product is loaded).
+    buy_now_variant_id = serializers.IntegerField(
+        required=False,
+        allow_null=True,
+        help_text="Buy Now: variant id of buy_now_product_id (required if the product has variants).",
     )
 
     # NEW (Checkout coupon field): optional. Lets the customer apply a

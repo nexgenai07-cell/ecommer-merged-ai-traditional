@@ -135,6 +135,19 @@ class Product(models.Model):
         return self.total_stock - self.reserved_stock
 
     # ============================================================
+    # NEW (Oct 2026 — product variants): True when this product has at
+    # least one non-deleted variant (color / size-kit). When True, the
+    # customer MUST pick a variant to buy it, and total_stock /
+    # reserved_stock on this row are no longer typed in by hand — they
+    # are the SUM of the active variants' stock, kept in sync by
+    # services.sync_product_stock_from_variants(). Products with no
+    # variants behave exactly as before.
+    # ============================================================
+    @property
+    def has_variants(self):
+        return self.variants.filter(is_delete=False).exists()
+
+    # ============================================================
     # NEW (Sep 2026 — profit/markup calculation): single source of
     # truth for cost-vs-price math, used by ProductListSerializer /
     # ProductDetailSerializer (admin-only "profit" field) and by
@@ -222,6 +235,120 @@ class ProductImage(models.Model):
         return f"Image for {self.product.name}"
 
 
+# ============================================================
+# NEW (Oct 2026 — product variants): one row per purchasable
+# combination of a product, e.g. Black / Large. Every variant has its
+# OWN price and its OWN stock (total_stock / reserved_stock follow the
+# same reserve -> deduct -> release rules as Product, see
+# apps/orders/views.py).
+#
+# Rules:
+# - At least one of color / size must be filled in (a variant with
+#   neither is just the product itself).
+# - A product with variants: customer must choose a variant (compulsory).
+#   A product with NO variants: works exactly as before (optional).
+# - Product.total_stock / reserved_stock = SUM over this product's
+#   active, non-deleted variants (see services.py).
+# - Soft delete (is_delete) like Product — the row is kept so old
+#   orders / stock history stay traceable.
+# ============================================================
+class ProductVariant(models.Model):
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.CASCADE,
+        related_name="variants",
+    )
+
+    color = models.CharField(
+        max_length=50,
+        blank=True,
+        default="",
+        help_text="Color name, e.g. Black. Leave blank if this product has no color options.",
+    )
+    color_hex = models.CharField(
+        max_length=7,
+        blank=True,
+        default="",
+        help_text="Optional swatch color for the storefront, e.g. #000000.",
+    )
+    size = models.CharField(
+        max_length=50,
+        blank=True,
+        default="",
+        help_text=(
+            "Size or kit, e.g. Large, 42, Body Only, 18-55mm Kit. "
+            "Leave blank if this product has no size/kit options."
+        ),
+    )
+
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+    original_price = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+
+    total_stock = models.PositiveIntegerField(
+        default=0,
+        help_text="Total physical stock of this variant",
+    )
+    reserved_stock = models.PositiveIntegerField(
+        default=0,
+        help_text="Stock of this variant reserved for pending payment orders",
+    )
+
+    is_active = models.BooleanField(default=True)
+    is_delete = models.BooleanField(default=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "product_variants"
+        ordering = ["id"]
+        constraints = [
+            # Same color + size can't exist twice on one product — only
+            # among non-deleted rows, so a deleted variant's combination
+            # can be re-created (same pattern as Product name / sku).
+            models.UniqueConstraint(
+                fields=["product", "color", "size"],
+                condition=models.Q(is_delete=False),
+                name="unique_active_product_variant",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.product.name} - {self.label}"
+
+    @property
+    def label(self):
+        parts = [p for p in (self.color, self.size) if p]
+        return " / ".join(parts)
+
+    @property
+    def available_stock(self):
+        return self.total_stock - self.reserved_stock
+
+    @property
+    def in_stock(self):
+        return self.available_stock > 0
+
+    def clean(self):
+        if not (self.color or self.size):
+            raise ValidationError(
+                "A variant needs at least a color or a size/kit."
+            )
+        if self.reserved_stock > self.total_stock:
+            raise ValidationError({
+                "reserved_stock": "Reserved stock cannot exceed total stock."
+            })
+
+    def save(self, *args, **kwargs):
+        self.clean()
+        super().save(*args, **kwargs)
+
+
 # Keeps a history of product price and stock changes.
 class ProductHistory(models.Model):
     product    = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='history')
@@ -277,6 +404,16 @@ class StockMovement(models.Model):
         null=True,
         blank=True,
         help_text="Null for system-triggered movements (checkout, auto-cancel, etc).",
+    )
+    # NEW (Oct 2026 — product variants): set when the movement is for one
+    # specific variant's stock (null = a product-level movement, exactly
+    # like every row that existed before variants).
+    variant = models.ForeignKey(
+        "ProductVariant",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="stock_movements",
     )
     old_stock = models.IntegerField()
     new_stock = models.IntegerField()

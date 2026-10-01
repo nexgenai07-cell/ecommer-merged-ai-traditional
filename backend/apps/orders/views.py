@@ -49,8 +49,11 @@ from .serializers import (
 )
 
 from apps.cart.models import Cart
-from apps.products.models import Product, StockMovement, Discount
-from apps.products.services import check_low_stock_notification
+from apps.products.models import Product, ProductVariant, StockMovement, Discount
+from apps.products.services import (
+    check_low_stock_notification,
+    sync_product_stock_from_variants,
+)
 from apps.stores.models import Store
 from apps.users.permissions import IsAdmin, IsCustomer
 
@@ -139,68 +142,166 @@ def get_or_create_customer(user, store_id=1):
 # completely unchanged whether the order came from the persisted cart or
 # a single Buy Now click.
 class _BuyNowItem:
-    def __init__(self, product, quantity):
+    # UPDATED (Oct 2026 — product variants): also carries the picked
+    # variant (None for a product without variants) and exposes the same
+    # unit_price a real CartItem has, so checkout prices both the same way.
+    def __init__(self, product, quantity, variant=None):
         self.product = product
         self.product_id = product.id
         self.quantity = quantity
+        self.variant = variant
+        self.variant_id = variant.id if variant else None
+
+    @property
+    def unit_price(self):
+        if self.variant is not None:
+            return self.variant.price
+        return self.product.price
+
+
+# ============================================================
+# NEW (Oct 2026 — product variants): shared pieces of the four stock
+# functions below (reserve / release / deduct / restock).
+#
+# An order item that has a variant is stocked on the VARIANT row
+# (variant.total_stock / reserved_stock), exactly like a plain product is
+# stocked on the Product row. After the variant rows change, the product's
+# own total_stock / reserved_stock are re-summed from its variants
+# (services.sync_product_stock_from_variants) so "product stock = sum of
+# its variants" always holds.
+#
+# Lock order, everywhere: variants first (by id), then products (by id) —
+# the same order in all four functions and in CheckoutView, so two
+# concurrent orders can't deadlock each other.
+# ============================================================
+def _split_order_items(order):
+    items = list(order.items.select_related("product", "variant").all())
+    variant_items = [i for i in items if i.variant_id]
+    # An item whose variant row was later hard-deleted (variant_id set to
+    # NULL) still has its variant_label. It must NOT fall through to the
+    # product-level path: a variant product's stock is the sum of its
+    # variants, not a number to edit directly.
+    plain_items = [i for i in items if not i.variant_id and not i.variant_label]
+    return plain_items, variant_items
+
+
+def _lock_variants(variant_items):
+    ids = sorted({i.variant_id for i in variant_items})
+    if not ids:
+        return {}
+    return {
+        v.id: v
+        for v in ProductVariant.objects.select_for_update()
+        .filter(id__in=ids)
+        .order_by("id")
+    }
+
+
+def _lock_products(plain_items, variant_items):
+    ids = sorted({
+        i.product_id for i in list(plain_items) + list(variant_items) if i.product_id
+    })
+    if not ids:
+        return {}
+    return {
+        p.id: p
+        for p in Product.objects.select_for_update()
+        .filter(id__in=ids)
+        .order_by("id")
+    }
+
+
+def _sync_variant_products(locked_variants):
+    for product_id in sorted({v.product_id for v in locked_variants.values()}):
+        sync_product_stock_from_variants(Product(pk=product_id))
 
 
 def reserve_stock_for_order(order):
     """
     Transition 1: Checkout (API 55), order created as pending_payment
     reserved_stock += qty, total_stock unchanged
+
+    UPDATED (Oct 2026 — product variants): items with a variant reserve
+    on the variant; the product's totals are then re-summed.
     """
     if order.stock_deducted:
         return
 
-    items = list(order.items.select_related("product").all())
-    product_ids = [item.product_id for item in items if item.product_id]
+    items, variant_items = _split_order_items(order)
+    locked_variants = _lock_variants(variant_items)
+    locked_products = _lock_products(items, variant_items)
 
-    if product_ids:
-        locked_products = {
-            p.id: p
-            for p in Product.objects.select_for_update().filter(id__in=product_ids)
-        }
+    for item in items:
+        product = locked_products.get(item.product_id)
+        if not product:
+            continue
 
-        for item in items:
-            product = locked_products.get(item.product_id)
-            if not product:
-                continue
+        old_reserved = product.reserved_stock
+        new_reserved = old_reserved + item.quantity
 
-            old_reserved = product.reserved_stock
-            new_reserved = old_reserved + item.quantity
-
-            if new_reserved > product.total_stock:
-                raise Exception(
-                    f"Cannot reserve {item.quantity} units for product {product.name}. "
-                    f"Available stock: {product.total_stock - old_reserved}"
-                )
-
-            # NEW (Notification Triggers Addendum, Item 17): this is the
-            # point where available_stock (total_stock - reserved_stock)
-            # actually decreases in this codebase — total_stock itself
-            # only changes later, at payment confirmation, when
-            # reserved_stock drops by the same amount total_stock does
-            # (net available_stock change = 0 at that point). Snapshot
-            # before/after here so the low-stock crossing check fires at
-            # the moment it's technically true, not just at confirmation.
-            old_available = product.total_stock - old_reserved
-            new_available = product.total_stock - new_reserved
-
-            product.reserved_stock = new_reserved
-            product.save(update_fields=["reserved_stock"])
-
-            StockMovement.objects.create(
-                product=product,
-                changed_by=None,
-                old_stock=product.total_stock,
-                new_stock=product.total_stock,
-                delta=0,
-                reason="order_placed",
-                note=f"Order {order.order_number} - reserved {item.quantity} units",
+        if new_reserved > product.total_stock:
+            raise Exception(
+                f"Cannot reserve {item.quantity} units for product {product.name}. "
+                f"Available stock: {product.total_stock - old_reserved}"
             )
 
-            check_low_stock_notification(product, old_available, new_available)
+        # NEW (Notification Triggers Addendum, Item 17): this is the
+        # point where available_stock (total_stock - reserved_stock)
+        # actually decreases in this codebase — total_stock itself
+        # only changes later, at payment confirmation, when
+        # reserved_stock drops by the same amount total_stock does
+        # (net available_stock change = 0 at that point). Snapshot
+        # before/after here so the low-stock crossing check fires at
+        # the moment it's technically true, not just at confirmation.
+        old_available = product.total_stock - old_reserved
+        new_available = product.total_stock - new_reserved
+
+        product.reserved_stock = new_reserved
+        product.save(update_fields=["reserved_stock"])
+
+        StockMovement.objects.create(
+            product=product,
+            changed_by=None,
+            old_stock=product.total_stock,
+            new_stock=product.total_stock,
+            delta=0,
+            reason="order_placed",
+            note=f"Order {order.order_number} - reserved {item.quantity} units",
+        )
+
+        check_low_stock_notification(product, old_available, new_available)
+
+    # Variant items (low-stock check for these runs inside the product
+    # re-sum below, on the product's total available stock).
+    for item in variant_items:
+        variant = locked_variants.get(item.variant_id)
+        if not variant:
+            continue
+
+        old_reserved = variant.reserved_stock
+        new_reserved = old_reserved + item.quantity
+
+        if new_reserved > variant.total_stock:
+            raise Exception(
+                f"Cannot reserve {item.quantity} units for {item.product_name}. "
+                f"Available stock: {variant.total_stock - old_reserved}"
+            )
+
+        variant.reserved_stock = new_reserved
+        variant.save(update_fields=["reserved_stock"])
+
+        StockMovement.objects.create(
+            product_id=variant.product_id,
+            variant=variant,
+            changed_by=None,
+            old_stock=variant.total_stock,
+            new_stock=variant.total_stock,
+            delta=0,
+            reason="order_placed",
+            note=f"Order {order.order_number} - reserved {item.quantity} units",
+        )
+
+    _sync_variant_products(locked_variants)
 
 
 def release_reserved_stock_for_order(order):
@@ -215,73 +316,109 @@ def release_reserved_stock_for_order(order):
     If payment was confirmed:
         total_stock += qty
         reserved_stock -= qty
+
+    UPDATED (Oct 2026 — product variants): items with a variant are
+    released on the variant row, then the product's totals are re-summed.
+    For a variant item whose payment WAS confirmed only total_stock is put
+    back — deduct_stock_for_order already dropped the reservation when it
+    deducted, so there is nothing reserved left to release.
     """
+    items, variant_items = _split_order_items(order)
+    locked_variants = _lock_variants(variant_items)
+    locked_products = _lock_products(items, variant_items)
+
     if not order.stock_deducted:
-        items = list(order.items.select_related("product").all())
-        product_ids = [item.product_id for item in items if item.product_id]
-
-        if product_ids:
-            locked_products = {
-                p.id: p
-                for p in Product.objects.select_for_update().filter(id__in=product_ids)
-            }
-
-            for item in items:
-                product = locked_products.get(item.product_id)
-                if not product:
-                    continue
-
-                old_reserved = product.reserved_stock
-                new_reserved = max(old_reserved - item.quantity, 0)
-
-                product.reserved_stock = new_reserved
-                product.save(update_fields=["reserved_stock"])
-
-                StockMovement.objects.create(
-                    product=product,
-                    changed_by=None,
-                    old_stock=product.total_stock,
-                    new_stock=product.total_stock,
-                    delta=0,
-                    reason="order_cancelled",
-                    note=f"Order {order.order_number} - released {item.quantity} units",
-                )
-
-        return
-
-    items = list(order.items.select_related("product").all())
-    product_ids = [item.product_id for item in items if item.product_id]
-
-    if product_ids:
-        locked_products = {
-            p.id: p
-            for p in Product.objects.select_for_update().filter(id__in=product_ids)
-        }
-
         for item in items:
             product = locked_products.get(item.product_id)
             if not product:
                 continue
 
-            old_total = product.total_stock
-            new_total = old_total + item.quantity
-
             old_reserved = product.reserved_stock
             new_reserved = max(old_reserved - item.quantity, 0)
 
-            product.total_stock = new_total
             product.reserved_stock = new_reserved
-            product.save(update_fields=["total_stock", "reserved_stock"])
+            product.save(update_fields=["reserved_stock"])
 
             StockMovement.objects.create(
                 product=product,
                 changed_by=None,
-                old_stock=old_total,
-                new_stock=new_total,
-                delta=item.quantity,
+                old_stock=product.total_stock,
+                new_stock=product.total_stock,
+                delta=0,
                 reason="order_cancelled",
-                note=f"Order {order.order_number} cancelled - restored {item.quantity} units",
+                note=f"Order {order.order_number} - released {item.quantity} units",
             )
+
+        for item in variant_items:
+            variant = locked_variants.get(item.variant_id)
+            if not variant:
+                continue
+
+            variant.reserved_stock = max(variant.reserved_stock - item.quantity, 0)
+            variant.save(update_fields=["reserved_stock"])
+
+            StockMovement.objects.create(
+                product_id=variant.product_id,
+                variant=variant,
+                changed_by=None,
+                old_stock=variant.total_stock,
+                new_stock=variant.total_stock,
+                delta=0,
+                reason="order_cancelled",
+                note=f"Order {order.order_number} - released {item.quantity} units",
+            )
+
+        _sync_variant_products(locked_variants)
+        return
+
+    for item in items:
+        product = locked_products.get(item.product_id)
+        if not product:
+            continue
+
+        old_total = product.total_stock
+        new_total = old_total + item.quantity
+
+        old_reserved = product.reserved_stock
+        new_reserved = max(old_reserved - item.quantity, 0)
+
+        product.total_stock = new_total
+        product.reserved_stock = new_reserved
+        product.save(update_fields=["total_stock", "reserved_stock"])
+
+        StockMovement.objects.create(
+            product=product,
+            changed_by=None,
+            old_stock=old_total,
+            new_stock=new_total,
+            delta=item.quantity,
+            reason="order_cancelled",
+            note=f"Order {order.order_number} cancelled - restored {item.quantity} units",
+        )
+
+    for item in variant_items:
+        variant = locked_variants.get(item.variant_id)
+        if not variant:
+            continue
+
+        old_total = variant.total_stock
+        new_total = old_total + item.quantity
+
+        variant.total_stock = new_total
+        variant.save(update_fields=["total_stock"])
+
+        StockMovement.objects.create(
+            product_id=variant.product_id,
+            variant=variant,
+            changed_by=None,
+            old_stock=old_total,
+            new_stock=new_total,
+            delta=item.quantity,
+            reason="order_cancelled",
+            note=f"Order {order.order_number} cancelled - restored {item.quantity} units",
+        )
+
+    _sync_variant_products(locked_variants)
 
     order.stock_deducted = False
 
@@ -359,56 +496,81 @@ def deduct_stock_for_order(order, user=None):
 
     This is idempotent through order.stock_deducted, so a duplicate
     Stripe webhook cannot deduct stock twice.
+
+    UPDATED (Oct 2026 — product variants): items with a variant are
+    deducted on the variant row, then the product's totals are re-summed.
     """
     if order.stock_deducted:
         return
 
-    items = list(order.items.select_related("product").all())
-    product_ids = [item.product_id for item in items if item.product_id]
+    items, variant_items = _split_order_items(order)
+    locked_variants = _lock_variants(variant_items)
+    locked_products = _lock_products(items, variant_items)
 
-    if product_ids:
-        locked_products = {
-            p.id: p
-            for p in Product.objects.select_for_update().filter(
-                id__in=product_ids
-            )
-        }
+    for item in items:
+        product = locked_products.get(item.product_id)
+        if not product:
+            continue
 
-        for item in items:
-            product = locked_products.get(item.product_id)
-            if not product:
-                continue
+        old_total = product.total_stock
+        old_reserved = product.reserved_stock
 
-            old_total = product.total_stock
-            old_reserved = product.reserved_stock
+        # The quantity was reserved during checkout.
+        # Now payment is confirmed, so it becomes permanently sold.
+        new_total = max(old_total - item.quantity, 0)
+        new_reserved = max(old_reserved - item.quantity, 0)
 
-            # The quantity was reserved during checkout.
-            # Now payment is confirmed, so it becomes permanently sold.
-            new_total = max(old_total - item.quantity, 0)
-            new_reserved = max(old_reserved - item.quantity, 0)
+        product.total_stock = new_total
+        product.reserved_stock = new_reserved
 
-            product.total_stock = new_total
-            product.reserved_stock = new_reserved
+        product.save(
+            update_fields=[
+                "total_stock",
+                "reserved_stock",
+            ]
+        )
 
-            product.save(
-                update_fields=[
-                    "total_stock",
-                    "reserved_stock",
-                ]
-            )
+        StockMovement.objects.create(
+            product=product,
+            changed_by=user,
+            old_stock=old_total,
+            new_stock=new_total,
+            delta=new_total - old_total,
+            reason="order_confirmed",
+            note=(
+                f"Order {order.order_number} payment confirmed - "
+                f"deducted {item.quantity} units"
+            ),
+        )
 
-            StockMovement.objects.create(
-                product=product,
-                changed_by=user,
-                old_stock=old_total,
-                new_stock=new_total,
-                delta=new_total - old_total,
-                reason="order_confirmed",
-                note=(
-                    f"Order {order.order_number} payment confirmed - "
-                    f"deducted {item.quantity} units"
-                ),
-            )
+    for item in variant_items:
+        variant = locked_variants.get(item.variant_id)
+        if not variant:
+            continue
+
+        old_total = variant.total_stock
+        new_total = max(old_total - item.quantity, 0)
+        new_reserved = max(variant.reserved_stock - item.quantity, 0)
+
+        variant.total_stock = new_total
+        variant.reserved_stock = new_reserved
+        variant.save(update_fields=["total_stock", "reserved_stock"])
+
+        StockMovement.objects.create(
+            product_id=variant.product_id,
+            variant=variant,
+            changed_by=user,
+            old_stock=old_total,
+            new_stock=new_total,
+            delta=new_total - old_total,
+            reason="order_confirmed",
+            note=(
+                f"Order {order.order_number} payment confirmed - "
+                f"deducted {item.quantity} units"
+            ),
+        )
+
+    _sync_variant_products(locked_variants)
 
     order.stock_deducted = True
     order.save(update_fields=["stock_deducted"])
@@ -435,17 +597,16 @@ def confirm_stock_for_order(order, user=None):
 # dropped reserved_stock at payment confirmation), so — unlike
 # release_reserved_stock_for_order — only total_stock needs to move here.
 def restock_returned_order(order, user=None):
-    items = list(order.items.select_related("product").all())
-    product_ids = [item.product_id for item in items if item.product_id]
+    # UPDATED (Oct 2026 — product variants): items with a variant go back
+    # into that variant's stock, then the product's totals are re-summed.
+    items, variant_items = _split_order_items(order)
 
-    if not product_ids:
+    if not items and not variant_items:
         return
 
     with transaction.atomic():
-        locked_products = {
-            p.id: p
-            for p in Product.objects.select_for_update().filter(id__in=product_ids)
-        }
+        locked_variants = _lock_variants(variant_items)
+        locked_products = _lock_products(items, variant_items)
 
         for item in items:
             product = locked_products.get(item.product_id)
@@ -470,6 +631,33 @@ def restock_returned_order(order, user=None):
                     f"restocked {item.quantity} units"
                 ),
             )
+
+        for item in variant_items:
+            variant = locked_variants.get(item.variant_id)
+            if not variant:
+                continue
+
+            old_total = variant.total_stock
+            new_total = old_total + item.quantity
+
+            variant.total_stock = new_total
+            variant.save(update_fields=["total_stock"])
+
+            StockMovement.objects.create(
+                product_id=variant.product_id,
+                variant=variant,
+                changed_by=user,
+                old_stock=old_total,
+                new_stock=new_total,
+                delta=item.quantity,
+                reason="return_approved",
+                note=(
+                    f"Order {order.order_number} return approved - "
+                    f"restocked {item.quantity} units"
+                ),
+            )
+
+        _sync_variant_products(locked_variants)
 
 
 # NEW (B27): when an admin cancels an order, suggest in-stock alternatives
@@ -505,9 +693,18 @@ def suggest_alternatives_for_order(order):
     suggestions = []
     seen_ids = set()
 
-    for item in order.items.select_related("product", "product__category").all():
+    for item in order.items.select_related("product", "product__category", "variant").all():
         product = item.product
-        if not product or product.available_stock > 0:
+        if not product:
+            continue
+
+        # UPDATED (Oct 2026 — product variants): for a variant item,
+        # "out of stock" means THAT variant is out (the product as a
+        # whole may still have other variants in stock).
+        if item.variant_id and item.variant is not None:
+            if item.variant.available_stock > 0:
+                continue
+        elif product.available_stock > 0:
             continue
 
         alternatives_qs = (
@@ -630,6 +827,35 @@ class CheckoutView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+            # NEW (Oct 2026 — product variants): a product that has
+            # variants can only be bought with one picked (compulsory);
+            # a product without variants must not be sent one.
+            buy_now_variant = None
+            buy_now_variant_id = data.get("buy_now_variant_id")
+
+            if buy_now_product.has_variants:
+                if buy_now_variant_id is None:
+                    return Response(
+                        {"error": "Please choose a variant (color / size) for this product."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                try:
+                    buy_now_variant = buy_now_product.variants.get(
+                        id=buy_now_variant_id,
+                        is_active=True,
+                        is_delete=False,
+                    )
+                except ProductVariant.DoesNotExist:
+                    return Response(
+                        {"error": "This variant was not found or is no longer available."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            elif buy_now_variant_id is not None:
+                return Response(
+                    {"error": "This product has no variants."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
             checkout_store_id = buy_now_product.store_id
             checkout_coupon = None
 
@@ -642,7 +868,11 @@ class CheckoutView(APIView):
             # customer's real cart, coupon included.
             if coupon_code:
                 buy_now_quantity = data.get("buy_now_quantity") or 1
-                buy_now_subtotal = buy_now_product.price * buy_now_quantity
+                # UPDATED (Oct 2026 — product variants): the picked
+                # variant's own price when there is one.
+                buy_now_subtotal = (
+                    buy_now_variant.price if buy_now_variant else buy_now_product.price
+                ) * buy_now_quantity
 
                 checkout_coupon, coupon_error = self._resolve_coupon(
                     coupon_code, buy_now_subtotal
@@ -666,9 +896,11 @@ class CheckoutView(APIView):
             # this one checkout), so it's still applied if the
             # customer's payment fails and they retry.
             if coupon_code:
+                # UPDATED (Oct 2026 — product variants): item.total_price
+                # uses the variant's price when one was picked.
                 coupon_check_subtotal = sum(
-                    item.product.price * item.quantity
-                    for item in cart.items.all()
+                    item.total_price
+                    for item in cart.items.select_related("product", "variant")
                 )
 
                 coupon_discount, coupon_error = self._resolve_coupon(
@@ -894,11 +1126,14 @@ class CheckoutView(APIView):
                     _BuyNowItem(
                         product=buy_now_product,
                         quantity=data.get("buy_now_quantity") or 1,
+                        variant=buy_now_variant,
                     )
                 ]
             else:
+                # UPDATED (Oct 2026 — product variants): variant loaded
+                # with the item so its price / label are available.
                 cart_items = list(
-                    cart.items.select_related("product").all()
+                    cart.items.select_related("product", "variant").all()
                 )
 
             product_ids = [
@@ -906,6 +1141,25 @@ class CheckoutView(APIView):
                 for item in cart_items
                 if item.product_id
             ]
+            variant_ids = [
+                item.variant_id
+                for item in cart_items
+                if item.variant_id
+            ]
+
+            # NEW (Oct 2026 — product variants): variants are locked
+            # BEFORE products (same order as the stock helpers above) so
+            # a concurrent payment confirmation / cancellation can't
+            # deadlock with this checkout. Inactive / deleted variants
+            # are left out, so they count as unavailable below.
+            locked_variants = {
+                v.id: v
+                for v in ProductVariant.objects.select_for_update().filter(
+                    id__in=variant_ids,
+                    is_delete=False,
+                    is_active=True,
+                ).order_by("id")
+            }
 
             # FIX (Bug report, Sep 2026): this used to lock/read
             # Product rows with no is_delete/is_active filter at all, so
@@ -921,14 +1175,61 @@ class CheckoutView(APIView):
                     id__in=product_ids,
                     is_delete=False,
                     is_active=True,
-                )
+                ).order_by("id")
             }
+
+            # NEW (Oct 2026 — product variants): a line with NO variant
+            # picked is only valid for a product that has no variants. A
+            # stale line (product got variants after it was added) can't
+            # be ordered — the customer has to pick one.
+            plain_product_ids = [
+                item.product_id
+                for item in cart_items
+                if item.product_id and not item.variant_id
+            ]
+            needs_variant_product_ids = set(
+                ProductVariant.objects.filter(
+                    product_id__in=plain_product_ids,
+                    is_delete=False,
+                ).values_list("product_id", flat=True)
+            ) if plain_product_ids else set()
 
             out_of_stock = []
             unavailable_product_ids = []
+            unavailable_variant_ids = []
 
             for item in cart_items:
                 product = locked_products.get(item.product_id)
+
+                if item.variant_id:
+                    # Variant line: stock of the picked variant.
+                    variant = locked_variants.get(item.variant_id)
+                    available = (
+                        variant.total_stock - variant.reserved_stock
+                        if (product and variant)
+                        else 0
+                    )
+
+                    if not product or not variant or available < item.quantity:
+                        out_of_stock.append(
+                            f"{item.product.name} ({item.variant.label})"
+                            if item.product and item.variant
+                            else "Unknown product"
+                        )
+
+                    if not product:
+                        unavailable_product_ids.append(item.product_id)
+                    if not variant:
+                        unavailable_variant_ids.append(item.variant_id)
+                    continue
+
+                if item.product_id in needs_variant_product_ids:
+                    out_of_stock.append(
+                        f"{item.product.name} (please choose a variant)"
+                        if item.product
+                        else "Unknown product"
+                    )
+                    continue
 
                 # Available stock = total stock minus already reserved stock.
                 available = (
@@ -960,6 +1261,20 @@ class CheckoutView(APIView):
                         product_id__in=unavailable_product_ids
                     ).delete()
 
+                # NEW (Oct 2026 — product variants): same safety net for
+                # deleted / deactivated variants and for stale lines that
+                # have no variant picked on a product that now has them.
+                if not is_buy_now and unavailable_variant_ids:
+                    cart.items.filter(
+                        variant_id__in=unavailable_variant_ids
+                    ).delete()
+
+                if not is_buy_now and needs_variant_product_ids:
+                    cart.items.filter(
+                        product_id__in=needs_variant_product_ids,
+                        variant__isnull=True,
+                    ).delete()
+
                 return Response(
                     {
                         "error": (
@@ -975,8 +1290,10 @@ class CheckoutView(APIView):
             # CALCULATE ORDER TOTAL
             # ============================================================
 
+            # UPDATED (Oct 2026 — product variants): unit_price is the
+            # picked variant's price, or the product's when it has none.
             subtotal = sum(
-                item.product.price * item.quantity
+                item.unit_price * item.quantity
                 for item in cart_items
             )
 
@@ -1057,13 +1374,27 @@ class CheckoutView(APIView):
             # ============================================================
 
             for item in cart_items:
+                # UPDATED (Oct 2026 — product variants): price is the
+                # variant's price (snapshot) and the variant itself is
+                # saved on the item — stock is reserved / deducted /
+                # released against it. The variant label is also added to
+                # product_name so every place that prints the item name
+                # (order lists, emails, notifications) shows it, e.g.
+                # "Zyron Shoes (Black / Large)".
+                variant = item.variant if item.variant_id else None
+                item_name = item.product.name
+                if variant is not None:
+                    item_name = f"{item.product.name} ({variant.label})"[:255]
+
                 OrderItem.objects.create(
                     order=order,
                     product=item.product,
-                    product_name=item.product.name,
-                    price=item.product.price,
+                    variant=variant,
+                    variant_label=variant.label if variant is not None else "",
+                    product_name=item_name,
+                    price=item.unit_price,
                     quantity=item.quantity,
-                    total_price=item.product.price * item.quantity,
+                    total_price=item.unit_price * item.quantity,
                 )
 
             # ============================================================

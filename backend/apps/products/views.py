@@ -7,13 +7,19 @@ from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.db.models import Q, F, Case, When, Value, IntegerField
 
-from .services import adjust_stock as adjust_stock_service
-from .models import Product, ProductImage, ProductHistory
+from .services import (
+    adjust_stock as adjust_stock_service,
+    adjust_variant_stock as adjust_variant_stock_service,
+    sync_product_stock_from_variants,
+)
+from .models import Product, ProductImage, ProductHistory, ProductVariant, StockMovement
 from .serializers import (
     ProductListSerializer,
     ProductDetailSerializer,
     ProductCreateUpdateSerializer,
     ProductImageSerializer,
+    ProductVariantSerializer,
+    ProductVariantWriteSerializer,
     LowStockProductSerializer,
     StockAdjustSerializer,
 )
@@ -38,7 +44,13 @@ class ProductViewSet(viewsets.ModelViewSet):
     DELETE /api/v1/products/{id}/images/{image_id}/             -> remove image (admin only)
     PUT    /api/v1/products/{id}/images/{image_id}/set-primary/ -> set primary (admin only)
 
-    POST   /api/v1/products/{id}/stock/adjust/                  -> atomic stock adjustment (admin only)
+    POST   /api/v1/products/{id}/stock/adjust/                  -> atomic stock adjustment (admin only; not for products with variants)
+
+    GET    /api/v1/products/{id}/variants/                      -> list variants incl. inactive (admin only; customers get variants in product detail)
+    POST   /api/v1/products/{id}/variants/                      -> create a variant (admin only)
+    PUT/PATCH /api/v1/products/{id}/variants/{variant_id}/      -> update a variant (admin only)
+    DELETE /api/v1/products/{id}/variants/{variant_id}/         -> soft delete a variant (admin only)
+    POST   /api/v1/products/{id}/variants/{variant_id}/stock/adjust/ -> atomic variant stock adjustment (admin only)
 
     GET    /api/v1/products/check-name/                         -> live name-availability check (admin only)
     GET    /api/v1/products/check-sku/                           -> live SKU-availability check (admin only)
@@ -729,6 +741,20 @@ class ProductViewSet(viewsets.ModelViewSet):
 
         product = self.get_object()
 
+        # NEW (Oct 2026 — product variants): a product with variants gets
+        # its stock from the variants, so it can't be adjusted directly.
+        if product.has_variants:
+            return Response(
+                {
+                    "error": (
+                        "This product has variants, so its stock is the sum "
+                        "of its variants' stock. Adjust a variant's stock "
+                        "instead: POST /products/{id}/variants/{variant_id}/stock/adjust/"
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         result = adjust_stock_service(
             product=product,
             delta=serializer.validated_data["delta"],
@@ -736,6 +762,308 @@ class ProductViewSet(viewsets.ModelViewSet):
             changed_by=request.user,
             note=serializer.validated_data.get("note", ""),
         )
+
+        return Response(result)
+
+    # ============================================================
+    # NEW (Oct 2026 — product variants): admin endpoints. Customers
+    # don't need their own variants endpoint — active variants come
+    # back inside GET /products/{id}/ (see ProductDetailSerializer).
+    # ============================================================
+    def _product_stock_summary(self, product):
+        product.refresh_from_db()
+        return {
+            "id": product.id,
+            "total_stock": product.total_stock,
+            "reserved_stock": product.reserved_stock,
+            "available_stock": product.total_stock - product.reserved_stock,
+        }
+
+    def _log_variant_action(self, request, product, action_name, variant_id, old_data=None, new_data=None):
+        # An audit-log hiccup must never undo or break the variant change
+        # itself, so it's logged and swallowed.
+        try:
+            log_admin_action(
+                store=product.store,
+                user=request.user,
+                action=action_name,
+                entity="product_variant",
+                entity_id=variant_id,
+                old_data=old_data,
+                new_data=new_data,
+                request=request,
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "audit log failed for %s (variant %s)", action_name, variant_id
+            )
+
+    def _get_variant(self, product, variant_id):
+        try:
+            return product.variants.get(id=variant_id, is_delete=False)
+        except (ProductVariant.DoesNotExist, ValueError):
+            return None
+
+    @action(
+        detail=True,
+        methods=['get', 'post'],
+        url_path='variants',
+        permission_classes=[permissions.IsAuthenticated, IsAdmin],
+    )
+    def variants(self, request, pk=None):
+        """
+        GET  /api/v1/products/{id}/variants/  -> every non-deleted variant (admin)
+        POST /api/v1/products/{id}/variants/  -> create a variant (admin)
+
+        POST body: color, size (at least one), color_hex (optional),
+        price, original_price (optional), total_stock (starting stock),
+        is_active (optional).
+        """
+        from django.db import transaction
+
+        product = self.get_object()
+
+        if request.method == 'GET':
+            qs = product.variants.filter(is_delete=False).order_by('id')
+            return Response(
+                {
+                    "product": self._product_stock_summary(product),
+                    "variants": ProductVariantSerializer(
+                        qs, many=True, context={'request': request}
+                    ).data,
+                }
+            )
+
+        with transaction.atomic():
+            # Lock the product row so two admins can't race the
+            # "first variant" switch below.
+            product = Product.objects.select_for_update().get(pk=product.pk)
+            is_first_variant = not product.has_variants
+
+            # The first variant turns the product from "stock typed in by
+            # hand" into "stock = sum of variants". Units reserved by
+            # pending orders were reserved against the product itself, so
+            # that switch is only safe when nothing is reserved.
+            if is_first_variant and product.reserved_stock > 0:
+                return Response(
+                    {
+                        "error": (
+                            f"{product.reserved_stock} unit(s) of this product "
+                            "are reserved for pending orders. Add variants "
+                            "after those orders are paid or cancelled."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            serializer = ProductVariantWriteSerializer(
+                data=request.data,
+                context={'request': request, 'product': product},
+            )
+            serializer.is_valid(raise_exception=True)
+            variant = serializer.save(product=product)
+
+            # Once a product has variants, a variant must be chosen to buy
+            # it — so cart lines added BEFORE it had variants (no variant
+            # picked) can't be valid anymore. Removed from carts here.
+            if is_first_variant:
+                from apps.cart.models import CartItem
+
+                CartItem.objects.filter(
+                    product=product, variant__isnull=True
+                ).delete()
+
+            if variant.total_stock > 0:
+                StockMovement.objects.create(
+                    product=product,
+                    variant=variant,
+                    changed_by=request.user,
+                    old_stock=0,
+                    new_stock=variant.total_stock,
+                    delta=variant.total_stock,
+                    reason='restock',
+                    note='Initial stock of new variant',
+                )
+
+            sync_product_stock_from_variants(
+                product,
+                changed_by=request.user,
+                log=is_first_variant,
+                reason='correction',
+                note='Stock is now managed by variants',
+            )
+
+        self._log_variant_action(
+            request, product, "create_variant", variant.id,
+            new_data={
+                "product": product.name,
+                "variant": variant.label,
+                "price": str(variant.price),
+                "total_stock": variant.total_stock,
+            },
+        )
+
+        return Response(
+            {
+                "variant": ProductVariantSerializer(
+                    variant, context={'request': request}
+                ).data,
+                "product": self._product_stock_summary(product),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(
+        detail=True,
+        methods=['put', 'patch', 'delete'],
+        url_path=r'variants/(?P<variant_id>[^/.]+)',
+        permission_classes=[permissions.IsAuthenticated, IsAdmin],
+    )
+    def variant_detail(self, request, pk=None, variant_id=None):
+        """
+        PUT/PATCH /api/v1/products/{id}/variants/{variant_id}/ -> update
+        DELETE    /api/v1/products/{id}/variants/{variant_id}/ -> soft delete
+
+        Stock can't be changed by PUT/PATCH — use the variant stock
+        adjust endpoint.
+        """
+        from django.db import transaction
+
+        product = self.get_object()
+        variant = self._get_variant(product, variant_id)
+        if variant is None:
+            return Response(
+                {"error": "Variant not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if request.method == 'DELETE':
+            with transaction.atomic():
+                variant = ProductVariant.objects.select_for_update().get(pk=variant.pk)
+
+                if variant.reserved_stock > 0:
+                    return Response(
+                        {
+                            "error": (
+                                f"{variant.reserved_stock} unit(s) of this "
+                                "variant are reserved for pending orders. "
+                                "Delete it after those orders are paid or cancelled."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                old_data = {
+                    "variant": variant.label,
+                    "price": str(variant.price),
+                    "total_stock": variant.total_stock,
+                }
+
+                variant.is_active = False
+                variant.is_delete = True
+                variant.save(update_fields=["is_active", "is_delete", "updated_at"])
+
+                # A deleted variant can't be bought anymore, so it
+                # disappears from every customer's cart right away — same
+                # thing perform_destroy does for a deleted product (the
+                # soft delete never fires CartItem's CASCADE).
+                from apps.cart.models import CartItem
+
+                CartItem.objects.filter(variant=variant).delete()
+
+                sync_product_stock_from_variants(
+                    product,
+                    changed_by=request.user,
+                    log=True,
+                    reason='correction',
+                    note=f'Variant deleted: {variant.label}',
+                )
+
+            self._log_variant_action(
+                request, product, "delete_variant", variant.id, old_data=old_data,
+            )
+
+            return Response(
+                {"product": self._product_stock_summary(product)},
+                status=status.HTTP_200_OK,
+            )
+
+        partial = request.method == 'PATCH'
+        old_data = {
+            "variant": variant.label,
+            "price": str(variant.price),
+            "is_active": variant.is_active,
+        }
+
+        with transaction.atomic():
+            serializer = ProductVariantWriteSerializer(
+                variant,
+                data=request.data,
+                partial=partial,
+                context={'request': request, 'product': product},
+            )
+            serializer.is_valid(raise_exception=True)
+            variant = serializer.save()
+
+            # is_active changes which variants count toward the
+            # product's stock total.
+            sync_product_stock_from_variants(product)
+
+        self._log_variant_action(
+            request, product, "update_variant", variant.id,
+            old_data=old_data,
+            new_data={
+                "variant": variant.label,
+                "price": str(variant.price),
+                "is_active": variant.is_active,
+            },
+        )
+
+        return Response(
+            {
+                "variant": ProductVariantSerializer(
+                    variant, context={'request': request}
+                ).data,
+                "product": self._product_stock_summary(product),
+            }
+        )
+
+    @action(
+        detail=True,
+        methods=['post'],
+        url_path=r'variants/(?P<variant_id>[^/.]+)/stock/adjust',
+        permission_classes=[permissions.IsAuthenticated, IsAdmin],
+    )
+    def adjust_variant_stock(self, request, pk=None, variant_id=None):
+        """
+        POST /api/v1/products/{id}/variants/{variant_id}/stock/adjust/
+        Same body as the product stock adjust: delta, reason, note.
+        """
+        product = self.get_object()
+        variant = self._get_variant(product, variant_id)
+        if variant is None:
+            return Response(
+                {"error": "Variant not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        serializer = StockAdjustSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            result = adjust_variant_stock_service(
+                variant=variant,
+                delta=serializer.validated_data["delta"],
+                reason=serializer.validated_data["reason"],
+                changed_by=request.user,
+                note=serializer.validated_data.get("note", ""),
+            )
+        except ValueError as exc:
+            return Response(
+                {"error": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         return Response(result)
 

@@ -353,6 +353,22 @@ class OrderItem(models.Model):
         null=True,
     )
 
+    # NEW (Oct 2026 — product variants): the variant (color / size-kit)
+    # that was bought, null for a product without variants. The variant
+    # is what stock is reserved / deducted / released against — see the
+    # stock helpers in apps/orders/views.py. `variant_label` is a
+    # snapshot (e.g. "Black / Large") so the order still reads correctly
+    # if the variant is renamed or removed later; `price` below is the
+    # variant's price at checkout time.
+    variant = models.ForeignKey(
+        "products.ProductVariant",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="order_items",
+    )
+    variant_label = models.CharField(max_length=120, blank=True, default="")
+
     product_name = models.CharField(max_length=255)
     price = models.DecimalField(max_digits=10, decimal_places=2)
     quantity = models.PositiveIntegerField()

@@ -128,19 +128,79 @@ class CartItem(models.Model):
         on_delete=models.CASCADE,
     )
 
+    # NEW (Oct 2026 — product variants): which variant (color / size-kit)
+    # of the product the customer picked. Compulsory for a product that
+    # has variants (enforced in AddToCartSerializer), null for a product
+    # without variants — which behaves exactly as before.
+    variant = models.ForeignKey(
+        "products.ProductVariant",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="cart_items",
+    )
+
     quantity = models.PositiveIntegerField(default=1)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = "cart_items"
-        unique_together = ["cart", "product"]
+        # UPDATED (Oct 2026 — product variants): was unique_together
+        # (cart, product). The same product can now sit in a cart several
+        # times, once per variant (Black/Large AND Brown/Small). A plain
+        # unique_together can't cover the no-variant case (NULLs count as
+        # distinct), so it is split in two conditional constraints.
+        constraints = [
+            models.UniqueConstraint(
+                fields=["cart", "product"],
+                condition=models.Q(variant__isnull=True),
+                name="unique_cart_product_no_variant",
+            ),
+            models.UniqueConstraint(
+                fields=["cart", "product", "variant"],
+                condition=models.Q(variant__isnull=False),
+                name="unique_cart_product_variant",
+            ),
+        ]
 
     def __str__(self):
+        if self.variant_id:
+            return f"{self.quantity} x {self.product.name} ({self.variant.label})"
         return f"{self.quantity} x {self.product.name}"
+
+    # NEW (Oct 2026 — product variants): the price ONE unit of this line
+    # costs — the variant's own price when a variant was picked,
+    # otherwise the product's price. Everything that adds up a cart
+    # (subtotal, coupon minimum, checkout) must use this, never
+    # product.price directly.
+    @property
+    def unit_price(self):
+        if self.variant_id:
+            return self.variant.price
+        return self.product.price
 
     @property
     def total_price(self):
-        return self.product.price * self.quantity
+        return self.unit_price * self.quantity
+
+    # NEW: stock of what was actually picked — the variant's available
+    # stock, or the product's for a product without variants.
+    @property
+    def available_stock(self):
+        if self.variant_id:
+            return self.variant.available_stock
+        return self.product.available_stock
+
+    # NEW: False once the product / variant was deactivated or deleted
+    # after the customer added it, so the cart page can show "no longer
+    # available" instead of letting them reach checkout with it.
+    @property
+    def is_available(self):
+        if not self.product.is_active or self.product.is_delete:
+            return False
+        if self.variant_id:
+            return self.variant.is_active and not self.variant.is_delete
+        return True
 
 
 class Wishlist(models.Model):

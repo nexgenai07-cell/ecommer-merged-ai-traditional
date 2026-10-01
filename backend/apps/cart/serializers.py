@@ -2,7 +2,7 @@
 
 from rest_framework import serializers
 from .models import Cart, CartItem
-from apps.products.models import Product
+from apps.products.models import Product, ProductVariant
 
 
 class CartProductSerializer(serializers.ModelSerializer):
@@ -38,20 +38,61 @@ class CartProductSerializer(serializers.ModelSerializer):
         return obj.total_stock - obj.reserved_stock
 
 
+class CartVariantSerializer(serializers.ModelSerializer):
+    """
+    NEW (Oct 2026 — product variants): small nested summary of the variant
+    (color / size-kit) the customer picked, inside a cart item.
+    """
+    label = serializers.CharField(read_only=True)
+    available_stock = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProductVariant
+        fields = ['id', 'color', 'color_hex', 'size', 'label', 'price', 'available_stock']
+
+    def get_available_stock(self, obj):
+        return obj.total_stock - obj.reserved_stock
+
+
 class CartItemSerializer(serializers.ModelSerializer):
     # FIX: 'product' is now the nested object described above, instead of
     # a bare ID.
     product = CartProductSerializer(read_only=True)
+    # NEW (Oct 2026 — product variants): null for a product without
+    # variants. For a variant item, use unit_price / available_stock below
+    # rather than product.price / product.available_stock (those belong
+    # to the product as a whole).
+    variant = CartVariantSerializer(read_only=True)
+    unit_price = serializers.SerializerMethodField()
+    available_stock = serializers.SerializerMethodField()
+    is_available = serializers.SerializerMethodField()
     # FIX: renamed from 'subtotal' to 'total_price' to match the documented
     # field name exactly (API 32 — Get Cart).
     total_price = serializers.SerializerMethodField()
 
     class Meta:
         model = CartItem
-        fields = ['id', 'product', 'quantity', 'total_price', 'created_at']
+        fields = [
+            'id', 'product', 'variant', 'quantity',
+            'unit_price', 'total_price',
+            'available_stock', 'is_available',
+            'created_at',
+        ]
+
+    # UPDATED (Oct 2026 — product variants): price of the picked variant
+    # when there is one, otherwise the product's price (see
+    # CartItem.unit_price / total_price in models.py).
+    def get_unit_price(self, obj):
+        return obj.unit_price
 
     def get_total_price(self, obj):
-        return obj.product.price * obj.quantity
+        return obj.total_price
+
+    def get_available_stock(self, obj):
+        return obj.available_stock
+
+    def get_is_available(self, obj):
+        return obj.is_available
 
 
 class CartCouponSerializer(serializers.Serializer):
@@ -77,7 +118,9 @@ class CartSerializer(serializers.ModelSerializer):
         fields = ['id', 'items', 'coupon', 'subtotal', 'discount_amount', 'total', 'created_at', 'updated_at']
 
     def get_subtotal(self, obj):
-        return sum(item.product.price * item.quantity for item in obj.items.all())
+        # UPDATED (Oct 2026 — product variants): item.total_price uses the
+        # variant's price when one was picked.
+        return sum(item.total_price for item in obj.items.all())
 
     def get_discount_amount(self, obj):
         subtotal = self.get_subtotal(obj)
@@ -100,25 +143,56 @@ class CartSerializer(serializers.ModelSerializer):
 
 class AddToCartSerializer(serializers.Serializer):
     product_id = serializers.IntegerField()
+    # NEW (Oct 2026 — product variants): compulsory when the product has
+    # variants (color / size-kit), must be left out for a product that
+    # has none.
+    variant_id = serializers.IntegerField(required=False, allow_null=True)
     quantity = serializers.IntegerField(min_value=1, default=1)
 
     def validate(self, data):
         try:
-            product = Product.objects.get(id=data['product_id'], is_active=True)
+            product = Product.objects.get(
+                id=data['product_id'], is_active=True, is_delete=False
+            )
         except Product.DoesNotExist:
             raise serializers.ValidationError({'product_id': 'Product not found.'})
 
-        # FIX (Cross-check, Sep 2026 — PDF Part 2 Item 5): was checking
-        # product.stock, the deprecated field nothing updates anymore —
-        # this validation was effectively broken (comparing against a
-        # frozen/stale number) for every real product. available_stock
-        # (total_stock - reserved_stock) is what checkout itself checks.
-        if product.available_stock < data['quantity']:
+        variant_id = data.get('variant_id')
+        variant = None
+
+        if product.has_variants:
+            if variant_id is None:
+                raise serializers.ValidationError({
+                    'variant_id': 'Please choose a variant (color / size) for this product.'
+                })
+            try:
+                variant = product.variants.get(
+                    id=variant_id, is_active=True, is_delete=False
+                )
+            except ProductVariant.DoesNotExist:
+                raise serializers.ValidationError({
+                    'variant_id': 'This variant was not found or is no longer available.'
+                })
+            available_stock = variant.available_stock
+        else:
+            if variant_id is not None:
+                raise serializers.ValidationError({
+                    'variant_id': 'This product has no variants.'
+                })
+            # FIX (Cross-check, Sep 2026 — PDF Part 2 Item 5): was checking
+            # product.stock, the deprecated field nothing updates anymore —
+            # this validation was effectively broken (comparing against a
+            # frozen/stale number) for every real product. available_stock
+            # (total_stock - reserved_stock) is what checkout itself checks.
+            available_stock = product.available_stock
+
+        if available_stock < data['quantity']:
             raise serializers.ValidationError({
-                'quantity': f'Only {product.available_stock} units available in stock.'
+                'quantity': f'Only {available_stock} units available in stock.'
             })
 
         data['product'] = product
+        data['variant'] = variant
         return data
 
 
@@ -127,11 +201,28 @@ class UpdateCartItemSerializer(serializers.Serializer):
 
     def validate_quantity(self, value):
         cart_item = self.context.get('cart_item')
+
+        # NEW (Oct 2026 — product variants): the picked variant was
+        # deactivated / deleted after it was added — the customer can
+        # still remove it (quantity 0) but not raise or keep a quantity.
+        if (
+            value > 0
+            and cart_item
+            and cart_item.variant_id
+            and not (cart_item.variant.is_active and not cart_item.variant.is_delete)
+        ):
+            raise serializers.ValidationError(
+                'This variant is no longer available. Please remove it from your cart.'
+            )
+
         # FIX (Cross-check, Sep 2026 — PDF Part 2 Item 5): same stock ->
         # available_stock fix as AddToCartSerializer above.
-        if value > 0 and cart_item and value > cart_item.product.available_stock:
+        # UPDATED (Oct 2026 — product variants): cart_item.available_stock
+        # is the variant's stock for a variant item, the product's
+        # otherwise.
+        if value > 0 and cart_item and value > cart_item.available_stock:
             raise serializers.ValidationError(
-                f'Only {cart_item.product.available_stock} units available in stock.'
+                f'Only {cart_item.available_stock} units available in stock.'
             )
         return value
 

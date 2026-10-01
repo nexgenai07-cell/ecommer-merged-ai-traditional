@@ -4,7 +4,7 @@ import re
 
 from rest_framework import serializers
 from django.db.models import Avg, Sum
-from .models import Product, ProductImage, ProductHistory, StockMovement
+from .models import Product, ProductImage, ProductVariant, ProductHistory, StockMovement
 
 
 # NEW (Production SKU validation spec, Sep 2026)
@@ -209,6 +209,190 @@ class LowStockProductSerializer(ProductListSerializer):
 
 
 # ============================================================
+# NEW (Oct 2026 — product variants)
+# ============================================================
+HEX_COLOR_REGEX = re.compile(r"^#[0-9A-Fa-f]{6}$")
+
+
+def _request_is_admin(context):
+    request = context.get("request")
+    return bool(
+        request
+        and request.user
+        and request.user.is_authenticated
+        and getattr(request.user, "role", None) == "admin"
+    )
+
+
+# Read-only shape of one variant (Black / Large, its own price + stock).
+# total_stock / reserved_stock / is_active are admin-only — a customer
+# only ever gets available_stock + in_stock, same idea as price/profit
+# fields elsewhere in this file.
+class ProductVariantSerializer(serializers.ModelSerializer):
+    label = serializers.CharField(read_only=True)
+    available_stock = serializers.SerializerMethodField()
+    in_stock = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProductVariant
+        fields = [
+            "id",
+            "color",
+            "color_hex",
+            "size",
+            "label",
+            "price",
+            "original_price",
+            "available_stock",
+            "in_stock",
+            "total_stock",
+            "reserved_stock",
+            "is_active",
+        ]
+
+    def get_available_stock(self, obj):
+        return obj.total_stock - obj.reserved_stock
+
+    def get_in_stock(self, obj):
+        return obj.in_stock
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not _request_is_admin(self.context):
+            for key in ("total_stock", "reserved_stock", "is_active"):
+                data.pop(key, None)
+        return data
+
+
+# Admin create / update of one variant. The product it belongs to must
+# be passed in the serializer context as context["product"].
+#
+# total_stock is only accepted as the STARTING stock on create; after
+# that, stock changes go through the atomic variant stock-adjust
+# endpoint (same reason Product has /stock/adjust/ — a plain update
+# is not safe against concurrent checkouts).
+class ProductVariantWriteSerializer(serializers.ModelSerializer):
+    color = serializers.CharField(
+        required=False, allow_blank=True, max_length=50
+    )
+    size = serializers.CharField(
+        required=False, allow_blank=True, max_length=50
+    )
+    color_hex = serializers.CharField(
+        required=False, allow_blank=True, max_length=7
+    )
+    total_stock = serializers.IntegerField(required=False, min_value=0)
+
+    class Meta:
+        model = ProductVariant
+        fields = [
+            "id",
+            "color",
+            "color_hex",
+            "size",
+            "price",
+            "original_price",
+            "total_stock",
+            "is_active",
+        ]
+        read_only_fields = ["id"]
+
+    def validate_color_hex(self, value):
+        value = (value or "").strip()
+        if value and not HEX_COLOR_REGEX.match(value):
+            raise serializers.ValidationError(
+                "Color hex must look like #RRGGBB, e.g. #000000."
+            )
+        return value.upper()
+
+    def validate_price(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("Price must be greater than 0.")
+        return value
+
+    def validate(self, data):
+        product = self.context["product"]
+        instance = self.instance
+
+        def _final(field):
+            if field in data:
+                return (data[field] or "").strip()
+            return (getattr(instance, field, "") or "").strip() if instance else ""
+
+        color = _final("color")
+        size = _final("size")
+        data["color"] = color
+        data["size"] = size
+
+        if not (color or size):
+            raise serializers.ValidationError(
+                "A variant needs at least a color or a size/kit."
+            )
+
+        others = product.variants.filter(is_delete=False)
+        if instance is not None:
+            others = others.exclude(pk=instance.pk)
+
+        if others.exists():
+            uses_color = others.exclude(color="").exists()
+            uses_size = others.exclude(size="").exists()
+
+            if uses_color and not color:
+                raise serializers.ValidationError(
+                    {"color": "Color is required — this product's other variants have colors."}
+                )
+            if uses_size and not size:
+                raise serializers.ValidationError(
+                    {"size": "Size/kit is required — this product's other variants have sizes/kits."}
+                )
+            if color and not uses_color:
+                raise serializers.ValidationError(
+                    {"color": "This product's other variants have no color, so this one can't have a color either."}
+                )
+            if size and not uses_size:
+                raise serializers.ValidationError(
+                    {"size": "This product's other variants have no size/kit, so this one can't have a size/kit either."}
+                )
+
+            if others.filter(color__iexact=color, size__iexact=size).exists():
+                raise serializers.ValidationError(
+                    "A variant with this color and size/kit already exists for this product."
+                )
+
+        price = data.get("price", getattr(instance, "price", None))
+        original_price = data.get(
+            "original_price", getattr(instance, "original_price", None)
+        )
+        if (
+            price is not None
+            and original_price is not None
+            and price > original_price
+        ):
+            raise serializers.ValidationError(
+                {
+                    "price": (
+                        "Actual price cannot be greater than original "
+                        "price because this would create a negative discount."
+                    )
+                }
+            )
+
+        if instance is not None and "total_stock" in data:
+            if data["total_stock"] != instance.total_stock:
+                raise serializers.ValidationError(
+                    {
+                        "total_stock": (
+                            "Stock can't be changed here. Use the variant "
+                            "stock adjust endpoint instead."
+                        )
+                    }
+                )
+            data.pop("total_stock")
+
+        return data
+
+
+# ============================================================
 # UPDATED: ProductDetailSerializer with new stock fields
 # ============================================================
 class ProductDetailSerializer(serializers.ModelSerializer):
@@ -225,6 +409,13 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     average_rating = serializers.SerializerMethodField()
     review_count = serializers.SerializerMethodField()
     total_sold = serializers.SerializerMethodField()
+
+    # NEW (Oct 2026 — product variants): color / size-kit options, each
+    # variant with its own price + stock. has_variants=True means the
+    # customer MUST pick a variant to add this product to the cart.
+    has_variants = serializers.SerializerMethodField()
+    variants = serializers.SerializerMethodField()
+    variant_options = serializers.SerializerMethodField()
 
     # NEW (Sep 2026 — profit tracking): both admin-only, null for a
     # customer request — same shared-serializer situation as
@@ -266,6 +457,10 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             "low_stock_threshold",
             "publish_at",
             "images",
+            # NEW (Oct 2026 — product variants)
+            "has_variants",
+            "variants",
+            "variant_options",
             # NEW
             "average_rating",
             "review_count",
@@ -336,25 +531,86 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             return None
         return obj.profit_margin_percent
 
-    # NEW: average of every active, non-deleted review's rating.
+    # NEW (Oct 2026 — product variants): True when the product has any
+    # non-deleted variant -> the customer must choose one.
+    def get_has_variants(self, obj):
+        return obj.has_variants
+
+    # Customers only see active variants; an admin sees all (including
+    # inactive) so the edit page can re-activate them.
+    def _visible_variants(self, obj):
+        qs = obj.variants.filter(is_delete=False)
+        if not self._is_admin():
+            qs = qs.filter(is_active=True)
+        return qs.order_by("id")
+
+    def get_variants(self, obj):
+        return ProductVariantSerializer(
+            self._visible_variants(obj),
+            many=True,
+            context=self.context,
+        ).data
+
+    # The unique colors and sizes/kits of the visible variants, in the
+    # order they were created — ready for the swatch row ("Color") and
+    # the pill row ("Size / Kit") on the product page.
+    def get_variant_options(self, obj):
+        colors, sizes = [], []
+        seen_colors, seen_sizes = set(), set()
+
+        for variant in self._visible_variants(obj):
+            if variant.color and variant.color.lower() not in seen_colors:
+                seen_colors.add(variant.color.lower())
+                colors.append(
+                    {"name": variant.color, "hex": variant.color_hex}
+                )
+            if variant.size and variant.size.lower() not in seen_sizes:
+                seen_sizes.add(variant.size.lower())
+                sizes.append(variant.size)
+
+        return {"colors": colors, "sizes": sizes}
+
+    # UPDATED (Oct 2026 — rating consistency fix): average of every
+    # APPROVED, non-deleted review's rating. Previously this filtered on
+    # is_active=True (a deprecated field), so pending/rejected reviews
+    # leaked into the number while review_views._get_rating_summary only
+    # counted status="approved" — the two blocks on the detail page could
+    # disagree. Both now use the same rule.
     # Rounded to 1 decimal place (e.g. 4.8), 0.0 when there are no
-    # reviews yet.
+    # approved reviews yet.
     def get_average_rating(self, obj):
         avg = obj.reviews.filter(
-            is_active=True, is_delete=False
+            status="approved", is_delete=False
         ).aggregate(avg=Avg("rating"))["avg"]
         return round(avg, 1) if avg is not None else 0.0
 
-    # NEW: count of active, non-deleted reviews — the "2,450" in
-    # "4.8 (2,450 reviews)".
+    # UPDATED (Oct 2026 — rating consistency fix): count of APPROVED,
+    # non-deleted reviews — the "2,450" in "4.8 (2,450 reviews)". Same
+    # rule as review_views._get_rating_summary.
     def get_review_count(self, obj):
-        return obj.reviews.filter(is_active=True, is_delete=False).count()
+        return obj.reviews.filter(status="approved", is_delete=False).count()
 
-    # NEW: total units sold, summed across every ProductStats row for
-    # this product (ProductStats already tracks this daily for the
-    # analytics dashboard — this just totals it for the product page).
+    # UPDATED (Oct 2026 — real sales count): total units sold, now
+    # counted straight from real orders instead of the ProductStats
+    # table (nothing in apps/products ever wrote to ProductStats, so
+    # the old number was effectively always 0).
+    #
+    # Sums OrderItem.quantity for this product, only over orders whose
+    # status is in Order.REVENUE_STATUSES (confirmed / shipped /
+    # out_for_delivery / delivered) — i.e. payment is confirmed. Same
+    # single source of truth the revenue / customer-spent numbers use,
+    # so pending_payment, on_hold, order_placed and cancelled
+    # (refunded) orders never inflate "4,120 sold".
+    #
+    # Order is imported inside the method (not at the top of the file)
+    # to avoid a circular import between apps.products and apps.orders.
     def get_total_sold(self, obj):
-        total = obj.stats.aggregate(total=Sum("total_sold"))["total"]
+        from apps.orders.models import Order, OrderItem
+
+        total = OrderItem.objects.filter(
+            product=obj,
+            order__status__in=Order.REVENUE_STATUSES,
+        ).aggregate(total=Sum("quantity"))["total"]
         return total or 0
 
 
@@ -711,6 +967,30 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
         incoming_stock = validated_data.pop("stock", None)
         if "total_stock" not in validated_data and incoming_stock is not None:
             validated_data["total_stock"] = incoming_stock
+
+        # NEW (Oct 2026 — product variants): a product with variants has
+        # no stock number of its own (it's the sum of its variants), so
+        # this endpoint can't change it. An edit form that just re-sends
+        # the current total_stock unchanged is fine and is ignored; an
+        # actual change (or stock_to_add) is rejected with a pointer to
+        # the variant stock endpoint.
+        if instance.has_variants:
+            requested_total = validated_data.pop("total_stock", None)
+            validated_data.pop("reserved_stock", None)
+
+            if stock_to_add or (
+                requested_total is not None
+                and requested_total != instance.total_stock
+            ):
+                raise serializers.ValidationError(
+                    {
+                        "total_stock": (
+                            "This product has variants, so its stock is the "
+                            "sum of its variants' stock. Change stock on the "
+                            "variants instead."
+                        )
+                    }
+                )
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)

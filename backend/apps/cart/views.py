@@ -116,20 +116,36 @@ def merge_guest_cart_into_user_cart(request, user):
             store=store,
         )
 
-        for guest_item in guest_cart.items.select_related("product"):
+        for guest_item in guest_cart.items.select_related("product", "variant"):
             product = guest_item.product
+            variant = guest_item.variant
 
+            # NEW (Oct 2026 — product variants): a variant that was
+            # deactivated / deleted since the guest added it can't be
+            # carried over to the account cart.
+            if variant is not None and not (
+                variant.is_active and not variant.is_delete
+            ):
+                continue
+
+            # UPDATED (Oct 2026 — product variants): the stock of what was
+            # actually picked — the variant's, or the product's when the
+            # product has no variants.
             available_stock = max(
-                product.available_stock,
+                guest_item.available_stock,
                 0,
             )
 
             if available_stock <= 0:
                 continue
 
+            # The same product in a DIFFERENT variant is a separate cart
+            # line, so matching is on (product, variant). variant=None
+            # matches only variant-less lines.
             account_item = CartItem.objects.filter(
                 cart=account_cart,
                 product=product,
+                variant=variant,
             ).first()
 
             if account_item:
@@ -150,6 +166,7 @@ def merge_guest_cart_into_user_cart(request, user):
                 CartItem.objects.create(
                     cart=account_cart,
                     product=product,
+                    variant=variant,
                     quantity=account_quantity,
                 )
 
@@ -195,6 +212,10 @@ class AddToCartView(APIView):
         serializer.is_valid(raise_exception=True)
 
         product = serializer.validated_data['product']
+        # NEW (Oct 2026 — product variants): None for a product without
+        # variants. The same product in a different variant is its own
+        # cart line.
+        variant = serializer.validated_data['variant']
         quantity = serializer.validated_data['quantity']
 
         cart, session_key, is_new_session = get_or_create_cart_for_request(request)
@@ -202,12 +223,16 @@ class AddToCartView(APIView):
         cart_item, created = CartItem.objects.get_or_create(
             cart=cart,
             product=product,
+            variant=variant,
             defaults={'quantity': quantity}
         )
 
         if not created:
             new_quantity = cart_item.quantity + quantity
-            cart_item.quantity = min(new_quantity, product.available_stock)
+            # UPDATED (Oct 2026 — product variants): capped at the picked
+            # variant's stock (or the product's when it has no variants).
+            available = variant.available_stock if variant else product.available_stock
+            cart_item.quantity = min(new_quantity, available)
             cart_item.save()
 
         # Calculate total quantity of all items in the cart.
@@ -291,7 +316,9 @@ class UpdateCartItemView(APIView):
         cart_item.quantity = quantity
         cart_item.save()
 
-        item_total = cart_item.product.price * cart_item.quantity
+        # UPDATED (Oct 2026 — product variants): uses the variant's price
+        # when one was picked.
+        item_total = cart_item.total_price
 
         # NEW (Sep 2026 — coupon re-check): lowering a quantity may drop
         # the cart below the coupon's minimum order amount.
@@ -446,8 +473,10 @@ class ApplyCouponView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # UPDATED (Oct 2026 — product variants): item.total_price uses the
+        # variant's price when one was picked.
         subtotal = sum(
-            item.product.price * item.quantity
+            item.total_price
             for item in cart.items.all()
         )
 
