@@ -61,6 +61,17 @@ def _qr_payload(request, store):
     if url and url.startswith("/"):
         url = request.build_absolute_uri(url)
 
+    # Cloudinary can hand back http:// URLs; an https frontend would block
+    # them as mixed content. Same http -> https fix the product/order image
+    # serializers already apply (skipped for local development hosts).
+    if (
+        url
+        and url.startswith("http://")
+        and "localhost" not in url
+        and "127.0.0.1" not in url
+    ):
+        url = "https://" + url[len("http://"):]
+
     return {
         "store_id": store.id,
         "qr_image_url": url,
