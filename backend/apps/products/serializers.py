@@ -385,7 +385,10 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
     # the DB level as a safety net, same reasoning as `sku` above), so
     # admin add/edit forms could silently submit no cost price at all.
     # Explicitly required here, same pattern as `sku`, so create/full
-    # update (PUT) always reject a missing/blank/null purchase_price.
+    # update (PUT) reject a missing/blank/null purchase_price.
+    # UPDATED (Oct 2026): on update, a MISSING key is allowed when the
+    # product already has a saved value (see __init__ below); a blank or
+    # null key is still rejected.
     # A partial update (PATCH) is unaffected — DRF doesn't enforce
     # required=True fields during partial=True, so an unrelated PATCH
     # (e.g. toggling is_active) doesn't force re-sending purchase_price.
@@ -450,6 +453,43 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
             "publish_at",
         ]
         read_only_fields = ["id"]
+
+    # NEW (Oct 2026 — admin edit form losing purchase_price): on UPDATE
+    # (PUT), if the request does not send the `purchase_price` key at all
+    # AND the product already has a purchase_price saved, the saved value
+    # is kept instead of rejecting the request with "Purchase price is
+    # required." (the frontend form can lose this field after an image
+    # upload / stock update / live refresh).
+    #
+    # Rules that did NOT change:
+    # - CREATE: purchase_price is still required.
+    # - A key that IS sent but blank / null is still rejected (400) — see
+    #   to_internal_value() below.
+    # - An old product that has no purchase_price saved yet still has to
+    #   get one on its next full update.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        instance = getattr(self, "instance", None)
+        if (
+            instance is not None
+            and not isinstance(instance, (list, tuple))
+            and getattr(instance, "purchase_price", None) is not None
+        ):
+            self.fields["purchase_price"].required = False
+
+    def to_internal_value(self, data):
+        # With required=False (set in __init__ above), DRF treats a blank
+        # purchase_price in multipart/form-data as "missing" and would
+        # silently keep the old value. A purchase_price key that is sent
+        # but empty/null must still be an error, so it is checked here on
+        # the raw input, before DRF's own field handling.
+        if self.instance is not None and "purchase_price" in data:
+            raw = data.get("purchase_price")
+            if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+                raise serializers.ValidationError(
+                    {"purchase_price": ["Purchase price is required."]}
+                )
+        return super().to_internal_value(data)
 
     # NEW (Production SKU validation spec, Sep 2026): full validation
     # pipeline, applied in this order —

@@ -25,6 +25,7 @@ from rest_framework.response import Response
 from .models import PhoneChangeRequest
 from .serializers import UserProfileSerializer
 from .email_service import send_phone_change_code
+from .phone_validation import validate_pk_phone, same_phone
 
 
 def generate_otp():
@@ -33,23 +34,11 @@ def generate_otp():
 
 def _validate_phone_format(value):
     """
-    Same digit/length rules as RegisterSerializer.validate_phone, so a
-    phone number is held to the same standard whether it's entered at
-    registration or changed later from the Profile page.
-    Returns an error string, or None if the value is valid.
+    UPDATED (Oct 2026): the Profile page now only accepts a Pakistani
+    mobile number - 03XXXXXXXXX or +923XXXXXXXXX (see phone_validation.py).
+    Returns (cleaned_phone, error_string_or_None).
     """
-    digits = value[1:] if value.startswith('+') else value
-
-    if not digits or not digits.isdigit():
-        return "Phone number must contain digits only, optionally starting with '+'."
-
-    if len(digits) < 10:
-        return "Phone number must be at least 10 digits."
-
-    if len(digits) > 15:
-        return "Phone number must not exceed 15 digits."
-
-    return None
+    return validate_pk_phone(value)
 
 
 class RequestPhoneChangeView(APIView):
@@ -80,13 +69,13 @@ class RequestPhoneChangeView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        phone = phone.strip()
-
-        format_error = _validate_phone_format(phone)
+        phone, format_error = _validate_phone_format(phone)
         if format_error:
             return Response({'error': format_error}, status=status.HTTP_400_BAD_REQUEST)
 
-        if phone == user.phone:
+        # Same number in the other form (03001234567 / +923001234567)
+        # also counts as "already your number".
+        if same_phone(phone, user.phone):
             return Response(
                 {'error': 'That is already your current phone number.'},
                 status=status.HTTP_400_BAD_REQUEST,

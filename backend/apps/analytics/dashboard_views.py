@@ -1719,16 +1719,22 @@ class AnalyticsExportView(APIView):
         # NEW: trailing 'Customer' column (name of the customer the action
         # was about). Added at the END so the existing columns keep their
         # positions.
-        from apps.ai.audit_customer import customer_names_for_logs
+        # UPDATED (Oct 2026): another trailing 'Entity Name' column - the
+        # name of the record itself (product / category / discount name,
+        # or the customer's name for customer-linked entities), same value
+        # the Audit Logs page shows next to the Entity ID.
+        from apps.ai.audit_customer import customer_names_for_logs, entity_names_for_logs
         logs = list(qs)
         customer_names = customer_names_for_logs(logs)
+        entity_names = entity_names_for_logs(logs, customer_names=customer_names)
 
-        writer.writerow(['User', 'Action', 'Entity', 'Entity ID', 'IP Address', 'Source', 'Created At', 'Customer'])
+        writer.writerow(['User', 'Action', 'Entity', 'Entity ID', 'IP Address', 'Source', 'Created At', 'Customer', 'Entity Name'])
         for log in logs:
             writer.writerow([
                 log.user.email if log.user else 'system', log.action, log.entity,
                 log.entity_id or '', log.ip_address or '', log.source, log.created_at,
                 csv_safe_text(customer_names.get((log.entity, log.entity_id)) or ''),
+                csv_safe_text(entity_names.get((log.entity, log.entity_id)) or ''),
             ])
 
     def _export_qr_payments(self, writer, start_date, end_date):

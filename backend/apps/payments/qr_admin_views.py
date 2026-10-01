@@ -21,6 +21,7 @@ from core.date_range import get_date_range
 from core.pagination import StandardResultsPagination
 
 from .qr_filters import apply_qr_filters, base_qr_queryset
+from .customer_info import customer_name_phone
 
 
 class AdminQRPaymentListView(APIView):
@@ -55,13 +56,16 @@ class AdminQRPaymentListView(APIView):
         for payment in page:
             order = payment.order
             customer = order.customer
+            # UPDATED (Oct 2026): name / phone come from the customer's
+            # account first (see customer_info.py).
+            customer_name, customer_phone = customer_name_phone(order)
             results.append({
                 "id": payment.id,
                 "order_number": order.order_number,
                 "customer": {
                     "id": customer.id,
-                    "name": customer.name,
-                    "phone": customer.phone,
+                    "name": customer_name,
+                    "phone": customer_phone,
                 },
                 "amount": str(order.total_amount),
                 "status": payment.status,

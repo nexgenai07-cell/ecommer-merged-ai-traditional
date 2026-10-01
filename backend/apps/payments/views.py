@@ -35,6 +35,7 @@ from apps.stores.models import Store
 from apps.notifications.utils import create_notification
 from apps.ai.audit import log_manual_admin_action as log_admin_action
 from core.pagination import StandardResultsPagination
+from .customer_info import customer_name_phone
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
@@ -718,13 +719,16 @@ class AdminQRPaymentPendingView(APIView):
         for payment in page:
             order = payment.order
             customer = order.customer
+            # UPDATED (Oct 2026): name / phone come from the customer's
+            # account first (see customer_info.py).
+            customer_name, customer_phone = customer_name_phone(order)
 
             results.append({
                 "order_number": order.order_number,
                 "customer": {
                     "id": customer.id,
-                    "name": customer.name,
-                    "phone": customer.phone,
+                    "name": customer_name,
+                    "phone": customer_phone,
                 },
                 "amount": str(order.total_amount),
                 "screenshot_url": payment.qr_screenshot_url,

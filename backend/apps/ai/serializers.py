@@ -54,11 +54,22 @@ class AuditLogSerializer(serializers.ModelSerializer):
     # category, ...). See apps/ai/audit_customer.py.
     customer_name = serializers.SerializerMethodField()
 
+    # NEW (Oct 2026): name of the ENTITY the row is about, for EVERY entity
+    # type - the customer's name for order / payment / return / complaint /
+    # notification (same as customer_name above), the product's name for
+    # product / inventory, the category's name for category, the code for
+    # discount. Read live from the record, matched on entity + entity_id,
+    # so a rename shows on old rows too. entity_label is the ready-made
+    # text for the Entity ID column: "7 - Product name", or just "7" when
+    # no name can be found. See apps/ai/audit_customer.py.
+    entity_name = serializers.SerializerMethodField()
+    entity_label = serializers.SerializerMethodField()
+
     class Meta:
         model = AuditLog
         fields = [
             'id', 'user', 'user_name', 'user_email', 'action', 'entity', 'entity_id',
-            'customer_name',
+            'customer_name', 'entity_name', 'entity_label',
             'old_data', 'new_data', 'ip_address', 'source', 'created_at',
         ]
         read_only_fields = fields  # nothing on AuditLog should be editable through the API
@@ -71,3 +82,19 @@ class AuditLogSerializer(serializers.ModelSerializer):
             from .audit_customer import customer_names_for_logs
             names = customer_names_for_logs([obj])
         return names.get((obj.entity, obj.entity_id))
+
+    def _entity_names(self, obj):
+        names = self.context.get('entity_names')
+        if names is None:
+            from .audit_customer import entity_names_for_logs
+            names = entity_names_for_logs([obj])
+        return names
+
+    def get_entity_name(self, obj):
+        return self._entity_names(obj).get((obj.entity, obj.entity_id))
+
+    def get_entity_label(self, obj):
+        if obj.entity_id is None:
+            return ""
+        name = self.get_entity_name(obj)
+        return f"{obj.entity_id} \u2014 {name}" if name else str(obj.entity_id)

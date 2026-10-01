@@ -107,6 +107,11 @@ def apply_qr_filters(qs, params, start_date=None, end_date=None):
             | Q(order__customer__name__icontains=search)
             | Q(order__customer__phone__icontains=search)
             | Q(order__customer__email__icontains=search)
+            # UPDATED (Oct 2026): the page now shows the account's name /
+            # phone (customer_info.py), so search must match those too.
+            | Q(order__customer__user__name__icontains=search)
+            | Q(order__customer__user__phone__icontains=search)
+            | Q(order__contact_phone__icontains=search)
             | Q(qr_transaction_id__icontains=search)
         )
 
