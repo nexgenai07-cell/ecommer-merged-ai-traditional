@@ -49,6 +49,40 @@ def _get_rating_summary(product):
     }
 
 
+def get_review_eligibility(user, product):
+    """
+    NEW (Oct 2026 - can_review): the ONE place that decides whether a user
+    may review a product. Used by BOTH GET (the can_review flag) and POST
+    (the 403), so the flag the frontend shows and the server's real answer
+    can never differ.
+
+    Returns (can_review, is_verified_purchase):
+      - guest                          -> (False, False)
+      - admin                          -> (True, <has a delivered order?>)
+                                          admins are exempt from the
+                                          purchase rule (existing behaviour)
+      - customer with a DELIVERED order
+        containing this product        -> (True, True)
+      - anyone else (never bought it,
+        or not delivered yet)          -> (False, False)
+    """
+    if not user or not user.is_authenticated:
+        return False, False
+
+    # Imported inline (not at module level) to avoid a circular
+    # import between apps.products and apps.orders at startup.
+    from apps.orders.models import OrderItem
+
+    is_verified = OrderItem.objects.filter(
+        product=product,
+        order__customer__user=user,
+        order__status="delivered",
+    ).exists()
+
+    is_admin = getattr(user, "role", None) == "admin"
+    return (is_admin or is_verified), is_verified
+
+
 class ProductReviewListCreateView(APIView):
     """
     GET  /api/v1/products/{product_id}/reviews/  -> paginated review list
@@ -109,6 +143,12 @@ class ProductReviewListCreateView(APIView):
 
         response = paginator.get_paginated_response(serializer.data)
         response.data["summary"] = _get_rating_summary(product)
+
+        # NEW (Oct 2026): can_review - true only when POST would not
+        # return the 403 (same helper as POST). Plain boolean, top level.
+        # The response now depends on who is logged in, so it must never be
+        # served from a shared cache.
+        response.data["can_review"], _ = get_review_eligibility(request.user, product)
         return response
 
     def post(self, request, product_id):
@@ -136,15 +176,9 @@ class ProductReviewListCreateView(APIView):
         serializer = ReviewCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        # Imported inline (not at module level) to avoid a circular
-        # import between apps.products and apps.orders at startup.
-        from apps.orders.models import OrderItem
-
-        is_verified = OrderItem.objects.filter(
-            product=product,
-            order__customer__user=request.user,
-            order__status="delivered",
-        ).exists()
+        # UPDATED (Oct 2026): eligibility now comes from
+        # get_review_eligibility(), shared with GET's can_review flag.
+        can_review, is_verified = get_review_eligibility(request.user, product)
 
         # NEW (Sep 2026 — review eligibility bug): a review used to be
         # accepted from ANY logged-in user regardless of whether they had
@@ -164,7 +198,7 @@ class ProductReviewListCreateView(APIView):
             request.user.is_authenticated and request.user.role == "admin"
         )
 
-        if not is_admin and not is_verified:
+        if not can_review:
             return Response(
                 {
                     "error": (
