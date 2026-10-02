@@ -3,9 +3,10 @@
 from rest_framework import serializers
 from .models import Cart, CartItem
 from apps.products.models import Product, ProductVariant
+from apps.products.card_stats import CardStatsMixin, card_stats_for_products
 
 
-class CartProductSerializer(serializers.ModelSerializer):
+class CartProductSerializer(CardStatsMixin, serializers.ModelSerializer):
     """
     NEW — small nested product summary used inside cart items.
     FIX: doc documents cart items as
@@ -25,10 +26,19 @@ class CartProductSerializer(serializers.ModelSerializer):
     """
     primary_image = serializers.SerializerMethodField()
     available_stock = serializers.SerializerMethodField()
+    # NEW (Oct 2026): same card figures as the product list (see
+    # products/card_stats.py), filled in bulk by CartSerializer.
+    average_rating = serializers.SerializerMethodField()
+    review_count = serializers.SerializerMethodField()
+    total_sold = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
-        fields = ['id', 'name', 'price', 'primary_image', 'total_stock', 'reserved_stock', 'available_stock']
+        fields = [
+            'id', 'name', 'price', 'primary_image', 'total_stock',
+            'reserved_stock', 'available_stock',
+            'average_rating', 'review_count', 'total_sold',
+        ]
 
     def get_primary_image(self, obj):
         img = obj.primary_image
@@ -146,6 +156,17 @@ class CartSerializer(serializers.ModelSerializer):
     class Meta:
         model = Cart
         fields = ['id', 'items', 'coupon', 'subtotal', 'discount_amount', 'total', 'created_at', 'updated_at']
+
+    # NEW (Oct 2026): rating / review / sold numbers for every product in
+    # the cart are loaded ONCE here and shared with the nested product
+    # serializers through the serializer context.
+    def to_representation(self, instance):
+        if not hasattr(self, "_context"):
+            self._context = {}
+        self._context["card_stats"] = card_stats_for_products(
+            item.product_id for item in instance.items.all()
+        )
+        return super().to_representation(instance)
 
     def get_subtotal(self, obj):
         # UPDATED (Oct 2026 — product variants): item.total_price uses the

@@ -13,6 +13,7 @@ from .services import (
     sync_product_stock_from_variants,
 )
 from .models import Product, ProductImage, ProductHistory, ProductVariant, StockMovement
+from .card_stats import annotate_card_stats
 from .serializers import (
     ProductListSerializer,
     ProductDetailSerializer,
@@ -82,6 +83,14 @@ class ProductViewSet(viewsets.ModelViewSet):
                 and self.request.user.role == 'admin'
             ):
                 qs = qs.filter(is_active=True)
+
+        # NEW (Oct 2026 - storefront product cards): average_rating,
+        # review_count and total_sold are computed inside this queryset
+        # (correlated subqueries - no joins), so filters, ordering,
+        # distinct() and pagination behave exactly as before and a page of
+        # products costs no extra query per product.
+        if self.action in ['list', 'search', 'suggestions']:
+            qs = annotate_card_stats(qs)
 
         return qs
 
@@ -609,6 +618,8 @@ class ProductViewSet(viewsets.ModelViewSet):
             is_active=True,
             is_delete=False,
         ).select_related('category').prefetch_related('images')
+        # NEW (Oct 2026): card fields without a query per product.
+        qs = annotate_card_stats(qs)
 
         q = request.query_params.get('q')
         if q:

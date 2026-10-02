@@ -5,6 +5,7 @@ import re
 from rest_framework import serializers
 from django.db.models import Avg, Sum
 from .models import Product, ProductImage, ProductVariant, ProductHistory, StockMovement
+from .card_stats import CardStatsMixin
 
 
 # NEW (Production SKU validation spec, Sep 2026)
@@ -57,9 +58,18 @@ class ProductImageSerializer(serializers.ModelSerializer):
 # UPDATED: ProductListSerializer with new stock fields
 # as per PDF Part 2 Item 5
 # ============================================================
-class ProductListSerializer(serializers.ModelSerializer):
+class ProductListSerializer(CardStatsMixin, serializers.ModelSerializer):
     primary_image = serializers.SerializerMethodField()
     category = serializers.SerializerMethodField()
+
+    # NEW (Oct 2026 - storefront product cards): same three public figures
+    # as Get Single Product, same rules (approved + non-deleted reviews,
+    # real paid orders) - see card_stats.py. Plain JSON numbers, returned to
+    # guests and customers too. The list views annotate them in the
+    # queryset, so a page of products runs no per-product queries.
+    average_rating = serializers.SerializerMethodField()
+    review_count = serializers.SerializerMethodField()
+    total_sold = serializers.SerializerMethodField()
 
     # ============================================================
     # NEW: available_stock computed field
@@ -105,6 +115,9 @@ class ProductListSerializer(serializers.ModelSerializer):
             "category",
             "primary_image",
             "is_active",
+            "average_rating",
+            "review_count",
+            "total_sold",
         ]
 
     # Returns category details instead of only the category ID.

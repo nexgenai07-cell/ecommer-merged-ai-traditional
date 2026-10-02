@@ -3,9 +3,10 @@
 from rest_framework import serializers
 from .models import Wishlist, WishlistItem
 from apps.products.models import Product
+from apps.products.card_stats import CardStatsMixin, card_stats_for_products
 
 
-class WishlistProductSerializer(serializers.ModelSerializer):
+class WishlistProductSerializer(CardStatsMixin, serializers.ModelSerializer):
     primary_image = serializers.SerializerMethodField()
     # in_stock is a model property already redefined as available_stock > 0
     # (see products/models.py Product.in_stock) — no change needed here.
@@ -20,6 +21,12 @@ class WishlistProductSerializer(serializers.ModelSerializer):
     # object/string with a .name — StringRelatedField sends the category's
     # __str__ (its name) as a plain string instead of the numeric ID.
     category = serializers.SerializerMethodField()
+
+    # NEW (Oct 2026): same field names as the product list / detail
+    # (average_rating - NOT "rating"), same rules - see products/card_stats.py.
+    average_rating = serializers.SerializerMethodField()
+    review_count = serializers.SerializerMethodField()
+    total_sold = serializers.SerializerMethodField()
 
     def get_category(self, obj):
         if obj.category:
@@ -44,6 +51,9 @@ class WishlistProductSerializer(serializers.ModelSerializer):
             "reserved_stock",
             "available_stock",
             "category",
+            "average_rating",
+            "review_count",
+            "total_sold",
         ]
 
     def get_primary_image(self, obj):
@@ -75,6 +85,17 @@ class WishlistSerializer(serializers.ModelSerializer):
             "items",
             "created_at",
         ]
+
+    # NEW (Oct 2026): rating / review / sold numbers for every product in
+    # the wishlist are loaded ONCE here (2 queries) and shared with the
+    # nested product serializers through the serializer context.
+    def to_representation(self, instance):
+        if not hasattr(self, "_context"):
+            self._context = {}
+        self._context["card_stats"] = card_stats_for_products(
+            item.product_id for item in instance.items.all()
+        )
+        return super().to_representation(instance)
 
 
 class AddToWishlistSerializer(serializers.Serializer):

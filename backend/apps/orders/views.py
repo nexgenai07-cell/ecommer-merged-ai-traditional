@@ -960,11 +960,21 @@ class CheckoutView(APIView):
         # ("order_placed", "pending_payment") — every one of the cases
         # above, regardless of payment method or which stage of its own
         # timeout it's currently in.
+        # UPDATED (Oct 2026 - proof uploaded = free to order again): an
+        # order whose QR payment proof is ALREADY UPLOADED (payment status
+        # "under_review", waiting for the admin) no longer blocks the next
+        # checkout - the customer has done their part, so they must not be
+        # stuck until the admin approves. Only orders where the customer
+        # still owes something block: QR "order_placed" (no proof uploaded
+        # yet), a QR proof that was rejected and needs re-uploading, and an
+        # unpaid Stripe "pending_payment". If that earlier order's proof
+        # is later rejected, it blocks again until re-uploaded.
         blocking_order = (
             Order.objects.filter(
                 customer=customer,
                 status__in=["order_placed", "pending_payment"],
             )
+            .exclude(payment__status="under_review")
             .order_by("-created_at")
             .first()
         )
