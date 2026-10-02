@@ -1468,10 +1468,10 @@ class AnalyticsExportView(APIView):
 
         search = params.get('search')
         if search:
+            # FIX (Oct 2026): name + category only, same scope as the
+            # Products page search (see _export_products).
             qs = qs.filter(
                 Q(name__icontains=search) |
-                Q(description__icontains=search) |
-                Q(sku__icontains=search) |
                 Q(category__name__icontains=search)
             )
 
@@ -1517,10 +1517,14 @@ class AnalyticsExportView(APIView):
 
         q = params.get('q')
         if q:
+            # FIX (Oct 2026 - export showed more products than the page):
+            # /products/search/ matches ONLY product name + category name
+            # (search scope change, Sep 2026), but this export still also
+            # matched description and SKU - so searching "cr" showed 2
+            # products on the Products page and 8 in the file. Same two
+            # fields as the page now.
             qs = qs.filter(
                 Q(name__icontains=q) |
-                Q(description__icontains=q) |
-                Q(sku__icontains=q) |
                 Q(category__name__icontains=q)
             )
 

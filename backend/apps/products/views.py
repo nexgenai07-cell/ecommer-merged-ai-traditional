@@ -631,10 +631,12 @@ class ProductViewSet(viewsets.ModelViewSet):
 
         q = request.query_params.get('q')
         if q:
+            # FIX (Oct 2026): same scope as /products/search/ - product
+            # name + category name only - so the Products page search
+            # returns the same products whichever Status tab is picked,
+            # and the export (which uses the same scope) always matches.
             qs = qs.filter(
                 Q(name__icontains=q) |
-                Q(description__icontains=q) |
-                Q(sku__icontains=q) |
                 Q(category__name__icontains=q)
             )
 
