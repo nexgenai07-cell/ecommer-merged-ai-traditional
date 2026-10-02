@@ -28,6 +28,7 @@ from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 
 from apps.orders.models import Order, OrderItem, Customer
+from apps.orders.customer_contact import resolve_customer_name, resolve_customer_phone
 from apps.products.models import Product, Discount, Review
 from apps.social.models import SocialPost
 from apps.returns.models import Return, Complaint
@@ -1998,7 +1999,10 @@ class AnalyticsExportView(APIView):
         # total_orders/total_spent sort options (which reuse the same
         # annotations already computed below, so the CSV order matches
         # the screen order exactly).
-        qs = Customer.objects.all()
+        # FIX (Oct 2026 — Customers export phone mismatch): select_related('user')
+        # because name/phone now come from the account first (shared with the
+        # admin Customers list), not from the Customer-row copy.
+        qs = Customer.objects.select_related('user')
         if start_date:
             qs = qs.filter(created_at__date__gte=start_date)
         if end_date:
@@ -2073,5 +2077,5 @@ class AnalyticsExportView(APIView):
         writer.writerow(['Name', 'Phone', 'Email', 'Total Orders', 'Total Spent', 'Created At'])
         for c in qs:
             writer.writerow([
-                c.name, format_phone_for_csv(c.phone), c.email or '', c._total_orders, c._total_spent, c.created_at,
+                resolve_customer_name(c), format_phone_for_csv(resolve_customer_phone(c)), c.email or '', c._total_orders, c._total_spent, c.created_at,
             ])

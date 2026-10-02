@@ -4,6 +4,7 @@ from decimal import Decimal
 
 from rest_framework import serializers
 from .models import Customer, Order
+from .customer_contact import resolve_customer_name, resolve_customer_phone
 
 
 # Converts customer information into API responses for the admin panel.
@@ -31,6 +32,10 @@ class CustomerAdminSerializer(serializers.ModelSerializer):
     # Customer.user's null=True/blank=True comment in models.py).
     phone = serializers.SerializerMethodField()
 
+    # NEW (Oct 2026): name also follows the account (User.name) first, same
+    # shared rule as the CSV export - see customer_contact.py.
+    name = serializers.SerializerMethodField()
+
     class Meta:
         model = Customer
         fields = [
@@ -47,10 +52,13 @@ class CustomerAdminSerializer(serializers.ModelSerializer):
         ]
 
     # NEW (Sep 2026 — Admin Customers page missing phone bug)
+    # UPDATED (Oct 2026): uses the shared resolver so the Customers CSV
+    # export shows exactly the same phone as this list.
     def get_phone(self, obj):
-        if obj.user and obj.user.phone:
-            return obj.user.phone
-        return obj.phone
+        return resolve_customer_phone(obj)
+
+    def get_name(self, obj):
+        return resolve_customer_name(obj)
 
     # Returns total number of orders that actually count as "placed" —
     # i.e. the customer has paid for them.
