@@ -4,6 +4,7 @@ import re
 
 from .models import User, UserSession, TwoFactorAuth
 from rest_framework import serializers
+from .phone_validation import validate_pk_phone
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 
@@ -192,8 +193,16 @@ class RegisterSerializer(serializers.ModelSerializer):
         # rejected. A leading '+' is now stripped before the digit/length
         # checks (a bare '+' with nothing after it still correctly fails),
         # so both 03XXXXXXXXX and +923XXXXXXXXX / 923XXXXXXXXX register.
+        # UPDATED (Oct 2026): same Pakistani-mobile rule as the Profile
+        # phone change (phone_validation.py): 03XXXXXXXXX or +923XXXXXXXXX
+        # only. Phone stays optional at registration (blank is allowed).
         if not value:
             return value
+
+        cleaned, error = validate_pk_phone(value)
+        if error:
+            raise serializers.ValidationError(error)
+        return cleaned
 
         digits = value[1:] if value.startswith('+') else value
 

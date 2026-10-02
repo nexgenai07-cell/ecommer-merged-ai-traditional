@@ -161,12 +161,17 @@ def format_phone_for_csv(phone):
     if not digits:
         return ''
 
-    if digits.startswith('92'):
-        normalized = '+' + digits
-    elif digits.startswith('0'):
+    # UPDATED (Oct 2026): only a real Pakistani mobile (03XXXXXXXXX /
+    # +923XXXXXXXXX / 923XXXXXXXXX) is converted to +92 form. Any other
+    # stored value (dummy / old numbers like 00000000000) is exported
+    # exactly as stored, so the CSV shows the same number as the website
+    # instead of inventing a "+920000000000".
+    if re.fullmatch(r'03\d{9}', digits):
         normalized = '+92' + digits[1:]
+    elif re.fullmatch(r'923\d{9}', digits):
+        normalized = '+' + digits
     else:
-        normalized = '+92' + digits
+        normalized = phone.strip().replace('"', '')
 
     return f'="{normalized}"'
 

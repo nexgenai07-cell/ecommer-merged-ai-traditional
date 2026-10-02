@@ -7,7 +7,9 @@ from .models import Address
 
 # Reused as-is from serializers.py (checkout) so address-book validation
 # matches checkout validation exactly.
-PHONE_RE = re.compile(r'^(\+92|0)\d{9,10}$')
+# UPDATED (Oct 2026): strict Pakistani mobile only - 03XXXXXXXXX or
+# +923XXXXXXXXX (same rule as users/phone_validation.py).
+PHONE_RE = re.compile(r'^(03\d{9}|\+923\d{9})$')
 POSTAL_CODE_RE = re.compile(r'^\d{4,6}$')
 CITY_RE = re.compile(r'^[A-Za-z\s]+$')
 CITY_MAX_LENGTH = 30

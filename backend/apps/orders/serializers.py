@@ -10,7 +10,9 @@ from .locations import check_city_province
 # Pakistani mobile/landline numbers: optional +92 or leading 0, then 9-11
 # digits. Kept permissive on purpose (spaces/dashes stripped before check)
 # so real numbers aren't rejected, but garbage input is (B15).
-PHONE_RE = re.compile(r'^(\+92|0)\d{9,10}$')
+# UPDATED (Oct 2026): strict Pakistani mobile only - 03XXXXXXXXX or
+# +923XXXXXXXXX (same rule as users/phone_validation.py).
+PHONE_RE = re.compile(r'^(03\d{9}|\+923\d{9})$')
 
 # Pakistan Post uses 5-digit postal codes. Field stays optional (B18) —
 # this only runs when the customer actually typed something in.

@@ -16,23 +16,16 @@
 # is only a fallback (guest customers have no account).
 #   name  : User.name  -> Customer.name
 #   phone : User.phone -> Customer.phone
-
-import re
-
-
-def is_placeholder_phone(phone):
-    """True for empty values and dummy numbers made only of zeros
-    (e.g. 00000000000) - these are not real phone numbers."""
-    digits = re.sub(r"\D", "", phone or "")
-    return not digits or set(digits) == {"0"}
-
+#
+# The number is shown EXACTLY as stored - no hiding of dummy/placeholder
+# numbers. Format rules are enforced when a number is SAVED, not here.
 
 def resolve_customer_phone(customer):
     user = getattr(customer, "user", None)
-    for candidate in (getattr(user, "phone", None), customer.phone):
-        if candidate and not is_placeholder_phone(candidate):
-            return candidate.strip()
-    return ""
+    user_phone = (getattr(user, "phone", None) or "").strip()
+    if user_phone:
+        return user_phone
+    return (customer.phone or "").strip()
 
 
 def resolve_customer_name(customer):

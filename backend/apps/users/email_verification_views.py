@@ -13,6 +13,7 @@ from rest_framework.response import Response
 from django.conf import settings
 
 from .models import User, EmailVerification, PhoneVerification
+from .phone_validation import validate_pk_phone
 from .email_service import send_verification_with_resend
 # Generates a verification token, creates a verification link,
 # sends it to the user's email, and allows users to request
@@ -184,20 +185,12 @@ class SendPhoneVerificationView(APIView):
 
         # Same validation rules as RegisterSerializer.validate_phone /
         # CheckoutSerializer.validate_phone.
-        digits = phone[1:] if phone.startswith('+') else phone
-        if not digits or not digits.isdigit():
+        # UPDATED (Oct 2026): same Pakistani-mobile rule as everywhere else
+        # (phone_validation.py): 03XXXXXXXXX or +923XXXXXXXXX only.
+        phone, phone_error = validate_pk_phone(phone)
+        if phone_error:
             return Response(
-                {"error": "Phone number must contain digits only, optionally starting with '+'."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if len(digits) < 10:
-            return Response(
-                {"error": "Phone number must be at least 10 digits."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if len(digits) > 15:
-            return Response(
-                {"error": "Phone number must not exceed 15 digits."},
+                {"error": phone_error},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
