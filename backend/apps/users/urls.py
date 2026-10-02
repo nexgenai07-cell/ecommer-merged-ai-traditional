@@ -44,6 +44,8 @@ from .email_change_views import (
 from .password_change_views import (
     ChangePasswordView,
     ConfirmPasswordChangeView,
+    SetPasswordView,
+    ConfirmSetPasswordView,
 )
 
 # NEW (Sep 2026 — Profile: editable phone with OTP code-entry verification)
@@ -139,6 +141,19 @@ urlpatterns = [
         "change-password/confirm/",
         ConfirmPasswordChangeView.as_view(),
         name="change_password_confirm",
+    ),
+
+    # NEW (Oct 2026): first password for a Google sign-in account -
+    # step 1 of 2 (validates + emails the OTP) and step 2 of 2 (confirm).
+    path(
+        "set-password/",
+        SetPasswordView.as_view(),
+        name="set_password",
+    ),
+    path(
+        "set-password/confirm/",
+        ConfirmSetPasswordView.as_view(),
+        name="set_password_confirm",
     ),
 
     path(

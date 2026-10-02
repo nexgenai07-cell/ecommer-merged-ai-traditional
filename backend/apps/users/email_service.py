@@ -295,3 +295,47 @@ def send_password_change_code(user, code):
     except Exception:
         logger.exception("send_password_change_code: failed to send code to %s", user.email)
         return False
+
+
+def send_password_set_code(user, code):
+    """
+    NEW (Oct 2026 - Google sign-in users can add a password).
+
+    Emails the 6-digit code that confirms setting a FIRST password on an
+    account created with Google. The password is not set until the code is
+    entered back in the app (ConfirmSetPasswordView). Same 6-digit /
+    10-minute pattern as send_password_change_code.
+    """
+    subject = "Confirm setting your password"
+    message = (
+        f"Your verification code is: {code}\n\n"
+        "Enter this code in the app to set a password for your account, so "
+        "you can also sign in with your email and password. This code is "
+        "valid for 10 minutes. If you did not request this, please ignore "
+        "this email - no password will be set."
+    )
+    html_message = tpl.otp_html(
+        title="Confirm setting your password",
+        intro="We received a request to add a password to your account. Use this code to confirm.",
+        code=code,
+        validity_text="This code is valid for 10 minutes.",
+        note=(
+            "If you did not request this, you can safely ignore this email. "
+            "No password will be set."
+        ),
+        plain_text=message,
+    )
+
+    try:
+        email_msg = EmailMultiAlternatives(
+            subject=subject,
+            body=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[user.email],
+        )
+        email_msg.attach_alternative(html_message, "text/html")
+        email_msg.send(fail_silently=False)
+        return True
+    except Exception:
+        logger.exception("send_password_set_code: failed to send code to %s", user.email)
+        return False

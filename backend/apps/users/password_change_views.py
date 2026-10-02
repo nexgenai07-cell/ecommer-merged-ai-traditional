@@ -23,8 +23,8 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 
 from .models import PasswordChangeRequest
-from .serializers import ChangePasswordSerializer
-from .email_service import send_password_change_code
+from .serializers import ChangePasswordSerializer, SetPasswordSerializer
+from .email_service import send_password_change_code, send_password_set_code
 
 OTP_VALID_MINUTES = 10
 MAX_OTP_ATTEMPTS = 5
@@ -55,6 +55,21 @@ class ChangePasswordView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
+        # NEW (Oct 2026): an account created with Google has no password
+        # yet, so there is no "current password" to check. It must use
+        # POST /set-password/ instead (also needs the emailed OTP).
+        if not request.user.has_usable_password():
+            return Response(
+                {
+                    "error": (
+                        "Your account was created with Google and has no "
+                        "password yet. Use Set Password to add one."
+                    ),
+                    "use_set_password": True,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         serializer = ChangePasswordSerializer(
             data=request.data,
             context={"request": request},
@@ -160,3 +175,108 @@ class ConfirmPasswordChangeView(APIView):
             {"message": "Password changed successfully."},
             status=status.HTTP_200_OK,
         )
+
+
+# ============================================================
+# NEW (Oct 2026): SET a first password for a Google sign-in account.
+#
+# Best practice used here (same as Google / GitHub / Spotify): signing in
+# with Google stays one tap - no password is forced at that moment - and the
+# customer can ADD a password later from Profile > Security. Because there
+# is no current password to prove who is asking, the account owner is
+# re-verified with a 6-digit code emailed to the (Google-verified) email,
+# exactly like the change-password flow:
+#   1. POST /set-password/          -> validates the new password, emails
+#                                      the code. Nothing is set yet.
+#   2. POST /set-password/confirm/  -> correct code -> password is set.
+#
+# Only for accounts WITHOUT a usable password. An account that already has
+# one must use change-password (which asks for the current password), so
+# this endpoint can never be used to bypass that check.
+# ============================================================
+class SetPasswordView(APIView):
+    """
+    POST /api/v1/auth/set-password/
+    Request: { "new_password": "...", "confirm_password": "..." (optional) }
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+
+        if user.has_usable_password():
+            return Response(
+                {
+                    "error": (
+                        "Your account already has a password. Use Change "
+                        "Password instead."
+                    ),
+                    "use_change_password": True,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = SetPasswordSerializer(
+            data=request.data,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        code = generate_otp()
+
+        PasswordChangeRequest.objects.update_or_create(
+            user=user,
+            defaults={
+                "new_password_hash": make_password(serializer.validated_data["new_password"]),
+                "otp_code": code,
+                "otp_expires_at": timezone.now() + timedelta(minutes=OTP_VALID_MINUTES),
+                "attempts": 0,
+            },
+        )
+
+        if not send_password_set_code(user, code):
+            PasswordChangeRequest.objects.filter(user=user).delete()
+            return Response(
+                {"error": "Could not send the verification email. Please try again."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        return Response(
+            {
+                "message": (
+                    f"A verification code has been sent to {user.email}. "
+                    "Enter it to confirm setting your password."
+                ),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class ConfirmSetPasswordView(ConfirmPasswordChangeView):
+    """
+    POST /api/v1/auth/set-password/confirm/
+    Request: { "otp": "123456" }
+
+    Same code check, expiry and 5-attempt limit as ConfirmPasswordChangeView
+    (this just reuses it). Extra rule: only for an account that still has
+    no password, so a pending change-password request of a normal account
+    can never be confirmed through this endpoint.
+    """
+
+    def post(self, request):
+        if request.user.has_usable_password():
+            return Response(
+                {
+                    "error": (
+                        "Your account already has a password. Use Change "
+                        "Password instead."
+                    ),
+                    "use_change_password": True,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        response = super().post(request)
+        if response.status_code == status.HTTP_200_OK:
+            response.data = {"message": "Password set successfully. You can now sign in with your email and password."}
+        return response

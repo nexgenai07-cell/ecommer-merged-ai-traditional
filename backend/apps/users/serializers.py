@@ -332,6 +332,14 @@ class UserProfileSerializer(serializers.ModelSerializer):
     # exist for admins) rather than an error.
     addresses = serializers.SerializerMethodField()
 
+    # NEW (Oct 2026 - Google sign-in users could not set a password):
+    # False for an account created through "Sign in with Google" that has
+    # never set a password (Django stores an UNUSABLE password for it),
+    # True once a password exists. The frontend uses it to show
+    # "Set password" (False) or "Change password" (True) in the profile,
+    # and may also use it to nudge a Google user right after sign-in.
+    has_password = serializers.SerializerMethodField()
+
     class Meta:
         model = User
         fields = [
@@ -342,6 +350,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             'profile_picture',
             'role',
             'email_verified',
+            'has_password',
             # NEW (Sep 2026 — checkout phone re-verification): lets the
             # frontend (e.g. the checkout page, by polling GET /me/) know
             # whether the CURRENT `phone` value above is verified — flips
@@ -354,6 +363,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             'created_at',
         ]
         read_only_fields = [
+            'has_password',
             'id',
             # email is intentionally read-only here — changing it now goes
             # through the dedicated OTP-verified flow instead
@@ -389,6 +399,9 @@ class UserProfileSerializer(serializers.ModelSerializer):
             return two_factor.is_enabled
 
         return False
+
+    def get_has_password(self, obj):
+        return obj.has_usable_password()
 
     def get_addresses(self, obj):
         # Local import to avoid a module-load-time circular import between
@@ -455,6 +468,30 @@ class ChangePasswordSerializer(serializers.Serializer):
         if data['current_password'] == data['new_password']:
             raise serializers.ValidationError({
                 'new_password': 'New password must be different from the current password.'
+            })
+        return data
+
+
+class SetPasswordSerializer(serializers.Serializer):
+    """
+    NEW (Oct 2026): used by SetPasswordView - first password for an account
+    that signed up with Google. No current_password exists, so none is
+    asked for; the emailed OTP (password_change_views.py) is what proves
+    it is really the account owner. Same strength rules as every other
+    password (Django validators, checked against this user).
+    """
+    new_password = serializers.CharField(write_only=True)
+    confirm_password = serializers.CharField(write_only=True, required=False)
+
+    def validate_new_password(self, value):
+        validate_password(value, user=self.context['request'].user)
+        return value
+
+    def validate(self, data):
+        confirm = data.get('confirm_password')
+        if confirm is not None and confirm != data['new_password']:
+            raise serializers.ValidationError({
+                'confirm_password': 'Passwords do not match.'
             })
         return data
 
