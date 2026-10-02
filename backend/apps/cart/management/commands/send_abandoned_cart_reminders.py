@@ -40,7 +40,15 @@ class Command(BaseCommand):
 
         cutoff = timezone.now() - timedelta(hours=REMINDER_AFTER_HOURS)
         carts = (
-            Cart.objects.filter(user__isnull=False, updated_at__lte=cutoff)
+            # FIX (Oct 2026): only real CUSTOMER accounts get this reminder.
+            # Before, any user with a cart - including the admin account
+            # (an admin who added items while testing the store) - got
+            # "You left something in your cart" in their own notifications.
+            Cart.objects.filter(
+                user__isnull=False,
+                user__role="customer",
+                updated_at__lte=cutoff,
+            )
             .select_related("store", "user")
             .prefetch_related("items__product")
         )

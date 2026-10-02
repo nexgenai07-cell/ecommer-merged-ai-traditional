@@ -47,6 +47,21 @@ def sync_customer_profiles(user, fields, old_phone=None):
             "Could not sync Customer profile(s) for user %s", user.pk
         )
 
+    # NEW (Oct 2026): the sync above writes with queryset.update(), which
+    # sends no post_save signal - so the admin Customers page never heard
+    # about the change. Tell the admins live (name / phone / email now
+    # follow the account, same value the list shows). Never raises.
+    try:
+        from apps.orders.models import Customer
+        from apps.orders.signals import broadcast_customer
+
+        for customer in Customer.objects.filter(user=user).select_related("user"):
+            broadcast_customer(customer)
+    except Exception:
+        logger.exception(
+            "Could not broadcast customer update for user %s", user.pk
+        )
+
 
 def _sync(user, fields, old_phone):
     # Local imports: apps.orders imports from apps.users at module load.

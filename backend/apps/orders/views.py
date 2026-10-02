@@ -1326,6 +1326,35 @@ class CheckoutView(APIView):
 
             total_amount = subtotal - discount_amount + shipping_cost
 
+            # NEW (Oct 2026 - coupon / price changed while the customer was
+            # on the checkout page): if the frontend sent the total the
+            # customer saw (expected_total) and the total calculated here
+            # from the CURRENT coupon / prices is different, stop before
+            # anything is created - the customer must see and accept the
+            # new amount instead of being charged an amount they never saw.
+            # Nothing is written yet at this point, so a retry is clean.
+            expected_total = data.get("expected_total")
+            if expected_total is not None and Decimal(expected_total).quantize(
+                Decimal("0.01")
+            ) != Decimal(total_amount).quantize(Decimal("0.01")):
+                return Response(
+                    {
+                        "error": (
+                            "The price of your order has changed since you "
+                            "opened checkout (a coupon or a price was "
+                            "updated). Please review the new total and "
+                            "place the order again."
+                        ),
+                        "price_changed": True,
+                        "expected_total": str(Decimal(expected_total).quantize(Decimal("0.01"))),
+                        "new_total": str(Decimal(total_amount).quantize(Decimal("0.01"))),
+                        "discount_amount": str(Decimal(discount_amount).quantize(Decimal("0.01"))),
+                        "subtotal": str(Decimal(subtotal).quantize(Decimal("0.01"))),
+                        "shipping_cost": str(Decimal(shipping_cost).quantize(Decimal("0.01"))),
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+
             # ============================================================
             # CREATE ORDER
             # ============================================================

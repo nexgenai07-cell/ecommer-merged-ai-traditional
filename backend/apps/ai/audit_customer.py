@@ -113,6 +113,13 @@ def _build(logs):
 #   category            -> Category.name
 #   discount            -> Discount.code
 #
+# UPDATED (Oct 2026, part 2): now covers EVERY entity that shows up in the
+# Audit Logs table: product / inventory / category / discount (as before)
+# plus social posts, users, stores and reviews, and any other entity falls
+# back to a name saved in its own log rows. A hard-deleted record
+# (e.g. "delete_product 64") takes its name from the log rows of the same
+# entity + id (the create / update logs of that record stored it).
+#
 # The name is read LIVE from the record (matched on entity + entity_id), so
 # if a product / category is renamed later, the old log rows show the new
 # name too. A soft-deleted record (is_delete=True) still has its row, so
@@ -121,35 +128,46 @@ def _build(logs):
 # otherwise None. One query per entity type, not one per row. Never raises.
 # ============================================================
 
-_NAMED_ENTITIES = ("product", "inventory", "category", "discount")
+_NAMED_ENTITIES = (
+    "product", "inventory", "category", "discount",
+    "social_post", "social", "post", "user", "customer", "store", "review",
+)
+
+_NAME_KEYS = ("name", "title", "code", "product_name", "caption")
+
+
+def _clip(text, limit=40):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1] + "\u2026"
+
+
+def _pick(d):
+    if not isinstance(d, dict):
+        return None
+    for key in _NAME_KEYS:
+        value = d.get(key)
+        if isinstance(value, str) and value.strip():
+            return _clip(value)
+    return None
 
 
 def _saved_name(log):
     """Name stored inside the log row itself (fallback for a hard-deleted
     record). Looks at old_data / new_data and, for AI-flow logs, at the
     payload / result inside new_data."""
-    def pick(d):
-        if not isinstance(d, dict):
-            return None
-        for key in ("name", "code"):
-            value = d.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        return None
-
     for data in (log.new_data, log.old_data):
-        found = pick(data)
+        found = _pick(data)
         if found:
             return found
         if isinstance(data, dict):
             for part in ("payload", "result"):
                 inner = data.get(part)
-                found = pick(inner)
+                found = _pick(inner)
                 if found:
                     return found
                 if isinstance(inner, dict):
-                    for key in ("product", "category", "discount"):
-                        found = pick(inner.get(key))
+                    for key in ("product", "category", "discount", "post", "user"):
+                        found = _pick(inner.get(key))
                         if found:
                             return found
     return None
@@ -168,45 +186,123 @@ def entity_names_for_logs(logs, customer_names=None):
         return dict(customer_names or {})
 
 
+def _safe_lookup(label, fn):
+    """One entity type failing (unknown field, missing app) must never
+    stop the other types from getting their names."""
+    try:
+        return fn()
+    except Exception:
+        logger.exception("audit entity name lookup failed for %s", label)
+        return {}
+
+
+def _lookup_products(ids):
+    from apps.products.models import Product
+    return dict(Product.objects.filter(id__in=ids).values_list("id", "name"))
+
+
+def _lookup_categories(ids):
+    from apps.categories.models import Category
+    return dict(Category.objects.filter(id__in=ids).values_list("id", "name"))
+
+
+def _lookup_discounts(ids):
+    from apps.products.models import Discount
+    return dict(Discount.objects.filter(id__in=ids).values_list("id", "code"))
+
+
+def _lookup_social_posts(ids):
+    from apps.social.models import SocialPost
+    return {
+        pk: _clip(caption) if caption else None
+        for pk, caption in SocialPost.objects.filter(id__in=ids).values_list("id", "caption")
+    }
+
+
+def _lookup_users(ids):
+    from django.contrib.auth import get_user_model
+    return dict(get_user_model().objects.filter(id__in=ids).values_list("id", "name"))
+
+
+def _lookup_stores(ids):
+    from apps.stores.models import Store
+    return dict(Store.objects.filter(id__in=ids).values_list("id", "name"))
+
+
+def _lookup_reviews(ids):
+    from apps.products.models import Review
+    return {
+        r.id: r.product.name
+        for r in Review.objects.filter(id__in=ids).select_related("product")
+        if r.product_id
+    }
+
+
+_LOOKUPS = {
+    "product": _lookup_products,
+    "inventory": _lookup_products,   # inventory rows store the product id
+    "category": _lookup_categories,
+    "discount": _lookup_discounts,
+    "social_post": _lookup_social_posts,
+    "social": _lookup_social_posts,
+    "post": _lookup_social_posts,
+    "user": _lookup_users,
+    "customer": _lookup_users,
+    "store": _lookup_stores,
+    "review": _lookup_reviews,
+}
+
+
 def _build_entity_names(logs, customer_names):
     if customer_names is None:
         customer_names = customer_names_for_logs(logs)
 
     result = dict(customer_names)
 
-    ids = {e: set() for e in _NAMED_ENTITIES}
+    # Entities whose name is the customer's name (order / payment / ...)
+    # are already in `result`. Everything else is resolved here.
+    wanted = {}
     for log in logs:
-        if log.entity in ids and log.entity_id is not None:
-            ids[log.entity].add(log.entity_id)
-
-    found = {e: {} for e in _NAMED_ENTITIES}
-
-    product_ids = ids["product"] | ids["inventory"]
-    if product_ids:
-        from apps.products.models import Product
-
-        for pk, name in Product.objects.filter(id__in=product_ids).values_list("id", "name"):
-            found["product"][pk] = name
-            found["inventory"][pk] = name
-
-    if ids["category"]:
-        from apps.categories.models import Category
-
-        for pk, name in Category.objects.filter(id__in=ids["category"]).values_list("id", "name"):
-            found["category"][pk] = name
-
-    if ids["discount"]:
-        from apps.products.models import Discount
-
-        for pk, code in Discount.objects.filter(id__in=ids["discount"]).values_list("id", "code"):
-            found["discount"][pk] = code
-
-    for log in logs:
-        if log.entity not in ids or log.entity_id is None:
+        if log.entity_id is None or log.entity in _ENTITIES:
             continue
-        key = (log.entity, log.entity_id)
-        name = found[log.entity].get(log.entity_id) or _saved_name(log)
+        wanted.setdefault(log.entity, set()).add(log.entity_id)
+
+    found = {}
+    for entity, ids in wanted.items():
+        lookup = _LOOKUPS.get(entity)
+        found[entity] = _safe_lookup(entity, lambda: lookup(ids)) if lookup else {}
+
+    # Names from the log rows of the same record - covers a record that no
+    # longer exists (hard delete) and entity types without a lookup above.
+    unresolved = {}
+    for log in logs:
+        if log.entity_id is None or log.entity in _ENTITIES:
+            continue
+        if found[log.entity].get(log.entity_id):
+            continue
+        name = _saved_name(log)
         if name:
-            result[key] = name
+            found[log.entity][log.entity_id] = name
+        else:
+            unresolved.setdefault(log.entity, set()).add(log.entity_id)
+
+    if unresolved:
+        from .models import AuditLog
+
+        for entity, ids in unresolved.items():
+            siblings = AuditLog.objects.filter(entity=entity, entity_id__in=ids).order_by("-created_at")
+            for sib in siblings:
+                if found[entity].get(sib.entity_id):
+                    continue
+                name = _saved_name(sib)
+                if name:
+                    found[entity][sib.entity_id] = name
+
+    for log in logs:
+        if log.entity_id is None or log.entity in _ENTITIES:
+            continue
+        name = found.get(log.entity, {}).get(log.entity_id)
+        if name:
+            result[(log.entity, log.entity_id)] = name
 
     return result

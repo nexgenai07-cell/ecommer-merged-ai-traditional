@@ -746,6 +746,20 @@ class CheckoutSerializer(serializers.Serializer):
         help_text="Optional coupon code to apply at checkout (cart or Buy Now).",
     )
 
+    # NEW (Oct 2026 - coupon changed while the customer was on checkout):
+    # the total the customer SAW on the checkout page. Optional, so older
+    # frontends keep working. When sent, CheckoutView compares it with the
+    # total it just calculated from the current prices / coupon and, if
+    # they differ, does NOT place the order - it returns 409 with the new
+    # total so the customer can review it first.
+    expected_total = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+        help_text="Total shown to the customer at checkout (optional price-change guard).",
+    )
+
     # FIX (B19): city/address get real validation instead of none.
     def validate_shipping_address(self, value):
         value = value.strip()

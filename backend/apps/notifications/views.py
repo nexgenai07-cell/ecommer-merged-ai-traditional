@@ -58,7 +58,17 @@ class NotificationViewSet(
     def get_base_queryset(self):
         user = self.request.user
         if getattr(user, "role", None) != "customer":
-            return Notification.objects.filter(user=user).order_by("-created_at")
+            # UPDATED (Oct 2026): admins only see notifications that were
+            # sent TO them (new order, return, complaint, ...). "promotion"
+            # is the type an admin SENDS to customers (offers, cart
+            # reminders) - it is never meant for an admin's own inbox, so
+            # it is excluded here. This also hides old promotion rows that
+            # were wrongly created for an admin account before the fix.
+            return (
+                Notification.objects.filter(user=user)
+                .exclude(type="promotion")
+                .order_by("-created_at")
+            )
 
         return Notification.objects.filter(
             Q(user=user)
