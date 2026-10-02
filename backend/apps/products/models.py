@@ -225,13 +225,32 @@ class ProductImage(models.Model):
         related_name="images",
     )
     image = CloudinaryField("image", blank=True, null=True)
+
+    # NEW (Oct 2026 — per-color images): which color this image belongs
+    # to, matching ProductVariant.color (e.g. "Black"). Blank = a general
+    # image of the product, shown for every color / when no color is
+    # picked, and used for the product's listing / cart / order thumbnail.
+    color = models.CharField(max_length=50, blank=True, default="")
+
+    # UPDATED (Oct 2026 — per-color images): is_primary is now "primary
+    # WITHIN ITS COLOR GROUP" — one primary among the general images and
+    # one per color. For a product without colors nothing changes: still
+    # exactly one primary per product.
     is_primary = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = "product_images"
+        # General images (blank color) sort first, then by color, then in
+        # upload order. Every "first primary, else first image" lookup in
+        # the codebase (product list, cart, orders, wishlist) therefore
+        # picks the product's GENERAL image, never a color's image, even
+        # when several colors have their own primary.
+        ordering = ["color", "id"]
 
     def __str__(self):
+        if self.color:
+            return f"Image for {self.product.name} ({self.color})"
         return f"Image for {self.product.name}"
 
 

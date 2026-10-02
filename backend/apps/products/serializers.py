@@ -40,6 +40,9 @@ class ProductImageSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "image_url",
+            # NEW (Oct 2026 — per-color images): "" for a general image,
+            # otherwise the variant color it belongs to (e.g. "Black").
+            "color",
             "is_primary",
             "created_at",
         ]
@@ -224,12 +227,24 @@ def _request_is_admin(context):
     )
 
 
+# NEW (Oct 2026 — variant pricing): the "-20% OFF" badge value — how far
+# price is below original_price, as a whole percent. 0 when there is no
+# original_price or it is not higher than the price.
+def _discount_percent(price, original_price):
+    if price is None or original_price is None or original_price <= 0:
+        return 0
+    if original_price <= price:
+        return 0
+    return int(round((original_price - price) / original_price * 100))
+
+
 # Read-only shape of one variant (Black / Large, its own price + stock).
 # total_stock / reserved_stock / is_active are admin-only — a customer
 # only ever gets available_stock + in_stock, same idea as price/profit
 # fields elsewhere in this file.
 class ProductVariantSerializer(serializers.ModelSerializer):
     label = serializers.CharField(read_only=True)
+    discount_percent = serializers.SerializerMethodField()
     available_stock = serializers.SerializerMethodField()
     in_stock = serializers.SerializerMethodField()
 
@@ -243,12 +258,16 @@ class ProductVariantSerializer(serializers.ModelSerializer):
             "label",
             "price",
             "original_price",
+            "discount_percent",
             "available_stock",
             "in_stock",
             "total_stock",
             "reserved_stock",
             "is_active",
         ]
+
+    def get_discount_percent(self, obj):
+        return _discount_percent(obj.price, obj.original_price)
 
     def get_available_stock(self, obj):
         return obj.total_stock - obj.reserved_stock
@@ -416,6 +435,9 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     has_variants = serializers.SerializerMethodField()
     variants = serializers.SerializerMethodField()
     variant_options = serializers.SerializerMethodField()
+    # NEW (Oct 2026 — variant pricing): "-20% OFF" badge for the product's
+    # own price. Each variant carries its own discount_percent too.
+    discount_percent = serializers.SerializerMethodField()
 
     # NEW (Sep 2026 — profit tracking): both admin-only, null for a
     # customer request — same shared-serializer situation as
@@ -461,6 +483,7 @@ class ProductDetailSerializer(serializers.ModelSerializer):
             "has_variants",
             "variants",
             "variant_options",
+            "discount_percent",
             # NEW
             "average_rating",
             "review_count",
@@ -536,6 +559,9 @@ class ProductDetailSerializer(serializers.ModelSerializer):
     def get_has_variants(self, obj):
         return obj.has_variants
 
+    def get_discount_percent(self, obj):
+        return _discount_percent(obj.price, obj.original_price)
+
     # Customers only see active variants; an admin sees all (including
     # inactive) so the edit page can re-activate them.
     def _visible_variants(self, obj):
@@ -558,11 +584,30 @@ class ProductDetailSerializer(serializers.ModelSerializer):
         colors, sizes = [], []
         seen_colors, seen_sizes = set(), set()
 
+        # NEW (Oct 2026 — per-color images): each color also carries its
+        # own images (image URLs, that color's primary first). When a
+        # color has none, the frontend shows the product's general images
+        # (the entries in "images" whose color is "").
+        images_by_color = {}
+        for img in obj.images.all():
+            if not img.color or not img.image:
+                continue
+            images_by_color.setdefault(img.color.lower(), []).append(img)
+
+        def _urls(color):
+            group = images_by_color.get(color.lower(), [])
+            group = sorted(group, key=lambda i: not i.is_primary)
+            return [i.image.url.replace("http://", "https://") for i in group]
+
         for variant in self._visible_variants(obj):
             if variant.color and variant.color.lower() not in seen_colors:
                 seen_colors.add(variant.color.lower())
                 colors.append(
-                    {"name": variant.color, "hex": variant.color_hex}
+                    {
+                        "name": variant.color,
+                        "hex": variant.color_hex,
+                        "images": _urls(variant.color),
+                    }
                 )
             if variant.size and variant.size.lower() not in seen_sizes:
                 seen_sizes.add(variant.size.lower())

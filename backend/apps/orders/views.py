@@ -1687,7 +1687,7 @@ class OrderListView(generics.ListAPIView):
                     "items",
                     queryset=(
                         OrderItem.objects
-                        .select_related("product")
+                        .select_related("product", "variant")
                         .prefetch_related("product__images")
                         .order_by("id")
                     ),

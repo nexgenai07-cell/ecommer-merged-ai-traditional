@@ -54,6 +54,29 @@ class CartVariantSerializer(serializers.ModelSerializer):
         return obj.total_stock - obj.reserved_stock
 
 
+# NEW (Oct 2026 — per-color images): the image to show for one cart line —
+# the picked variant's COLOR image (its primary, else its first) when that
+# color has images, otherwise the product's general primary image. Reads
+# product.images.all() once (already ordered general-first by ProductImage).
+def _cart_item_image_url(item):
+    images = list(item.product.images.all())
+    if not images:
+        return None
+
+    chosen = None
+    color = item.variant.color if item.variant_id else ""
+    if color:
+        group = [i for i in images if (i.color or "").lower() == color.lower()]
+        chosen = next((i for i in group if i.is_primary), group[0] if group else None)
+
+    if chosen is None:
+        chosen = next((i for i in images if i.is_primary), images[0])
+
+    if not chosen.image:
+        return None
+    return chosen.image.url.replace("http://", "https://")
+
+
 class CartItemSerializer(serializers.ModelSerializer):
     # FIX: 'product' is now the nested object described above, instead of
     # a bare ID.
@@ -63,6 +86,10 @@ class CartItemSerializer(serializers.ModelSerializer):
     # rather than product.price / product.available_stock (those belong
     # to the product as a whole).
     variant = CartVariantSerializer(read_only=True)
+    # NEW (Oct 2026 — per-color images): image of the picked color (falls
+    # back to the product's primary image). Use this instead of
+    # product.primary_image for a variant line.
+    image = serializers.SerializerMethodField()
     unit_price = serializers.SerializerMethodField()
     available_stock = serializers.SerializerMethodField()
     is_available = serializers.SerializerMethodField()
@@ -73,7 +100,7 @@ class CartItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = CartItem
         fields = [
-            'id', 'product', 'variant', 'quantity',
+            'id', 'product', 'variant', 'image', 'quantity',
             'unit_price', 'total_price',
             'available_stock', 'is_available',
             'created_at',
@@ -82,6 +109,9 @@ class CartItemSerializer(serializers.ModelSerializer):
     # UPDATED (Oct 2026 — product variants): price of the picked variant
     # when there is one, otherwise the product's price (see
     # CartItem.unit_price / total_price in models.py).
+    def get_image(self, obj):
+        return _cart_item_image_url(obj)
+
     def get_unit_price(self, obj):
         return obj.unit_price
 

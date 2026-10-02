@@ -40,9 +40,10 @@ class ProductViewSet(viewsets.ModelViewSet):
     GET    /api/v1/products/suggestions/ -> navbar type-ahead dropdown (anyone)
     GET    /api/v1/products/low-stock/   -> below threshold (admin only)
 
-    POST   /api/v1/products/{id}/images/                       -> add image (admin only)
+    POST   /api/v1/products/{id}/images/                       -> add image (admin only); optional form field "color" = a variant color of this product
+    PATCH  /api/v1/products/{id}/images/{image_id}/             -> move an image to another color / back to general (admin only)
     DELETE /api/v1/products/{id}/images/{image_id}/             -> remove image (admin only)
-    PUT    /api/v1/products/{id}/images/{image_id}/set-primary/ -> set primary (admin only)
+    PUT    /api/v1/products/{id}/images/{image_id}/set-primary/ -> set primary within the image's color group (admin only)
 
     POST   /api/v1/products/{id}/stock/adjust/                  -> atomic stock adjustment (admin only; not for products with variants)
 
@@ -683,22 +684,70 @@ class ProductViewSet(viewsets.ModelViewSet):
         )
         return Response(serializer.data)
 
+    # NEW (Oct 2026 — per-color images): validates the optional "color"
+    # an image is attached to. It must be a color one of this product's
+    # variants really has (so a typo can't create a color that no variant
+    # can ever show), and is stored with the variant's own spelling /
+    # casing so it always matches. Blank / missing = a general image.
+    # Returns (color, error_response_or_None).
+    def _resolve_image_color(self, product, raw_color):
+        raw_color = (raw_color or "").strip()
+        if not raw_color:
+            return "", None
+
+        canonical = (
+            product.variants.filter(is_delete=False, color__iexact=raw_color)
+            .values_list("color", flat=True)
+            .first()
+        )
+        if canonical:
+            return canonical, None
+
+        available = list(
+            product.variants.filter(is_delete=False)
+            .exclude(color="")
+            .values_list("color", flat=True)
+            .distinct()
+        )
+        hint = (
+            f"Available colors: {', '.join(available)}."
+            if available
+            else "This product has no variants with a color yet — create the color variants first."
+        )
+        return None, Response(
+            {"error": f"'{raw_color}' is not a color of this product. {hint}"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     @action(detail=True, methods=['post'], url_path='images',
             permission_classes=[permissions.IsAuthenticated, IsAdmin],
             parser_classes=[MultiPartParser, FormParser])
     def upload_image(self, request, pk=None):
-        """POST /api/v1/products/{id}/images/ — multipart form, field name: image"""
+        """
+        POST /api/v1/products/{id}/images/ — multipart form, field name: image
+
+        Optional form field `color`: attach the image to one color of this
+        product (must match a variant color, e.g. "Black"). Leave it out
+        for a general image.
+        """
         product = self.get_object()
         image_file = request.FILES.get('image')
 
         if not image_file:
             return Response({'error': 'No image file provided.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        is_first_image = not product.images.exists()
+        color, error = self._resolve_image_color(product, request.data.get('color'))
+        if error:
+            return error
+
+        # The first image of each color group (general images count as
+        # their own group) becomes that group's primary automatically.
+        is_first_image = not product.images.filter(color=color).exists()
 
         product_image = ProductImage.objects.create(
             product=product,
             image=image_file,
+            color=color,
             is_primary=is_first_image,
         )
 
@@ -707,22 +756,61 @@ class ProductViewSet(viewsets.ModelViewSet):
             status=status.HTTP_201_CREATED,
         )
 
-    @action(detail=True, methods=['delete'], url_path='images/(?P<image_id>[^/.]+)',
+    @action(detail=True, methods=['patch', 'delete'], url_path='images/(?P<image_id>[^/.]+)',
             permission_classes=[permissions.IsAuthenticated, IsAdmin])
     def delete_image(self, request, pk=None, image_id=None):
-        """DELETE /api/v1/products/{id}/images/{image_id}/"""
+        """
+        DELETE /api/v1/products/{id}/images/{image_id}/
+        PATCH  /api/v1/products/{id}/images/{image_id}/  body: {"color": "Black"} (or "" for a general image)
+        """
         product = self.get_object()
         try:
             image = product.images.get(id=image_id)
-        except ProductImage.DoesNotExist:
+        except (ProductImage.DoesNotExist, ValueError):
             return Response({'error': 'Image not found.'}, status=status.HTTP_404_NOT_FOUND)
 
+        if request.method == 'PATCH':
+            if 'color' not in request.data:
+                return Response(
+                    {'error': 'Send "color" (a variant color, or "" for a general image).'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            new_color, error = self._resolve_image_color(product, request.data.get('color'))
+            if error:
+                return error
+
+            old_color = image.color
+            if new_color != old_color:
+                was_primary = image.is_primary
+
+                # In its new group it is only the primary if that group
+                # has none yet.
+                image.color = new_color
+                image.is_primary = not product.images.filter(
+                    color=new_color, is_primary=True
+                ).exists()
+                image.save(update_fields=['color', 'is_primary'])
+
+                # The group it left needs a primary again.
+                if was_primary:
+                    next_image = product.images.filter(color=old_color).first()
+                    if next_image:
+                        next_image.is_primary = True
+                        next_image.save(update_fields=['is_primary'])
+
+            return Response(
+                ProductImageSerializer(image, context={'request': request}).data
+            )
+
         was_primary = image.is_primary
+        color = image.color
         image.delete()
 
-        # If we deleted the primary image, promote another one automatically
+        # If we deleted a primary image, promote another one of the SAME
+        # color group automatically.
         if was_primary:
-            next_image = product.images.first()
+            next_image = product.images.filter(color=color).first()
             if next_image:
                 next_image.is_primary = True
                 next_image.save()
@@ -990,6 +1078,7 @@ class ProductViewSet(viewsets.ModelViewSet):
             )
 
         partial = request.method == 'PATCH'
+        old_color = variant.color
         old_data = {
             "variant": variant.label,
             "price": str(variant.price),
@@ -1005,6 +1094,23 @@ class ProductViewSet(viewsets.ModelViewSet):
             )
             serializer.is_valid(raise_exception=True)
             variant = serializer.save()
+
+            # NEW (Oct 2026 — per-color images): renaming a color
+            # ("Blck" -> "Black") must carry that color's images with it,
+            # otherwise they would be left pointing at a color nothing
+            # uses anymore. Only done when this was the LAST variant still
+            # using the old color — if other variants keep it, its images
+            # stay where they are.
+            if (
+                old_color
+                and variant.color.lower() != old_color.lower()
+                and not product.variants.filter(
+                    is_delete=False, color__iexact=old_color
+                ).exists()
+            ):
+                product.images.filter(color__iexact=old_color).update(
+                    color=variant.color
+                )
 
             # is_active changes which variants count toward the
             # product's stock total.
@@ -1087,8 +1193,10 @@ class ProductViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # Remove primary flag from all images
-        product.images.update(is_primary=False)
+        # Remove primary flag from the images of the SAME color group
+        # only (UPDATED Oct 2026 — per-color images; for a product with no
+        # colors this is every image, exactly as before).
+        product.images.filter(color=image.color).update(is_primary=False)
 
         # Make selected image primary
         image.is_primary = True

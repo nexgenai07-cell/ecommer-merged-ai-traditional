@@ -106,7 +106,12 @@ def order_can_return(order):
 # images.first()). Now it reads product.images.all() ONCE - a single
 # query, or zero when the list view has prefetched them - and picks the
 # same image as before: the first primary image, else the first image.
-def _pick_product_image(product):
+#
+# UPDATED (Oct 2026 — per-color images): optional `color` — the color of
+# the variant that was ordered. When that color has images of its own, its
+# primary (else first) is returned; otherwise the product's general
+# primary image, exactly as before.
+def _pick_product_image(product, color=""):
     images = list(product.images.all())
     if not images:
         return None
@@ -115,6 +120,14 @@ def _pick_product_image(product):
     # it has none.
     if not product.images.model._meta.ordering:
         images.sort(key=lambda i: i.pk)
+
+    if color:
+        group = [i for i in images if (i.color or "").lower() == color.lower()]
+        if group:
+            for img in group:
+                if img.is_primary:
+                    return img
+            return group[0]
 
     for img in images:
         if img.is_primary:
@@ -156,7 +169,10 @@ class OrderItemSerializer(serializers.ModelSerializer):
         if not product:
             return None
 
-        img = _pick_product_image(product)
+        # UPDATED (Oct 2026 — per-color images): the ordered variant's
+        # color image when it has one.
+        color = obj.variant.color if obj.variant_id and obj.variant else ""
+        img = _pick_product_image(product, color)
         if not img or not img.image:
             return None
 
@@ -300,7 +316,10 @@ class OrderListItemSerializer(serializers.ModelSerializer):
         if not product:
             return None
 
-        img = _pick_product_image(product)
+        # UPDATED (Oct 2026 — per-color images): the ordered variant's
+        # color image when it has one.
+        color = obj.variant.color if obj.variant_id and obj.variant else ""
+        img = _pick_product_image(product, color)
 
         if not img or not img.image:
             return None
