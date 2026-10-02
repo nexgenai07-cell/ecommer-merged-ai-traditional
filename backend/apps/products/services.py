@@ -42,13 +42,47 @@ def check_low_stock_notification(product, old_available, new_available):
 
 
 # Safely updates product stock and records every stock movement.
+def _write_stock_adjust_audit(*, product, user, previous_stock, delta, reason, note, request):
+    # Imported here (not at the top) to avoid a circular import between
+    # apps.products and apps.ai. Deliberately NOT wrapped in try/except -
+    # it must succeed or roll the adjustment back (see adjust_stock).
+    from apps.ai.models import AuditLog
+    from apps.ai.audit import get_client_ip
+
+    base = {
+        "name": product.name,
+        "price": str(product.price),
+        "is_active": product.is_active,
+    }
+    AuditLog.objects.create(
+        store=product.store,
+        user=user,
+        action="update_product",
+        entity="product",
+        entity_id=product.id,
+        old_data={**base, "total_stock": previous_stock},
+        new_data={
+            **base,
+            "total_stock": product.total_stock,
+            "adjustment": {
+                "delta": delta,
+                "reason": reason,
+                "note": note or "",
+            },
+        },
+        ip_address=get_client_ip(request),
+        source="web",
+    )
+
+
 def adjust_stock(
     *,
     product,
     delta,
     reason,
     changed_by=None,
-    note=""
+    note="",
+    request=None,
 ):
     """
     Atomically adjust product stock and record a StockMovement.
@@ -111,6 +145,28 @@ def adjust_stock(
             delta=delta,
             reason=reason,
             note=note,
+        )
+
+        # NEW (Oct 2026 - Audit Logs): every successful stock adjustment
+        # writes its own audit entry HERE, inside this same transaction, so
+        # the log and the stock can never disagree: if the entry cannot be
+        # saved the whole adjustment (stock + StockMovement) rolls back, and
+        # a failed request (e.g. stock would go below 0 - raised above,
+        # before any write) never creates an entry. delta == 0 is rejected
+        # before this function, so it never logs either.
+        #
+        # Shaped exactly like the update_product entry (name / price /
+        # total_stock / is_active) so the Audit Log detail screen shows
+        # "Total stock: 1779 -> 1799" with no frontend change; delta,
+        # reason and note ride along in new_data["adjustment"].
+        _write_stock_adjust_audit(
+            product=product,
+            user=changed_by,
+            previous_stock=previous_stock,
+            delta=delta,
+            reason=reason,
+            note=note,
+            request=request,
         )
 
         # NEW (Notification Triggers Addendum, Item 17): reserved_stock is

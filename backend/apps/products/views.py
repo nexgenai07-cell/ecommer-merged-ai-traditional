@@ -213,6 +213,19 @@ class ProductViewSet(viewsets.ModelViewSet):
 
         product = serializer.save()
 
+        new_data = {
+            "name": product.name,
+            "price": str(product.price),
+            "total_stock": product.total_stock,
+            "is_active": product.is_active,
+        }
+
+        # UPDATED (Oct 2026): nothing tracked changed -> no entry. Stops the
+        # useless "No field changes" rows (e.g. Publish pressed right after
+        # a stock adjustment, which now has its own audit entry).
+        if old_data == new_data:
+            return
+
         log_admin_action(
             store=product.store,
             user=self.request.user,
@@ -220,12 +233,7 @@ class ProductViewSet(viewsets.ModelViewSet):
             entity="product",
             entity_id=product.id,
             old_data=old_data,
-            new_data={
-                "name": product.name,
-                "price": str(product.price),
-                "total_stock": product.total_stock,
-                "is_active": product.is_active,
-            },
+            new_data=new_data,
             request=self.request,
         )
 
@@ -854,13 +862,24 @@ class ProductViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        result = adjust_stock_service(
-            product=product,
-            delta=serializer.validated_data["delta"],
-            reason=serializer.validated_data["reason"],
-            changed_by=request.user,
-            note=serializer.validated_data.get("note", ""),
-        )
+        # UPDATED (Oct 2026): request is passed so the audit entry written
+        # inside the service records the admin's IP; a rejected adjustment
+        # (stock would go below 0) is now a clean 400 like the variant
+        # endpoint, and writes nothing.
+        try:
+            result = adjust_stock_service(
+                product=product,
+                delta=serializer.validated_data["delta"],
+                reason=serializer.validated_data["reason"],
+                changed_by=request.user,
+                note=serializer.validated_data.get("note", ""),
+                request=request,
+            )
+        except ValueError as exc:
+            return Response(
+                {"error": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         return Response(result)
 
